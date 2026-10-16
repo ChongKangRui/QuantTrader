@@ -1,0 +1,6 @@
+# GBP/JPY - strongest trends, largest ranges. Size down.
+base: _base.yaml
+symbol: GBPJPY
+pip_size: 0.01
+risk: { risk_pct: 0.3 }
+# Note: half size vs EURUSD; wide stops, no H1 scalping

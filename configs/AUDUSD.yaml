@@ -1,0 +1,5 @@
+# AUD/USD - commodity/China cycles; smooth H4, choppy H1.
+base: _base.yaml
+symbol: AUDUSD
+pip_size: 0.0001
+# Note: weight H4 bias heavily; ignore weak H1 triggers

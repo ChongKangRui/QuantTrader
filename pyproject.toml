@@ -1,0 +1,17 @@
+[project]
+name = "quanttrader"
+version = "0.1.0"
+description = "Mid-term forex trend system (1H/4H) via MT5 Python bridge"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "MetaTrader5>=5.0.45",
+    "pandas>=2.2",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,37 @@
+# Shared defaults. Per-pair files override risk/strategy only; costs are global.
+# Units: spread in POINTS (20 points = 2.0 pips on 5-digit broker). Swaps in
+# account-currency per 0.01 lot per night, charged both sides unless overridden.
+timeframes: { execution: H1, regime: H4 }
+regime_rule: TODO_define  # e.g. H4 EMA200 slope + Donchian breakout; same fn for backtest + live
+execution: { signal_bar: t, fill_bar: t+1, fill: next_open_plus_costs }
+costs: { spread_points: 20, swap_long_per_0_01: -0.08, swap_short_per_0_01: -0.08, triple_swap_days: [Wednesday, weekend], commission_per_lot: 0.0, slippage_pips: 0.3 }
+risk: { risk_pct: 0.5, max_positions_per_pair: 1, max_total_positions: 4 }
+account: { currency: USD, contract_size: 100000 }
+live: { magic: 100001, dry_run_default: true }
+limits: { weekly_loss_pct: 15.0 }  # halt new entries at this % of week-start equity
+# Bias switch (spec B1 baseline ON). false = MA-only UP/DOWN for every pair.
+# strategy holds every indicator/strategy setting (STRATEGY.md section 5 table).
+# Pair files carry symbol + pip_size only; anything under a pair-level
+# `strategy` key is ignored. Pair selection lives in scan-selection.yml.
+strategy:
+  use_atr_sep: true
+  hr1: a
+  sep_atr: 0.3
+  atr_n: 7
+  ema_fast: 20
+  ema_slow: 50
+  warmup_bars: 300
+  stop_atr: 1.5
+  tp_mult: 3.0
+  ext_atr: 1.5
+  edge_atr: 1.5
+  pivot_n: 3
+  hl_guard: true
+  min_body_ratio: 0.5
+  max_body_atr: 1.5
+  lookback: 12
+  touch_atr: 0.5
+  breakdown_atr: 1.0
+  be_trigger_r: 1.0
+  be_buffer: 0
+  trail_atr: 1.5

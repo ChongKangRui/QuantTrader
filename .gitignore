@@ -1,0 +1,9 @@
+# Secrets, data, runtime junk — never commit.
+.env
+data/
+trades/
+memory/
+results/
+__pycache__/
+.venv/
+*.pyc

@@ -1,0 +1,4 @@
+QuantTrader H4 bias panel
+updated_utc=2026-10-16 09:54:07Z account=UNKNOWN
+
+DATA ERROR - no pair configs in configs: 'utf-8' codec can't decode bytes in position 10-11: invalid continuation byte

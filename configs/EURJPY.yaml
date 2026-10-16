@@ -1,0 +1,6 @@
+# EUR/JPY - GBPJPY-like trends but calmer; risk-on/off driven.
+base: _base.yaml
+symbol: EURJPY
+pip_size: 0.01
+risk: { risk_pct: 0.4 }
+# Note: risk-sentiment regime filter helps

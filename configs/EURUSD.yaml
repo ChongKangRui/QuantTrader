@@ -1,0 +1,5 @@
+# EUR/USD - baseline. Tight spreads, clean trends, long ranges. Calibrate others against this.
+base: _base.yaml
+symbol: EURUSD
+pip_size: 0.0001
+# Note: range filter matters; expect long flat stretches

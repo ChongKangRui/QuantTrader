@@ -1,0 +1,5 @@
+# USD/JPY - yield-driven trends; intervention risk = sudden reversals.
+base: _base.yaml
+symbol: USDJPY
+pip_size: 0.01
+# Note: add intervention/news guard; hard stop mandatory

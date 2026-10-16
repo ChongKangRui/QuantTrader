@@ -1,0 +1,6 @@
+# AUD/JPY - risk-sentiment trend pair; best in sustained risk-on/off.
+base: _base.yaml
+symbol: AUDJPY
+pip_size: 0.01
+risk: { risk_pct: 0.4 }
+# Note: gate entries on risk regime; flat in chop

@@ -1,0 +1,14 @@
+# Scan selection: tick which pairs take part in monitor scans and backtest batches.
+# enabled: false skips the pair (one compact line on the console, batch continues).
+# Pairs without H1 data are skipped with a warning even when enabled.
+pairs:
+  EURUSD: {enabled: true}
+  GBPUSD: {enabled: false}
+  USDJPY: {enabled: false}
+  USDCHF: {enabled: false}
+  AUDUSD: {enabled: false}
+  USDCAD: {enabled: false}
+  EURJPY: {enabled: false}
+  GBPJPY: {enabled: false}
+  EURGBP: {enabled: false}
+  AUDNZD: {enabled: false}

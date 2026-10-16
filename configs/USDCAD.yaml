@@ -1,0 +1,5 @@
+# USD/CAD - slow grinding oil/USD trends. Favour H4 over H1.
+base: _base.yaml
+symbol: USDCAD
+pip_size: 0.0001
+# Note: H4-led; H1 only for entry timing

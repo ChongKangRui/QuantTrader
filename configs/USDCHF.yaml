@@ -1,0 +1,5 @@
+# USD/CHF - inverse EURUSD; little diversification. USD-move trends only.
+base: _base.yaml
+symbol: USDCHF
+pip_size: 0.0001
+# Note: never hold alongside opposing EURUSD signal; cap combined USD exposure

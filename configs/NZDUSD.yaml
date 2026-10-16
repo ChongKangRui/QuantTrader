@@ -1,0 +1,5 @@
+# NZD/USD - like AUDUSD, thinner liquidity + wider spreads. Mid-term swings only.
+base: _base.yaml
+symbol: NZDUSD
+pip_size: 0.0001
+# Note: wider spread baked in; avoid H1 entries in Asia chop
