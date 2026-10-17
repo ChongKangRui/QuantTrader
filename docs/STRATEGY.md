@@ -95,7 +95,7 @@ All ATR in sections 5-7 means ATR(`atr_n`, H1). Everything is evaluated at the c
 | `breakdown_atr` | 1.0 | 0.75 / 1.0 / 1.5 | E1 setup |
 | `be_trigger_r` | 1.0 | 1.0 / 1.5 / off | breakeven |
 | `be_buffer` | 0 | 0 / 0.05R | breakeven |
-| `trail_atr` | 1.5 | 1.0 / 1.5 / 2.0 | trailing |
+| `trail_r` | 1.0 | 0.5 / 1.0 / 1.5 | trailing (R of initial risk) |
 
 ### Hard rules on the signal candle
 - **HR2 body ratio:** body / range >= `min_body_ratio` (range must be > 0), and the candle direction matches the trade (close > open for long).
@@ -163,8 +163,8 @@ Skip rules that apply to every stop type:
 Baseline **X4:** take profit at 3R. When price reaches `+be_trigger_r` (default +1R = +1.5 ATR), move the stop to breakeven (entry price plus `be_buffer`), then trail.
 
 Trail:
-- **T1 (baseline):** stop = `highest high since entry - trail_atr x ATR(current bar)` for longs (mirror for shorts). The stop only moves in the trade's favor, never back.
-  - Note: with `trail_atr = 1.5` the trail equals breakeven at the moment of the +1R trigger and follows from there. With `trail_atr = 2.0` the stop stays at breakeven until price passes +2 ATR. With `1.0` it locks profit immediately.
+- **T1 (baseline, profit-based):** active only after the +1R trigger. Stop = `best price since the trigger - trail_r x initial risk` for longs (mirror for shorts). The stop only moves in the trade's favor, never back. ATR is not used.
+  - Note: with `trail_r = 1.0` the stop stays at breakeven until the peak passes +2R, then follows 1R behind (peak +3R, stop +2R). Smaller values lock profit sooner.
 - **T2:** trail under the last confirmed H1 pivot low (long) minus a small buffer.
 - **T3:** exit on an H1 close beyond the H1 EMA(20).
 
@@ -285,7 +285,7 @@ Demo forward test (2-3 months) checks plumbing (fills, timing, slippage, swaps) 
 - Trade record: every fill appends one row to `trades/journal.csv` (`time_utc,symbol,direction,entry,sl,tp,lot,h4_bias,h4_ema20,h4_ema50,h4_sep_atr,hr1,trigger,spread_pts,slippage_pips,magic,comment,ticket,dry_run,reason`). The MT5 on-chain comment is a short code only (`QT B1-L E1`, 31-char limit); the full reason lives in the journal + log.
 - Panel: `python -m quant.monitor` prints bias + entry checklist per pair (`GO` or first failing section-5 rule, `*` = open position), repainted only on a new closed H1 bar. Header rows: laptop local time (Malaysia UTC+8), broker last-H1-close time (UTC), per-account week P&L with `HALTED` banner at the `WEEKLY_LOSS_PCT` limit. `NONE DETECTED` when no pair holds UP/DOWN H4 bias; per-pair `DATA ERROR` rows otherwise. Halt state persists in `memory/weekly_<demo|real>.json`.
 - Executor: `python -m quant.live --roundtrip` (open + immediate market close) and `--touch-close` (open with close SL+TP, broker closes on first touch, timeout falls back to market close). No signal entries yet. Dry-run default; real orders need `--no-dry-run` plus exactly one enabled account. Both legs journaled.
-- Backtest: `python -m quant.backtest --batch` loops `configs/scan-selection.yml` (tick pairs on/off there; missing `data/<SYM>_H1.csv` prints SKIP and continues). Results to `results/<local-time>/`: `summary.csv`, `funnel.csv`, `trades_<SYM>.csv`, `params.json`. Build H1 with `python -m quant.mkdata --symbol <SYM>`.
+- Backtest: `python -m quant.backtest --batch` loops `configs/scan-selection.yml` (tick pairs on/off there; missing `data/<SYM>_H1.csv` prints SKIP and continues). Results to `backtest_results/<local-time>/`: `summary.csv`, `funnel.csv`, `trades_<SYM>.csv`, `params.json`. Build H1 with `python -m quant.mkdata --symbol <SYM>`.
 - Demo account only until section 12 is satisfied.
 
 ## 14. Open decisions
@@ -302,7 +302,7 @@ Demo forward test (2-3 months) checks plumbing (fills, timing, slippage, swaps) 
 - [ ] Whether to use `pair_pause` (test only)
 - [ ] Final 10 pairs and broker symbol names
 - [ ] B1 (20/50) vs B2 (20/100), E1 vs E2 vs E3 after testing
-- [ ] Trailing method (T1 with `trail_atr` 1.5 as baseline) and whether to keep BE at +1R
+- [ ] Trailing method (T1 with `trail_r` 1.0 as baseline) and whether to keep BE at +1R
 - [ ] Drawdown limit, weekend rule
 
 ## 15. Parked (remembered, NOT active rules)

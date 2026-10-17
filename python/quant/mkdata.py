@@ -1,4 +1,4 @@
-"""Build data/<SYM>_H1.csv from DAT_MT_<SYM>_M1_*.csv (HistData-style M1).
+"""Build data/<SYM>_H1.csv from M1 files (plain CSV or HistData zips).
 
 M1 format: no header, `YYYY.MM.DD,HH:MM,open,high,low,close,volume`.
 Timestamps are used as-is and labeled UTC (source timezone is undocumented;
@@ -17,18 +17,33 @@ import pandas as pd
 H1_COLUMNS = ["time", "open", "high", "low", "close", "tick_volume", "n_minutes"]
 
 
+def _read_m1_file(path: Path) -> pd.DataFrame:
+    """Read one M1 file: plain CSV or a zip holding the CSV (HistData layout)."""
+    if path.suffix.lower() == ".zip":
+        import zipfile
+
+        with zipfile.ZipFile(path) as zf:
+            members = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+            if not members:
+                raise ValueError(f"{path}: no CSV inside zip")
+            with zf.open(sorted(members)[0]) as fh:
+                df = pd.read_csv(fh, header=None,
+                                 names=["date", "clock", "open", "high", "low", "close", "tick_volume"])
+    else:
+        df = pd.read_csv(path, header=None,
+                         names=["date", "clock", "open", "high", "low", "close", "tick_volume"])
+    df["time"] = pd.to_datetime(df["date"] + " " + df["clock"],
+                                 format="%Y.%m.%d %H:%M", utc=True)
+    return df[["time", "open", "high", "low", "close", "tick_volume"]]
+
+
 def load_m1(src_dir: str | Path, symbol: str) -> pd.DataFrame:
-    """Concatenate yearly M1 files for one symbol, sorted, deduped."""
+    """Concatenate yearly M1 files (CSV or zip) for one symbol, sorted, deduped."""
     files = sorted(Path(src_dir).glob(f"DAT_MT_{symbol}_M1_*.csv"))
+    files += sorted(Path(src_dir).glob(f"HISTDATA_COM_MT_{symbol}_M1*.zip"))
     if not files:
         raise FileNotFoundError(f"no M1 files for {symbol} in {src_dir}")
-    frames = []
-    for f in files:
-        df = pd.read_csv(f, header=None,
-                         names=["date", "clock", "open", "high", "low", "close", "tick_volume"])
-        df["time"] = pd.to_datetime(df["date"] + " " + df["clock"],
-                                     format="%Y.%m.%d %H:%M", utc=True)
-        frames.append(df[["time", "open", "high", "low", "close", "tick_volume"]])
+    frames = [_read_m1_file(f) for f in files]
     m1 = pd.concat(frames, ignore_index=True).drop_duplicates(subset="time")
     return m1.sort_values("time").reset_index(drop=True)
 

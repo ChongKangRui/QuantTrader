@@ -2,7 +2,7 @@
 
 Pipeline per pair: load H1 -> build H4 -> bias map -> entry scan (funnel) ->
 sizing/cost/risk -> lifecycle simulation -> metrics. Batch mode loops the
-universe scan file; results land in results/<local-time>/ with params.json.
+universe scan file; results land in backtest_results/<local-time>/ with params.json.
 
 Deviations from live, all documented: H4 blocks anchor at 00:00 UTC (broker
 H4 follows server midnight; user accepted the phase shift for variant-vs-
@@ -121,15 +121,32 @@ def map_bias(h1: pd.DataFrame, h4: pd.DataFrame, bf: pd.DataFrame) -> pd.DataFra
     return out
 
 
-def tick_spec(symbol: str, price: float) -> tuple[float, float] | None:
-    """(tick_size, usd_per_tick_per_lot). 5/3-digit assumption; crosses unsupported."""
+def tick_spec(symbol: str, price: float, rates: dict[str, float] | None = None,
+             ) -> tuple[float, float] | None:
+    """(tick_size, usd_per_tick_per_lot). 5/3-digit assumption.
+
+    USD-quoted reads off directly; USD-base divides by its own price; other
+    quotes convert through a same-time rate (JPY via USDJPY, GBP via GBPUSD,
+    AUD via AUDUSD, NZD via NZDUSD). Anything without a rate returns None.
+    """
     pip = 0.01 if "JPY" in symbol else 0.0001
     tick = pip / 10.0
-    if symbol.endswith("USD"):
+    quote = symbol[3:]
+    rates = rates or {}
+    if quote == "USD":
         return tick, tick * 100000.0
     if symbol.startswith("USD"):
-        return tick, tick * 100000.0 / price
-    return None  # cross pair: needs a second feed
+        return tick, tick * 100000.0 / price  # quote is XXX: USDXXX converts itself
+    # quote-foreign: feed holds XXXUSD (direct) or USDXXX (inverted) closes.
+    feed = {"JPY": "USDJPY", "GBP": "GBPUSD", "AUD": "AUDUSD",
+            "NZD": "NZDUSD", "CAD": "USDCAD", "CHF": "USDCHF"}.get(quote)
+    fx = rates.get(feed) if feed else None
+    if not fx:
+        return None  # no conversion path: needs a second feed for sizing
+    if quote == "JPY":
+        return tick, tick * 100000.0 / fx
+    usd_per_quote = 1.0 / fx if feed.startswith("USD") else fx
+    return tick, tick * 100000.0 * usd_per_quote
 
 
 def scan_pair(h1: pd.DataFrame, h4: pd.DataFrame, symbol: str, p: dict) -> tuple[pd.DataFrame, list[dict]]:
@@ -169,18 +186,38 @@ def scan_pair(h1: pd.DataFrame, h4: pd.DataFrame, symbol: str, p: dict) -> tuple
     return pd.DataFrame([funnel]), cands
 
 
+def _asof(series: pd.Series | None, ts) -> float | None:
+    """Last converter-feed value at or before ts."""
+    if series is None or len(series) == 0:
+        return None
+    i = series.index.searchsorted(ts, side="right") - 1
+    return float(series.iloc[i]) if i >= 0 else None
+
+
+def _converter_rates(converters: dict[str, pd.Series] | None, ts) -> dict[str, float]:
+    """Same-time converter closes ({USDJPY: px, ...}) for quote-foreign sizing."""
+    out = {}
+    for feed, series in (converters or {}).items():
+        v = _asof(series, ts)
+        if v is not None:
+            out[feed] = v
+    return out
+
+
 def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
              costs: dict, risk_usd: float, max_cost_ratio: float,
              bias_flip_exit: bool = False, weekend_flat: bool = False,
-             mapped: pd.DataFrame | None = None) -> tuple[pd.DataFrame, dict]:
-    """Walk candidates in time order; 1 open/pair and 1 entry/day enforced here."""
-    tick = tick_spec(symbol, float(h1["close"].iloc[-1]))
-    if tick is None:
-        raise ValueError(f"{symbol}: cross pairs need a second feed for sizing")
-    tick_size, tick_value = tick
-    point = tick_size  # 1 point = 1 tick on 5/3-digit quotes
-    spread_px = float(costs.get("spread_points", 20)) * point
+             mapped: pd.DataFrame | None = None, lot: float | None = None,
+             converters: dict[str, pd.Series] | None = None) -> tuple[pd.DataFrame, dict]:
+    """Walk candidates in time order; 1 open/pair and 1 entry/day enforced here.
+
+    lot set (e.g. 0.01) fixes size; None sizes from risk_usd. Either way the
+    USD3 cap-distance skip and the cost filter still apply, and R uses actual risk.
+    jpy carries USDJPY closes for JPY-cross USD conversion (None = unconvertible).
+    """
     pip_size = 0.01 if "JPY" in symbol else 0.0001
+    point = pip_size / 10.0  # 1 point = 1 tick on 5/3-digit quotes
+    spread_px = float(costs.get("spread_points", 20)) * point
     slip_px = float(costs.get("slippage_pips", 0.3)) * pip_size
     commission = float(costs.get("commission_per_lot", 0.0))
     swap_l = float(costs.get("swap_long_per_0_01", 0.0))
@@ -189,9 +226,7 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
     tp_mult = float(p.get("tp_mult", 3.0))
     be_r = float(p.get("be_trigger_r", 1.0))
     be_buf = float(p.get("be_buffer", 0))
-    trail_mult = float(p.get("trail_atr", 1.5))
-    atr_h1 = _atr_wilder(h1["high"], h1["low"], h1["close"], int(p.get("atr_n", 7)))
-    max_stop = risk_usd / ((tick_value / tick_size) * 0.01)  # USD3 cap distance
+    trail_r = float(p.get("trail_r", 1.0))
     trades = []
     funnel_sized = 0
     open_until = -1
@@ -203,13 +238,19 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
         day = h1["time"].iloc[t].date()
         if day == last_day:
             continue
+        tick = tick_spec(symbol, float(h1["open"].iloc[t + 1]), _converter_rates(
+            converters, h1["time"].iloc[t]))
+        if tick is None:
+            continue  # no USD conversion path for this bar
+        tick_size, tick_value = tick
+        max_stop = risk_usd / ((tick_value / tick_size) * 0.01)  # USD3 cap distance
         atr_f = float(cand["atr"])
         stop_dist = stop_mult * atr_f
         if stop_dist <= 0 or stop_dist > max_stop:
             continue
         if (spread_px + slip_px) / stop_dist > max_cost_ratio:
             continue
-        lots = risk_usd / ((stop_dist / tick_size) * tick_value)
+        lots = float(lot) if lot else risk_usd / ((stop_dist / tick_size) * tick_value)
         lots = int(lots // 0.01) * 0.01
         if lots < 0.01:
             continue
@@ -233,14 +274,14 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
                 mult = 3.0 if cur_day.weekday() == 3 else 1.0
                 swap += (swap_l if long else swap_s) * (lots / 0.01) * mult
                 day_open = cur_day
-            atr_now = float(atr_h1.iloc[b])
             eff_sl = sl
             if be_on:
                 eff_sl = max(eff_sl, entry + be_buf) if long else min(eff_sl, entry - be_buf)
-            if trail_on and atr_now > 0:
+            if trail_on:
+                # Profit trail: stay trail_r x initial risk behind the best price.
                 hh, ll = max(hh, hi), min(ll, lo)
-                ch = (hh if long else ll)
-                trail = ch - trail_mult * atr_now if long else ch + trail_mult * atr_now
+                gap = trail_r * stop_dist
+                trail = hh - gap if long else ll + gap
                 eff_sl = max(eff_sl, trail) if long else min(eff_sl, trail)
             hit_sl = (lo <= eff_sl) if long else (hi >= eff_sl)
             hit_tp = (hi >= tp) if long else (lo <= tp)
@@ -311,14 +352,48 @@ def metrics(trades: pd.DataFrame, h1: pd.DataFrame) -> dict:
             "per_month": round(n / months, 2)}
 
 
-def run_pair(symbol: str, h1_path: str | Path, p: dict, costs: dict, args) -> dict:
+def yearly_table(trades: pd.DataFrame) -> pd.DataFrame:
+    """Trades, net USD and net R per symbol-year (exit year)."""
+    if len(trades) == 0:
+        return pd.DataFrame(columns=["symbol", "year", "trades", "net_usd", "net_R"])
+    t = trades.copy()
+    t["year"] = pd.to_datetime(t["exit_time"], utc=True).dt.year
+    g = t.groupby(["symbol", "year"])
+    return pd.DataFrame({"symbol": [k[0] for k in g.groups],
+                         "year": [k[1] for k in g.groups],
+                         "trades": g.size().values,
+                         "net_usd": g["pnl_usd"].sum().round(2).values,
+                         "net_R": g["pnl_R"].sum().round(2).values,
+                         }).sort_values(["symbol", "year"]).reset_index(drop=True)
+
+
+def total_row(all_trades: pd.DataFrame) -> dict:
+    """Portfolio TOTAL across pairs, time-ordered by exit (weights concurrent risk)."""
+    t = all_trades.sort_values("exit_time").reset_index(drop=True)
+    n = len(t)
+    wins = t[t["pnl_usd"] > 0]
+    gross_pos = float(wins["pnl_usd"].sum())
+    gross_neg = -float(t[t["pnl_usd"] <= 0]["pnl_usd"].sum())
+    eq = t["pnl_usd"].cumsum()
+    return {"symbol": "TOTAL", "trades": n,
+            "net_usd": round(float(t["pnl_usd"].sum()), 2),
+            "net_R": round(float(t["pnl_R"].sum()), 2),
+            "expect_R": round(float(t["pnl_R"].mean()), 3),
+            "win_rate": round(len(wins) / n, 3),
+            "profit_factor": round(gross_pos / gross_neg, 3) if gross_neg > 0 else float("inf"),
+            "max_dd": round(float((eq.cummax() - eq).max()), 2)}
+
+
+def run_pair(symbol: str, h1_path: str | Path, p: dict, costs: dict, args,
+             converters: dict[str, pd.Series] | None = None) -> dict:
     h1 = load_h1(h1_path)
     h4 = build_h4(h1)
     funnel, cands = scan_pair(h1, h4, symbol, p)
     mapped = map_bias(h1, h4, bias_frames(h4, p))
     trades, extra = simulate(h1, symbol, cands, p, costs, args.risk_usd,
                              args.max_cost_ratio, args.bias_flip_exit,
-                             args.weekend_flat, mapped)
+                             args.weekend_flat, mapped, lot=args.lot,
+                             converters=converters)
     funnel["sized"] = extra["sized"]
     funnel["taken"] = len(trades)
     m = metrics(trades, h1)
@@ -336,12 +411,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--data", default=None, help="single H1 csv")
     ap.add_argument("--batch", action="store_true", help="loop scan-selection.yml")
     ap.add_argument("--config-dir", default="configs")
-    ap.add_argument("--results-dir", default="results")
+    ap.add_argument("--results-dir", default="backtest_results")
     ap.add_argument("--spread-pips", type=float, default=None)
     ap.add_argument("--spread-points", type=float, default=None)
     ap.add_argument("--flat-swaps", action="store_true")
     ap.add_argument("--slippage-pips", type=float, default=None)
     ap.add_argument("--risk-usd", type=float, default=3.0)
+    ap.add_argument("--lot", type=float, default=0.01,
+                    help="fixed lot size; <=0 sizes from --risk-usd instead")
     ap.add_argument("--max-cost-ratio", type=float, default=0.10)
     ap.add_argument("--atr-n", type=int, default=None)
     ap.add_argument("--sep-atr", type=float, default=None)
@@ -399,6 +476,34 @@ def main(argv: list[str] | None = None) -> int:
         print("Nothing to run.", flush=True)
         return 1
 
+    # Quote-foreign pairs convert through a converter feed (JPY via USDJPY,
+    # GBP via GBPUSD, ...). USD-quoted and USD-base pairs convert themselves.
+    conv_map = {"JPY": "USDJPY", "GBP": "GBPUSD", "AUD": "AUDUSD",
+                "NZD": "NZDUSD", "CAD": "USDCAD", "CHF": "USDCHF"}
+    need: dict[str, list[str]] = {}
+    for s, _ in jobs:
+        if s[3:] == "USD" or s.startswith("USD"):
+            continue
+        feed = conv_map.get(s[3:])
+        if feed:
+            need.setdefault(feed, []).append(s)
+        else:
+            print(f"SKIP {s} - no converter feed for quote {s[3:]}", flush=True)
+    jobs = [(s, p) for s, p in jobs if s[3:] == "USD" or s.startswith("USD")
+            or s in [x for v in need.values() for x in v]]
+    converters: dict[str, pd.Series] = {}
+    for feed, syms in need.items():
+        fp = Path(f"data/{feed}_H1.csv")
+        if not fp.exists():
+            for s in syms:
+                print(f"SKIP {s} - no {feed} converter feed", flush=True)
+            jobs = [(s, p) for s, p in jobs if s not in syms]
+            continue
+        converters[feed] = load_h1(fp).set_index("time")["close"]
+    if not jobs:
+        print("Nothing to run.", flush=True)
+        return 1
+
     outdir = Path(args.results_dir) / local_stamp()
     outdir.mkdir(parents=True, exist_ok=True)
     (outdir / "params.json").write_text(json.dumps({
@@ -407,11 +512,11 @@ def main(argv: list[str] | None = None) -> int:
         "weekend_flat": args.weekend_flat,
         "jobs": [[s, str(p)] for s, p in jobs]}, indent=1), encoding="utf-8")
 
-    summaries, funnels = [], []
+    summaries, funnels, yearlies, all_trades = [], [], [], []
     for sym, h1_path in jobs:
         print(f"RUN {sym} <- {h1_path}", flush=True)
         try:
-            res = run_pair(sym, h1_path, strat, costs, args)
+            res = run_pair(sym, h1_path, strat, costs, args, converters=converters)
         except Exception as exc:
             print(f"SKIP {sym} - {exc}", flush=True)
             continue
@@ -421,13 +526,20 @@ def main(argv: list[str] | None = None) -> int:
         m = res["metrics"]
         summaries.append(m)
         res["trades"].to_csv(outdir / f"trades_{sym}.csv", index=False)
+        yearlies.append(yearly_table(res["trades"]))
+        if len(res["trades"]):
+            all_trades.append(res["trades"])
         print(f"DONE {sym}: trades={m['trades']} net={m['net_usd']} "
               f"expect={m['expect_R']}R pf={m['profit_factor']} dd={m['max_dd']}", flush=True)
     if summaries:
+        if all_trades:
+            summaries.append(total_row(pd.concat(all_trades, ignore_index=True)))
         pd.DataFrame(summaries).to_csv(outdir / "summary.csv", index=False)
     if funnels:
         pd.concat(funnels, ignore_index=True).to_csv(outdir / "funnel.csv", index=False)
-    print(f"results -> {outdir}", flush=True)
+    if yearlies:
+        pd.concat(yearlies, ignore_index=True).to_csv(outdir / "yearly.csv", index=False)
+    print(f"backtest results -> {outdir}", flush=True)
     return 0
 
 

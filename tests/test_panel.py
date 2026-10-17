@@ -104,6 +104,7 @@ def test_load_pairs_skips_base_and_scan_selection(tmp_path):
     d.mkdir()
     (d / "_base.yaml").write_text("strategy: {hr1: a}\n", encoding="utf-8")
     (d / "scan-selection.yml").write_text("pairs: {EURUSD: {enabled: true}}\n", encoding="utf-8")
+    (d / "OLD_untrade.yaml").write_text("symbol: OLD\n", encoding="utf-8")
     (d / "a.yaml").write_text("symbol: EURUSD\n", encoding="utf-8")
     assert [p["name"] for p in load_pairs(d)] == ["a"]
 

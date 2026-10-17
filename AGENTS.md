@@ -51,6 +51,7 @@ Always flag real risks, even when I did not ask. If you are unsure, say so.
 - Never run live with `--no-dry-run`. Only I do that.
 - You may run tests. Ignore failures outside the current task.
 - If a request is ambiguous, give options and a recommendation first.
+- Only when I ask you to do the backtest, you are allow to do that. You can propose to me but never run a backtest process
 
 ## Modes
 | I say | Mode | Edit files? |

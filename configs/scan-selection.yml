@@ -1,14 +1,15 @@
 # Scan selection: tick which pairs take part in monitor scans and backtest batches.
 # enabled: false skips the pair (one compact line on the console, batch continues).
 # Pairs without H1 data are skipped with a warning even when enabled.
+# Files ending _untrade.yml are never loaded (see NZDUSD_untrade.yml).
 pairs:
   EURUSD: {enabled: true}
-  GBPUSD: {enabled: false}
-  USDJPY: {enabled: false}
-  USDCHF: {enabled: false}
-  AUDUSD: {enabled: false}
-  USDCAD: {enabled: false}
-  EURJPY: {enabled: false}
-  GBPJPY: {enabled: false}
-  EURGBP: {enabled: false}
-  AUDNZD: {enabled: false}
+  GBPUSD: {enabled: true}
+  USDJPY: {enabled: true}
+  USDCHF: {enabled: true}
+  AUDUSD: {enabled: true}
+  USDCAD: {enabled: true}
+  EURJPY: {enabled: true}
+  GBPJPY: {enabled: true}
+  EURGBP: {enabled: true}
+  NZDUSD: {enabled: true}

@@ -14,24 +14,34 @@ limits: { weekly_loss_pct: 15.0 }  # halt new entries at this % of week-start eq
 # Pair files carry symbol + pip_size only; anything under a pair-level
 # `strategy` key is ignored. Pair selection lives in scan-selection.yml.
 strategy:
-  use_atr_sep: true
-  hr1: a
-  sep_atr: 0.3
-  atr_n: 7
-  ema_fast: 20
-  ema_slow: 50
-  warmup_bars: 300
-  stop_atr: 1.5
-  tp_mult: 3.0
-  ext_atr: 1.5
-  edge_atr: 1.5
-  pivot_n: 3
-  hl_guard: true
-  min_body_ratio: 0.5
-  max_body_atr: 1.5
-  lookback: 12
-  touch_atr: 0.5
-  breakdown_atr: 1.0
-  be_trigger_r: 1.0
-  be_buffer: 0
-  trail_atr: 1.5
+  # -- H4 bias (section 4). Long needs all three; mirror for short; else FLAT.
+  use_atr_sep: true   # false = MA-only leg: pure EMA20/50 direction, no HR1/FLAT
+  hr1: a              # H4 candle vs EMA50: a = close past, b = full body past, c = whole candle past
+  sep_atr: 0.3        # min EMA20-EMA50 gap in H4-ATR units for a biased market
+  # -- shared indicator lengths
+  atr_n: 7            # H1 Wilder ATR period for every rule in sections 5-7 (H4 stays 14)
+  ema_fast: 20        # H1 fast EMA: extension cap + E1 trigger line
+  ema_slow: 50        # H1 slow EMA: E1 pullback line
+  warmup_bars: 300    # first bars ignored so EMA50/ATR have settled
+  # -- entry gates, each togglable for ablation (false = gate auto-passes)
+  use_hr2: true       # HR2 body ratio: body/range >= min_body_ratio, candle with the trade
+  use_hr3: true       # HR3 body cap: not an exhaustion spike
+  use_hr4: true       # HR4 edge: signal close near the last HL/LH (hl_guard still applies)
+  use_ext: true       # extension cap: not chasing far from EMA20
+  use_e1_setup: true  # E1 pullback touched EMA50 without breaking down
+  use_e1_trigger: true  # E1 resume: close over EMA20 and the previous bar extreme
+  min_body_ratio: 0.5  # HR2 threshold on body/range
+  max_body_atr: 1.5    # HR3 body cap in ATR units
+  lookback: 12         # E1 window length in H1 bars, signal bar included
+  touch_atr: 0.5       # E1 touch: some bar low within this of EMA50 (lows may pierce)
+  breakdown_atr: 1.0   # E1 floor: no close below EMA50 minus this (only closes floored)
+  edge_atr: 1.5        # HR4 max close-to-HL distance in ATR units
+  pivot_n: 3           # bars each side a pivot must beat; pivots confirm this late
+  hl_guard: true       # HR4 stale-HL guard: skip if structure already broke below HL
+  ext_atr: 1.5         # extension cap distance in ATR units (= stop_atr keeps stop past EMA20)
+  # -- exit
+  stop_atr: 1.5        # S1 stop distance in frozen ATR from entry
+  tp_mult: 3.0         # take profit = this x stop distance (3R = 4.5 ATR at defaults)
+  be_trigger_r: 1.0    # move stop to breakeven at this profit in R, then trail
+  be_buffer: 0         # padding on the breakeven stop, in R (covers commission if set)
+  trail_r: 1.0         # after BE, stop trails the best price by this many R of initial risk

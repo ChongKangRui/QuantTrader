@@ -10,6 +10,7 @@ from __future__ import annotations
 import pandas as pd
 
 # Section-5 parameter table. Callers override per key from config.
+# use_* flags switch gates off for ablation (off = gate auto-passes).
 DEFAULTS = {
     "atr_n": 7,
     "ema_fast": 20,
@@ -21,6 +22,12 @@ DEFAULTS = {
     "edge_atr": 1.5,
     "pivot_n": 3,
     "hl_guard": True,
+    "use_hr2": True,
+    "use_hr3": True,
+    "use_hr4": True,
+    "use_ext": True,
+    "use_e1_setup": True,
+    "use_e1_trigger": True,
     "min_body_ratio": 0.5,
     "max_body_atr": 1.5,
     "lookback": 12,
@@ -28,7 +35,7 @@ DEFAULTS = {
     "breakdown_atr": 1.0,
     "be_trigger_r": 1.0,
     "be_buffer": 0,
-    "trail_atr": 1.5,
+    "trail_r": 1.0,
 }
 
 # Funnel order for the first-failure code (spec section 2).
@@ -138,5 +145,19 @@ def check_entry(h1: pd.DataFrame, direction: str, params: dict | None = None) ->
         checks["E1-trigger"] = c < float(efast.iloc[t]) and c < float(low.iloc[t - 1])
         level = lh[1]
 
+    # Ablation switches: a disabled gate auto-passes (still reported per gate).
+    if not bool(p.get("use_hr2", True)):
+        checks["HR2"] = True
+    if not bool(p.get("use_hr3", True)):
+        checks["HR3"] = True
+    if not bool(p.get("use_hr4", True)):
+        checks["HR4"] = True
+        checks["HR4-guard"] = True
+    if not bool(p.get("use_ext", True)):
+        checks["EXT"] = True
+    if not bool(p.get("use_e1_setup", True)):
+        checks["E1-setup"] = True
+    if not bool(p.get("use_e1_trigger", True)):
+        checks["E1-trigger"] = True
     fail = next((code for code in FAIL_ORDER if not checks.get(code, False)), None)
     return _result(fail is None, fail, checks, level, a)

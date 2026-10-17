@@ -138,3 +138,22 @@ def test_e1_trigger_fails_on_gap_down_close():
 def test_pivot_needs_strict_inequality():
     flat = pd.Series([1.0] * 20)
     assert pivot_lows(flat, 3) == []  # ties are not pivots
+
+
+def test_disabled_trigger_turns_setup_bar_into_signal():
+    bars, E = _go_bars()
+    o, h, lo, c = bars[-1]
+    bars[-1] = [c - 0.7, c - 0.3, c - 0.8, c - 0.4]  # up candle under EMA20
+    df = _frame(bars)
+    assert check_entry(df, "LONG", {})["fail"] == "E1-trigger"
+    r = check_entry(df, "LONG", {"use_e1_trigger": False})
+    assert r["signal"] is True and r["fail"] is None
+
+
+def test_disabled_hr3_passes_giant_body():
+    bars, E = _go_bars()
+    o, h, lo, c = bars[-1]
+    bars[-1] = [c - 3.0, c + 0.1, c - 3.1, c]
+    df = _frame(bars)
+    assert check_entry(df, "LONG", {})["fail"] == "HR3"
+    assert check_entry(df, "LONG", {"use_hr3": False})["fail"] != "HR3"

@@ -1,0 +1,4 @@
+# EUR/GBP - quote-GBP cross; sizing converts through GBPUSD closes.
+base: _base.yaml
+symbol: EURGBP
+pip_size: 0.0001

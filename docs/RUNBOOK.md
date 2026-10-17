@@ -144,14 +144,15 @@ warning applies if anything fails mid-flight.
 
 ## Backtest batch (offline, no terminal needed)
 
-Build H1 once per symbol from the M1 files (coverage report included):
+Build H1 once per symbol from the M1 files (plain CSV or HistData zips;
+coverage report included):
 
 ```powershell
 $env:PYTHONPATH="python"; uv run python -m quant.mkdata --symbol EURUSD
 ```
 
 Run the batch (double-click `run-backtest.bat` does the same). Tick pairs on/off
-in `configs/scan-selection.yml`. Results land in `results/<local-time>/`:
+in `configs/scan-selection.yml`. Results land in `backtest_results/<local-time>/`:
 `summary.csv`, `funnel.csv` (survivors per rule, spec section 2 order),
 `trades_<SYM>.csv`, `params.json` (effective settings for reproducibility).
 Enabled pairs without `data/<SYM>_H1.csv` print `SKIP` and the batch continues.
@@ -165,9 +166,17 @@ $env:PYTHONPATH="python"; uv run python -m quant.backtest --batch --ma-only
 $env:PYTHONPATH="python"; uv run python -m quant.backtest --batch --spread-pips 3.0
 ```
 
+Gate toggles (ablation, spec 11.4): `use_hr2/hr3/hr4/ext/e1_setup/e1_trigger`
+in `_base.yaml` (all default true; false = gate auto-passes, own funnel effect).
+Size is fixed `--lot` (default 0.01); `--lot 0` sizes from `--risk-usd` instead.
+R always divides by actual risk. Pip math reference: `docs/PIP_VALUES.md`
+(1 pip = 10 points; 300 points = 30 pips = $3.00 at 0.01 on EURUSD).
+
 Single pair: `--config configs/EURUSD.yaml --data data/EURUSD_H1.csv`.
 Known deviations (strategy testing only, not go-live calibration): H4 blocks
 anchor at 00:00 UTC, spread fixed 20 points, 5/3-digit tick math, UTC weeks.
+Quote-foreign pairs size through converter feeds auto-loaded from `data/`
+(JPY via USDJPY, GBP via GBPUSD, ...); SKIP with notice when absent.
 
 ## Not built yet
 

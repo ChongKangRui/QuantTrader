@@ -27,6 +27,7 @@ H4_BARS = 350  # spec warmup_bars (300) plus margin
 H1_BARS = 400
 POLL_INTERVAL = 60.0
 SKIP_FILES = {"_base", "scan-selection"}  # never pair files (matched by stem)
+SKIP_SUFFIX = "_untrade"  # parked pairs, e.g. NZDUSD_untrade.yml
 DISP = {"LONG": "UP", "SHORT": "DOWN", "NEUTRAL": "FLAT"}
 MY_TZ = timezone(timedelta(hours=8))  # Malaysia is fixed UTC+8, no DST, no tz database needed
 
@@ -67,9 +68,6 @@ def _as_bool(v, default: bool = True) -> bool:
     if v is None:
         return default
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
-
-
-SKIP_FILES = {"_base", "scan-selection"}  # never pair files (matched by stem)
 
 
 def read_selection(config_dir: str | Path) -> dict[str, bool] | None:
@@ -119,7 +117,8 @@ def load_pairs(config_dir: str | Path) -> list[dict]:
         pass
     pairs: list[dict] = []
     for path in sorted(config_dir.glob("*.yaml")) + sorted(config_dir.glob("*.yml")):
-        if path.stem in SKIP_FILES or path.stem.startswith("_"):
+        if (path.stem in SKIP_FILES or path.stem.startswith("_")
+                or path.stem.endswith(SKIP_SUFFIX)):
             continue
         try:
             cfg = yaml.safe_load(_read_yaml_text(path)) or {}

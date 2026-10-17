@@ -1,4 +1,4 @@
-"""Backtest tests. Synthetic H1 only, never data/, never a terminal."""
+﻿"""Backtest tests. Synthetic H1 only, never data/, never a terminal."""
 import pandas as pd
 
 from quant.backtest import bias_frames, build_h4, map_bias, metrics, scan_pair, simulate
@@ -62,7 +62,7 @@ def test_target_hit_pays_3R():
               "time": h1["time"].iloc[11]}]
     trades, _ = simulate(h1, "EURUSD", cands, {"stop_atr": 1.5, "tp_mult": 3.0,
                                                "be_trigger_r": 1.0, "be_buffer": 0,
-                                               "trail_atr": 1.5, "atr_n": 7},
+                                               "trail_r": 1.0, "atr_n": 7},
                          _costs(), 3.0, 0.10)
     assert len(trades) == 1 and trades["exit_type"].iloc[0] == "target"
     assert trades["pnl_R"].iloc[0] == 3.0
@@ -74,7 +74,7 @@ def test_stop_before_target_inside_one_bar():
               "time": h1["time"].iloc[11]}]
     trades, _ = simulate(h1, "EURUSD", cands, {"stop_atr": 1.5, "tp_mult": 3.0,
                                                "be_trigger_r": 1.0, "be_buffer": 0,
-                                               "trail_atr": 1.5, "atr_n": 7},
+                                               "trail_r": 1.0, "atr_n": 7},
                          _costs(), 3.0, 0.10)
     assert trades["exit_type"].iloc[0] == "stop" and trades["pnl_R"].iloc[0] == -1.0
 
@@ -85,10 +85,23 @@ def test_breakeven_caps_a_reversal():
               "time": h1["time"].iloc[11]}]
     trades, _ = simulate(h1, "EURUSD", cands, {"stop_atr": 1.5, "tp_mult": 3.0,
                                                "be_trigger_r": 1.0, "be_buffer": 0,
-                                               "trail_atr": 100.0, "atr_n": 7},
+                                               "trail_r": 100.0, "atr_n": 7},
                          _costs(), 3.0, 0.10)
     assert trades["exit_type"].iloc[0] == "stop"
     assert abs(trades["pnl_R"].iloc[0]) < 0.2  # stopped near breakeven, not full R
+
+
+def test_profit_trail_follows_peak_in_R():
+    # entry 1.1001, risk 0.0030: +1R = 1.1031, peak 1.1077 -> stop = peak - 1R = 1.1047
+    h1 = _trade_frame([1.1005, 1.1010, 1.1070, 1.1075, 1.1060, 1.1040])
+    cands = [{"t": 11, "direction": "LONG", "atr": 0.0020,
+              "time": h1["time"].iloc[11]}]
+    params = {"stop_atr": 1.5, "tp_mult": 3.0, "be_trigger_r": 1.0, "be_buffer": 0,
+              "trail_r": 1.0, "atr_n": 7}
+    trades, _ = simulate(h1, "EURUSD", cands, params, _costs(), 3.0, 0.10)
+    assert trades["exit_type"].iloc[0] == "stop"
+    assert abs(trades["exit"].iloc[0] - 1.1047) < 1e-6
+    assert abs(trades["pnl_R"].iloc[0] - 1.533) < 0.01  # locked profit, not just breakeven
 
 
 def test_cost_filter_skips_expensive_setup():
@@ -97,7 +110,7 @@ def test_cost_filter_skips_expensive_setup():
               "time": h1["time"].iloc[11]}]  # tiny stop vs big spread
     trades, extra = simulate(h1, "EURUSD", cands, {"stop_atr": 1.5, "tp_mult": 3.0,
                                                    "be_trigger_r": 1.0, "be_buffer": 0,
-                                                   "trail_atr": 1.5, "atr_n": 7},
+                                                   "trail_r": 1.0, "atr_n": 7},
                              _costs(spread_points=20), 3.0, 0.10)
     assert len(trades) == 0 and extra["sized"] == 0
 
@@ -106,6 +119,68 @@ def test_metrics_on_empty_and_wheel():
     h1 = _h1([1.1] * 10)
     m = metrics(h1.iloc[0:0].copy(), h1)
     assert m["trades"] == 0 and m["net_usd"] == 0.0
+
+
+def test_yearly_and_total_rows():
+    from quant.backtest import total_row, yearly_table
+
+    t = pd.DataFrame([
+        {"symbol": "EURUSD", "exit_time": "2020-05-01 00:00:00+00:00",
+         "pnl_usd": 9.0, "pnl_R": 3.0, "bars_held": 5},
+        {"symbol": "EURUSD", "exit_time": "2021-06-01 00:00:00+00:00",
+         "pnl_usd": -3.0, "pnl_R": -1.0, "bars_held": 5},
+        {"symbol": "GBPUSD", "exit_time": "2021-07-01 00:00:00+00:00",
+         "pnl_usd": -3.0, "pnl_R": -1.0, "bars_held": 5},
+    ])
+    y = yearly_table(t)
+    assert len(y) == 3 and y["trades"].sum() == 3
+    assert float(y[(y["symbol"] == "EURUSD") & (y["year"] == 2020)]["net_usd"].iloc[0]) == 9.0
+    tot = total_row(t)
+    assert tot["symbol"] == "TOTAL" and tot["trades"] == 3
+    assert tot["net_usd"] == 3.0 and tot["expect_R"] == round(1.0 / 3, 3)
+
+
+def test_fixed_lot_always_001_and_r_scales():
+    h1 = _trade_frame([1.1005, 1.1010, 1.1120])
+    cands = [{"t": 11, "direction": "LONG", "atr": 0.0020,
+              "time": h1["time"].iloc[11]}]
+    params = {"stop_atr": 1.5, "tp_mult": 3.0, "be_trigger_r": 1.0, "be_buffer": 0,
+              "trail_r": 1.0, "atr_n": 7}
+    trades, _ = simulate(h1, "EURUSD", cands, params, _costs(), 3.0, 0.10, lot=0.01)
+    assert trades["lot"].iloc[0] == 0.01 and trades["pnl_R"].iloc[0] == 3.0
+
+
+def test_tick_spec_matches_pip_table():
+    from quant.backtest import tick_spec
+
+    size, val = tick_spec("EURUSD", 1.1)  # $10/pip/lot -> $1/tick/lot
+    assert (size, val) == (0.00001, 1.0)
+    size, val = tick_spec("USDJPY", 150.0)  # 1000JPY/pip/lot, tick 0.001
+    assert size == 0.001 and abs(val * 10 * 150.0 - 1000.0) < 1e-6
+    assert tick_spec("EURGBP", 0.85) is None  # cross: second feed needed
+    size, val = tick_spec("AUDJPY", 95.0, {"USDJPY": 150.0})
+    assert size == 0.001 and abs(val * 10 * 150.0 - 1000.0) < 1e-6
+    assert tick_spec("AUDJPY", 95.0) is None  # converter feed missing
+    size, val = tick_spec("EURGBP", 0.85, {"GBPUSD": 1.30})
+    assert size == 0.00001 and abs(val * 10 - 10 * 1.30) < 1e-9  # 10GBP/pip -> USD
+
+
+def test_jpy_cross_sizes_through_converter():
+    idx = pd.date_range("2020-01-06", periods=15, freq="h", tz="UTC")
+    closes = [150.00 + (0.01 if i % 2 else -0.01) for i in range(12)] + [150.05, 150.10, 151.20]
+    h1 = pd.DataFrame([{"time": t, "open": closes[max(0, i - 1)], "high": c + 0.02,
+                        "low": c - 0.02, "close": c, "tick_volume": 5}
+                       for i, (t, c) in enumerate(zip(idx, closes))])
+    jpy = pd.Series([150.0] * 15, index=idx)
+    cands = [{"t": 11, "direction": "LONG", "atr": 0.02, "time": idx[11]}]
+    params = {"stop_atr": 1.5, "tp_mult": 3.0, "be_trigger_r": 1.0, "be_buffer": 0,
+              "trail_r": 100.0, "atr_n": 7}  # trail off: this test is about JPY sizing
+    trades, _ = simulate(h1, "AUDJPY", cands, params, _costs(), 3.0, 0.10,
+                         lot=0.01, converters={"USDJPY": jpy})
+    assert len(trades) == 1 and trades["exit_type"].iloc[0] == "target"
+    assert trades["pnl_R"].iloc[0] == 3.0
+    trades, _ = simulate(h1, "AUDJPY", cands, params, _costs(), 3.0, 0.10, lot=0.01)
+    assert len(trades) == 0  # no converter feed: skipped, not crashed
 
 
 def test_scan_finds_calibrated_go():
