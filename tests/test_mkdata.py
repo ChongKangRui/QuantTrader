@@ -1,7 +1,7 @@
 """mkdata tests. Synthetic M1 only, never data/."""
 import pandas as pd
 
-from quant.mkdata import coverage, load_m1, to_h1
+from quant.mkdata import coverage, load_m1, to_h1, write_m1
 
 
 def _m1_rows(date="2020.01.06"):
@@ -51,3 +51,17 @@ def test_coverage_and_missing_symbol(tmp_path):
         zf.writestr("DAT_MT_ZIP_M1_2021.csv", "\n".join(_m1_rows_for(2021)) + "\n")
     m1 = load_m1(d, "ZIP")
     assert len(m1) == 120 and int(m1["time"].dt.year.unique()[0]) == 2021
+
+
+def test_write_m1_csv_roundtrip(tmp_path):
+    from quant.backtest import load_h1
+
+    d = tmp_path / "data"
+    d.mkdir()
+    (d / "DAT_MT_TST_M1_2020.csv").write_text("\n".join(_m1_rows()) + "\n", encoding="utf-8")
+    m1 = load_m1(d, "TST")
+    out = write_m1(m1, d / "TST_M1.csv")
+    back = load_h1(out)
+    assert len(back) == 120
+    assert list(back.columns[:5]) == ["time", "open", "high", "low", "close"]
+    assert float(back["close"].iloc[59]) == float(m1["close"].iloc[59])  # 10:59 close preserved

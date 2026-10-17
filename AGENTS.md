@@ -20,6 +20,7 @@ Always flag real risks, even when I did not ask. If you are unsure, say so.
 - `$env:PYTHONPATH="python"; uv run python -m quant.smoke` — MT5 connection check, sends no orders.
 - Backtest: `$env:PYTHONPATH="python"; uv run python -m quant.backtest --config configs/EURUSD.yaml --data data/EURUSD_H1.csv [--spread-pips 1.5 --flat-swaps]`
 - Live (terminal running + logged in): `uv run python -m quant.live --config configs/EURUSD.yaml`. Dry-run is the default. Real orders need `--no-dry-run`.
+- M1 CSVs (once per pair, BEFORE tick trails work): `$env:PYTHONPATH="python"; uv run python -m quant.mkdata --symbol EURUSD --m1-csv`. Without `data/<SYM>_M1.csv` the backtest's `position_checks: M1` silently falls back to H1 checks. All-11 parallel loop: `docs/RUNBOOK.md`.
 - No lint/typecheck yet. If added, run lint -> typecheck -> test.
 
 ## Config / cost model (required in every backtest)
@@ -77,6 +78,7 @@ If the mode is unclear, ask me.
 - Keep UI labels in their original language.
 - Say what you did NOT run. Never imply something was tested if it was not.
 - Explain a technical term in brackets only when you are explaining something I asked about.
+- When ask to explain and analysis the backtesting or trading data or gap, you should explain to me like a child, non technical person to understand. Dont have to many technical jargon or too depth word. 
 
 ## Reports
 **After a Change** (max 5 lines, no explanation of how it works):

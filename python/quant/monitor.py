@@ -101,6 +101,21 @@ def read_limits(config_dir: str | Path) -> float:
         return 15.0
 
 
+def flatten_strategy(cfg: dict) -> dict:
+    """The `strategy` block as one flat dict.
+
+    _base.yaml groups keys under bias / entry / risk sections; older files and
+    tests keep them flat. Both layouts merge into the same keys.
+    """
+    flat: dict = {}
+    for key, val in ((cfg or {}).get("strategy") or {}).items():
+        if isinstance(val, dict):
+            flat.update(val)
+        else:
+            flat[key] = val
+    return flat
+
+
 def load_pairs(config_dir: str | Path) -> list[dict]:
     """Read per-pair yamls. Strategy comes solely from _base.yaml's `strategy`.
 
@@ -112,7 +127,7 @@ def load_pairs(config_dir: str | Path) -> list[dict]:
     base_strat: dict = {}
     try:
         base_cfg = yaml.safe_load(_read_yaml_text(config_dir / "_base.yaml")) or {}
-        base_strat = base_cfg.get("strategy") or {}
+        base_strat = flatten_strategy(base_cfg)
     except Exception:
         pass
     pairs: list[dict] = []

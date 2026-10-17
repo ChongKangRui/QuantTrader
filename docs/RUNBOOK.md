@@ -145,10 +145,31 @@ warning applies if anything fails mid-flight.
 ## Backtest batch (offline, no terminal needed)
 
 Build H1 once per symbol from the M1 files (plain CSV or HistData zips;
-coverage report included):
+coverage report included). Add `--m1-csv` the first time (writes
+`data/<SYM>_M1.csv`, ~200 MB per pair, gitignored): the backtest needs it for
+tick-like position checks, and every hour without M1 rows falls back to H1
+checks for that bar.
 
 ```powershell
-$env:PYTHONPATH="python"; uv run python -m quant.mkdata --symbol EURUSD
+$env:PYTHONPATH="python"; uv run python -m quant.mkdata --symbol EURUSD --m1-csv
+```
+
+Build all 11 in parallel (same single-symbol command per job; ~1 GB peak RAM per
+job; builds also rewrite H1 byte-identical, audit-verified):
+
+```powershell
+foreach ($s in "EURUSD","GBPUSD","USDJPY","AUDUSD","NZDUSD","USDCAD","USDCHF","EURGBP","EURJPY","GBPJPY","AUDJPY") {
+  Start-Job -Name "mk_$s" -ScriptBlock {
+    param($sym)
+    Set-Location "C:\Users\SCSM11\Desktop\Dev Folder\FullStack\Project\QuantTrader"
+    $env:PYTHONPATH = "python"; uv run python -m quant.mkdata --symbol $sym --m1-csv
+  } -ArgumentList $s | Out-Null
+}
+Get-Job -Name "mk_*" | Wait-Job | Out-Null
+Get-Job -Name "mk_*" | Where-Object State -ne "Completed"   # anything here: rerun singly
+Get-Job -Name "mk_*" | Sort-Object Name | Receive-Job -Keep
+Get-Job -Name "mk_*" | Remove-Job
+(Get-ChildItem data\*_M1.csv).Count                          # expect 11
 ```
 
 Run the batch (double-click `run-backtest.bat` does the same). Tick pairs on/off
@@ -156,6 +177,9 @@ in `configs/scan-selection.yml`. Results land in `backtest_results/<local-time>/
 `summary.csv`, `funnel.csv` (survivors per rule, spec section 2 order),
 `trades_<SYM>.csv`, `params.json` (effective settings for reproducibility).
 Enabled pairs without `data/<SYM>_H1.csv` print `SKIP` and the batch continues.
+`configs/_base.yaml` `limits.no_trade_ranges` lists recurring no-trade windows
+(default: `12-15` to `01-01`); entries whose fill day falls inside are skipped
+(funnel `window` column) and open positions keep their stop/trail.
 
 Sweeps (one factor at a time):
 

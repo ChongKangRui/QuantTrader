@@ -2,7 +2,9 @@
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from quant.limits import assess, evaluate, load_state, save_state, week_key, week_realized, week_start
+from quant.limits import (assess, evaluate, load_state, md_in_ranges,
+                          parse_no_trade_ranges, save_state, week_key,
+                          week_realized, week_start)
 
 
 def _deal(profit, commission=0.0, swap=0.0, magic=100001, time=1_700_000_000):
@@ -53,3 +55,26 @@ def test_state_roundtrip_and_evaluate_persists(tmp_path):
     info = evaluate(p, [_deal(-16.0, time=monday + 60)], 100001, 100.0, 15.0, now)
     assert info["halted"] is True and info["loss_pct"] == 16.0
     assert load_state(p)["realized"] == -16.0
+
+
+def test_no_trade_ranges_parse_and_match():
+    cfg = {"limits": {"no_trade_ranges": [{"start": "12-15", "end": "01-01"},
+                                          {"start": "07-01", "end": "07-10"}]}}
+    ranges = parse_no_trade_ranges(cfg)
+    assert ranges == [("12-15", "01-01"), ("07-01", "07-10")]
+    assert md_in_ranges("12-15", ranges) and md_in_ranges("01-01", ranges)
+    assert md_in_ranges("12-31", ranges) and not md_in_ranges("01-15", ranges)
+    assert not md_in_ranges("12-14", ranges) and not md_in_ranges("02-01", ranges)
+    assert md_in_ranges("07-10", ranges) and not md_in_ranges("07-11", ranges)
+
+
+def test_no_trade_ranges_reject_bad_dates():
+    import pytest
+
+    cases = [{"limits": {"no_trade_ranges": [{"start": "12-15"}]}},          # no end
+             {"limits": {"no_trade_ranges": ["12-15"]}},                     # not a mapping
+             {"limits": {"no_trade_ranges": [{"start": "13-01", "end": "01-01"}]}},  # month 13
+             {"limits": {"no_trade_ranges": [{"start": "12-1", "end": "01-01"}]}}]   # not MM-DD
+    for cfg in cases:
+        with pytest.raises(ValueError):
+            parse_no_trade_ranges(cfg)

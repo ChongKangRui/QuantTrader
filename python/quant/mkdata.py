@@ -15,6 +15,16 @@ from pathlib import Path
 import pandas as pd
 
 H1_COLUMNS = ["time", "open", "high", "low", "close", "tick_volume", "n_minutes"]
+M1_COLUMNS = ["time", "open", "high", "low", "close", "tick_volume"]
+
+
+def write_m1(m1: pd.DataFrame, path: str | Path) -> Path:
+    """Consolidated minute CSV for tick-based position checks (backtest reads it)."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    m1 = m1[(M1_COLUMNS)]
+    m1.to_csv(path, index=False)
+    return path
 
 
 def _read_m1_file(path: Path) -> pd.DataFrame:
@@ -86,6 +96,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--symbol", required=True)
     ap.add_argument("--src", default="data")
     ap.add_argument("--out", default=None)
+    ap.add_argument("--m1-csv", action="store_true",
+                    help="also write data/<SYM>_M1.csv (minute feed for position checks)")
     args = ap.parse_args(argv)
     src = Path(args.src) / args.symbol if (Path(args.src) / args.symbol).is_dir() else Path(args.src)
     try:
@@ -98,6 +110,10 @@ def main(argv: list[str] | None = None) -> int:
     out.parent.mkdir(parents=True, exist_ok=True)
     h1.to_csv(out, index=False)
     print(f"wrote {out}: {len(h1)} H1 bars from {len(m1)} M1 minutes", flush=True)
+    if args.m1_csv:
+        m1out = write_m1(m1, Path(args.out).with_name(Path(args.out).stem.replace("_H1", "_M1"))
+                         if args.out else f"data/{args.symbol}_M1.csv")
+        print(f"wrote {m1out} ({len(m1)} M1 minutes)", flush=True)
     print(coverage(m1, h1).to_string(index=False), flush=True)
     short = int((h1["n_minutes"] < 60).sum())
     print(f"short hours (<60 min): {short} ({short / max(len(h1), 1):.1%})", flush=True)

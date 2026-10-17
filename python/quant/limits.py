@@ -16,6 +16,34 @@ from pathlib import Path
 WEEKLY_LOSS_PCT_DEFAULT = 15.0
 
 
+def parse_no_trade_ranges(cfg: dict) -> list[tuple[str, str]]:
+    """limits.no_trade_ranges -> [('MM-DD', 'MM-DD')]. Inclusive both ends;
+    start > end means the range wraps the New Year (12-15 .. 01-01)."""
+    out: list[tuple[str, str]] = []
+    for item in ((cfg.get("limits") or {}).get("no_trade_ranges") or []):
+        if not (isinstance(item, dict) and {"start", "end"} <= set(item)):
+            raise ValueError(f"no_trade_ranges entry needs start/end: {item!r}")
+        s, e = str(item["start"]).strip(), str(item["end"]).strip()
+        for md in (s, e):
+            mo, dd = md.split("-") if "-" in md else ("", "")
+            if len(md) != 5 or md[2] != "-" or not (mo.isdigit() and dd.isdigit()) \
+                    or not (1 <= int(mo) <= 12) or not (1 <= int(dd) <= 31):
+                raise ValueError(f"no_trade_ranges: need MM-DD dates, got {md!r}")
+        out.append((s, e))
+    return out
+
+
+def md_in_ranges(md: str, ranges) -> bool:
+    """Is month-day `md` ('MM-DD') inside any no-trade range?"""
+    for s, e in ranges:
+        if s <= e:
+            if s <= md <= e:
+                return True
+        elif md >= s or md <= e:  # wrap
+            return True
+    return False
+
+
 def week_start(now_utc: datetime) -> datetime:
     monday = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
     return monday - timedelta(days=monday.weekday())

@@ -195,3 +195,21 @@ def test_poll_ma_only_never_flat_on_pullback():
     assert rows[0].bias == "FLAT"
     rows, _ = poll(mt5, [dict(base, use_atr_sep=False)])
     assert rows[0].bias == "UP"
+
+
+def test_flatten_strategy_reads_sections_and_flat():
+    from quant.monitor import flatten_strategy
+
+    nested = flatten_strategy({"strategy": {"bias": {"hr1": "b"}, "entry": {"atr_n": 7}}})
+    assert nested == {"hr1": "b", "atr_n": 7}
+    assert flatten_strategy({"strategy": {"hr1": "a"}}) == {"hr1": "a"}
+
+
+def test_load_pairs_reads_nested_base(tmp_path):
+    d = tmp_path / "configs"
+    d.mkdir()
+    (d / "_base.yaml").write_text("strategy:\n  bias: {use_atr_sep: false, hr1: b}\n",
+                                  encoding="utf-8")
+    (d / "a.yaml").write_text("symbol: EURUSD\n", encoding="utf-8")
+    p = load_pairs(d)[0]
+    assert p["hr1"] == "b" and p["use_atr_sep"] is False

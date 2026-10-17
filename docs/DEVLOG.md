@@ -1,5 +1,29 @@
 # Dev Log
 
+## 2026-10-17 — v0.9: no-trade windows + tick-like position checks
+
+- `limits.no_trade_ranges` in `_base.yaml`: recurring yearly arrays of `{start, end}` MM-DD
+  (wrap-safe). Shared helpers `parse_no_trade_ranges` / `md_in_ranges` in `quant/limits.py`.
+  simulate blocks entries whose FILL day is inside a window (funnel `window` column);
+  open positions stay managed. Recorded in `params.json`. `timeframes.position_checks: M1`.
+- Position checks (stop/target/BE/trail, trigger-point arm) now walk the M1 feed row by row;
+  signals, bias and fills stay on H1. An hour with no M1 rows falls back to H1 checks for
+  that bar only. Stops/take-profits still model fixed spread/slippage per fill. Exit times
+  are minute-precision when M1 exits, H1 bar time otherwise.
+- BE/trail effect timing moves from "next H1 bar" to "next check row" (next M1 bar in M1 mode).
+- `mkdata --m1-csv` writes consolidated `data/<SYM>_M1.csv` (user must run this per pair
+  once; ~2 GB total). Without the file the backtest silently runs H1 checks.
+- Tests 96 -> 101 (range parse/match/rejects, window entry block, M1-vs-H1 divergent exits).
+- Data audit (read-only, all 11 pairs): prices/order/integrity clean, no famous-day anomalies,
+  H1 CSV = exact rebuild from raw sources. Vendor stamps use HistData's own day-fill grid,
+  not strict UTC — accepted as-is (rules never read hour-of-day; broker-vs-vendor grid shift
+  is a live-day concern, not now). M1 slice anchor floors to the hour edge: H1 stamps can
+  sit at :01 when the raw :00 minute is missing, and a :01 anchor double-counted one minute.
+- Build orchestration: mkdata stays single-symbol; the 11 M1 builds are hand-parallelized
+  with PowerShell Start-Job (snippet in RUNBOOK). No code change — one-time data chore.
+- Next: user builds M1 CSVs for the 10 pairs, then reruns the batch. Results will move
+  vs run `20261017_100407` (both M1 resolution and holiday windows change exits/entries).
+
 ## 2026-10-15 — Bootstrap + MT5 handshake
 
 - Created repo layout: `python/quant/`, `configs/` (10 pairs + `_base.yaml`), `data/` (gitignored), `tests/fixtures/`.
@@ -69,6 +93,21 @@
 - All 10 present pairs have full 2015-2025 file coverage, zero missing years (2023 thin everywhere, vendor-wide). CSV: AUDUSD/EURUSD/GBPUSD/USDCAD/USDCHF/USDJPY. ZIP (HistData, same minute format inside): AUDJPY/EURJPY/GBPJPY/NZDUSD. EURGBP/AUDNZD have no data and no sizing path — stay off.
 - `quant/mkdata` reads zip members directly; H1 built for all 9 (~67.6k bars each).
 - JPY crosses (AUDJPY/EURJPY/GBPJPY) convert tick values through the USDJPY feed, auto-loaded by the batch (SKIP with notice when absent). True crosses (EURGBP/AUDNZD) still unsupported.
+
+## 2026-10-17 — v0.8: no time cap, one profit-trail rule, config reorg
+
+- `_base.yaml` strategy split into BIAS / ENTRY / RISK MANAGEMENT; `flatten_strategy` (monitor.py) reads nested and flat layouts. New toggles `use_trail`, `use_be`; `bias_flip_exit` / `weekend_flat` now live in config (CLI flags still force them on).
+- T1: initial stop holds until best profit >= `trail_r`, then stop = best-since-entry - `trail_r` x risk. BE is optional (`use_be`, off; redundant while `be_trigger_r == trail_r`). Peak now counts from entry (was: from the BE trigger bar).
+- 120-bar time stop removed. Trades still open at the end of the data are not recorded (not new, but with no time stop it can touch more trades).
+- Shorts now pay the fixed spread on exit (they paid none before). Short stop/target triggers still use bid highs/lows.
+- `limits.max_trades_per_day: 5` (0 = off): portfolio post-filter, dropped entries listed in `params.json`.
+- Tests: 96 passed. Baseline numbers from run `20261017_100407` are not comparable to the next run.
+
+## 2026-10-17 — Parallel backtest batch
+
+- `--jobs N` (default 10, capped at pair count; 1 = linear; 0 = all cores). One process per pair via `ProcessPoolExecutor`; workers pin BLAS/OpenMP to 1 thread. A failing pair is recorded (`failed` in `params.json`, `FAILED:` line) and does not lose the others. Output files are written in input order, so they do not depend on finish order.
+- Acceptance still open: run `--jobs 1` and `--jobs 10` and diff the two result folders (must match). Check peak memory on the first parallel run.
+- `run-backtest.bat` passes args through (`run-backtest.bat --jobs 4`).
 
 ## 2026-10-17 — Profit-based trail (T1 revised)
 

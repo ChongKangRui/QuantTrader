@@ -1,7 +1,18 @@
 # Strategy Spec: Multi-Pair Trend System (H4 bias, H1 entry) on MT5
 
-Status: DRAFT v0.7. Every rule below is a **hypothesis to be tested**, not a proven edge.
+Status: DRAFT v0.9. Every rule below is a **hypothesis to be tested**, not a proven edge.
 `[TEST]` = has a range to evaluate. `[DECIDE]` = needs your choice before coding. Parked ideas sit in section 15 and are NOT active rules.
+
+Changes from v0.8:
+- **No-trade windows** (section 8): `limits.no_trade_ranges`, a list of `{start, end}` MM-DD ranges that repeat every year (wrap-safe across New Year). No NEW entries whose fill day falls inside a window; open trades keep being managed.
+- **Tick-like position checks** (sections 3 and 7): stop / target / breakeven / trail are checked on the M1 feed (`timeframes.position_checks: M1`), not once per H1 bar. Signals, bias and fills stay on H1.
+
+Changes from v0.7:
+- **No time cap on trades.** The 120-bar hard time stop is removed. A trade ends at its stop, its target, or an optional bias-flip / weekend exit.
+- **T1 is one profit-trail rule** (section 7). The stop keeps its initial level until the best profit reaches `trail_r` (trigger point), then follows the best price at `trail_r` x risk. Breakeven is now an optional separate leg (`use_be`, off).
+- **Same fixed spread on both sides** (section 10): longs pay it entering, shorts pay it exiting.
+- **Portfolio-wide daily entry cap** `limits.max_trades_per_day` (section 8).
+- `configs/_base.yaml` strategy block is split into BIAS / ENTRY / RISK MANAGEMENT. Every gate and exit leg has a `use_*` toggle.
 
 Changes from v0.6:
 - **E1 setup made exact** (section 5): per-bar EMA50 and ATR, the 12-bar window includes the signal bar, lows may pierce below EMA50, only closes are floored at `EMA50 - breakdown_atr x ATR`.
@@ -17,7 +28,7 @@ Earlier changes carried: H1-based ATR, HR4 edge = previous H1 HL/LH, extension c
 ## 1. Goal and constraints
 
 - Trade with the trend on about 10 FX pairs, entries on H1, bias from H4.
-- Typical holding 2-3 days, up to 5 days maximum (hard time stop).
+- Typical holding 2-3 days. No hard time cap: a trade runs until its stop, target, or an optional bias-flip / weekend exit.
 - Target 1:3 reward-to-risk, with breakeven at +1R and then a trailing stop.
 - Max loss per trade: USD 3 (locked).
 - Python on Windows, `MetaTrader5` package, demo account first.
@@ -30,7 +41,7 @@ Candidates (finalize after a correlation check):
 
 - `[DECIDE]` Final 10 and broker symbol names.
 - Sanity check: print signals per pair per month. Expect well over 4-5 a month across the portfolio. Far fewer = rules too strict (the hard rules below stack, so watch this closely).
-- **Signal funnel (first output of every backtest run, before any P&L):** count candidate H1 bars surviving each rule in order: H4 bias (EMA stack, plus separation if on) -> HR1 -> HR2 -> HR3 -> HR4 (edge, including the stale-HL guard) -> extension cap -> E1 setup -> E1 trigger (or E2) -> USD 3 cap / min lot / cost filter -> risk rules (1 open per pair, 1 entry per pair per day, 5 open max, loss limits in 8A). Report per pair and per month. This shows exactly which rule kills the trade count. If a test variant such as HR5 is switched on, and for each enabled optional filter, give it its own column.
+- **Signal funnel (first output of every backtest run, before any P&L):** count candidate H1 bars surviving each rule in order: H4 bias (EMA stack, plus separation if on) -> HR1 -> HR2 -> HR3 -> HR4 (edge, including the stale-HL guard) -> extension cap -> E1 setup -> E1 trigger (or E2) -> USD 3 cap / min lot / cost filter -> risk rules (1 open per pair, 1 entry per pair per day, `max_trades_per_day` across the portfolio, 5 open max, loss limits in 8A). Report per pair and per month. This shows exactly which rule kills the trade count. If a test variant such as HR5 is switched on, and for each enabled optional filter, give it its own column.
 
 ## 3. Data and timing conventions (avoid lookahead)
 
@@ -41,6 +52,7 @@ Candidates (finalize after a correlation check):
 - EMA = standard exponential MA. ATR and RSI = Wilder smoothing. **H1 ATR period = `atr_n` (default 7)**. H4 ATR (bias separation and the optional H4 filters only) and RSI use period 14.
 - Candle terms: body = |close - open|, range = high - low. A bar with range = 0 never qualifies as a signal bar.
 - **Warmup:** ignore the first `warmup_bars` (default 300) bars of each series so EMA50 and ATR have settled.
+- **Position checks are tick-like.** With `timeframes.position_checks: M1` (the default), everything that manages an open position — stop, target, breakeven, trail — is checked on the minute (M1) feed built from the same data source (`data/<SYM>_M1.csv`). An H1 bar with no M1 rows falls back to H1 checks for that bar only. Backtest and live share these conventions.
 
 ## 4. H4 bias (direction filter)
 
@@ -160,27 +172,27 @@ Skip rules that apply to every stop type:
 
 ## 7. Exit
 
-Baseline **X4:** take profit at 3R. When price reaches `+be_trigger_r` (default +1R = +1.5 ATR), move the stop to breakeven (entry price plus `be_buffer`), then trail.
+Baseline **X4:** take profit at `tp_mult` (3R). The stop is managed by the profit trail T1 below. All exit legs are toggles in `_base.yaml` (`use_trail`, `use_be`, `bias_flip_exit`, `weekend_flat`).
 
 Trail:
-- **T1 (baseline, profit-based):** active only after the +1R trigger. Stop = `best price since the trigger - trail_r x initial risk` for longs (mirror for shorts). The stop only moves in the trade's favor, never back. ATR is not used.
-  - Note: with `trail_r = 1.0` the stop stays at breakeven until the peak passes +2R, then follows 1R behind (peak +3R, stop +2R). Smaller values lock profit sooner.
+- **T1 (baseline, profit-based):** profit = best price since entry, in R of the initial risk. While profit < `trail_r` (the trigger point, default 1R) the position keeps its initial stop; `profit - trail_r` is negative, so nothing moves. From the trigger on, stop = `best price since entry - trail_r x initial risk` for longs (mirror for shorts). At the trigger the stop equals entry (breakeven); beyond it the stop follows (peak +1.5R, stop +0.5R; peak +3R, stop +2R). It only moves in the trade's favor, never back. ATR is not used.
+- **Optional BE leg (`use_be`, default off):** moves the stop to entry plus `be_buffer` once profit reaches `be_trigger_r`. With `be_trigger_r == trail_r` it is redundant, because the trail already sits at breakeven at the trigger. It exists for comparison legs such as BE at +1.5R, where the trail then also starts only at that point.
 - **T2:** trail under the last confirmed H1 pivot low (long) minus a small buffer.
 - **T3:** exit on an H1 close beyond the H1 EMA(20).
 
 Timing rules (no lookahead):
-- Breakeven and trail changes take effect from the **next** H1 bar.
-- If stop and target are both inside the same H1 bar, assume the **stop was hit first**.
+- Breakeven and trail changes take effect from the **next check row**: the next M1 bar when `position_checks: M1`, otherwise the next H1 bar.
+- If stop and target are both inside the same row (M1 minute or H1 bar), assume the **stop was hit first**.
 
 Comparison runs `[TEST]` (these decide whether the BE rule is worth it):
-- **X1:** fixed 3R, no breakeven, no trail
+- **X1:** fixed 3R, no breakeven, no trail (`use_trail: false`, `use_be: false`)
 - **X4a:** BE at +1R then trail (baseline)
 - **X4b:** BE at +1.5R then trail
 - **X4c:** no BE, trail only after +1.5R
 - **X3:** close 50% at 1.5R, stop to breakeven, remainder targets 3R
 
 Always on:
-- **Time stop:** close at the market after 120 H1 bars held (about 5 trading days). Count bars present in the data.
+- **No time stop.** A trade is never closed for age alone.
 - **Bias-flip exit** `[TEST]`: close if the H4 bias (section 4, conditions 1-3) turns against the trade. If the HR5 variant is ever tested, HR5 stays out of this exit, so one counter-direction H4 candle cannot close an open trade.
 - **Weekend rule** `[TEST]`: flat before Friday close vs hold through.
 
@@ -192,6 +204,8 @@ Caution: breakeven stops get hit by ordinary pullbacks and can reduce the share 
 - If the result is below `volume_min` (usually 0.01), **skip the trade**. Do not round up.
 - **Max 1 open position per pair.** If the pair already has an ongoing trade, skip it — no new entries.
 - **Max 1 entry per pair per calendar day** (broker server date of the H1 signal bar). A stop-out or time-stop exit does not allow same-day re-entry. Ablation may later test whether this adds value beyond the bar-cooldown in section 5.
+- **No-trade windows:** `limits.no_trade_ranges`, a list of `{start, end}` month-day pairs (`MM-DD`, UTC), inclusive on both ends, repeated every year; a range whose start is later than its end wraps the New Year (e.g. `12-15` to `01-01`). **No new entries whose fill day falls inside a window.** Open positions keep their stop / target / trail — windows are entry filters, not forced repairs. The funnel records skipped candidates in the `window` column, and `params.json` stores the active list.
+- **Max entries per day across the portfolio:** `limits.max_trades_per_day` (default 5, 0 = off). The backtest applies it as a deterministic post-filter: per calendar day the earliest entries stay, later ones drop, and a pair is not refilled that day.
 - **Max 5 open trades portfolio-wide.** Total open risk is then at most 5 x USD 3 = USD 15.
 - What the cap implies at minimum lot 0.01 (approximate, check the symbol info):
   - USD-quoted pairs (EURUSD, GBPUSD, AUDUSD): about USD 0.10 per pip, so the stop can be at most about 30 pips.
@@ -238,6 +252,7 @@ Reference math (approximate):
 
 ## 10. Cost model for the backtest
 
+- Backtest on vendor H1 (no per-bar spread): one fixed spread from config, the same for both directions. Longs pay it at entry, shorts at exit (buy back on the ask).
 - Spread: per-bar `spread` field (points). Longs enter at ask and exit at bid, shorts the reverse. A short's stop/target triggers on ask, so add the spread to the bid high/low.
 - Slippage: fixed addition per fill `[TEST]` (e.g. 0.2 x typical spread), plus a 2x spread stress run.
 - Swap: `swap_long` / `swap_short` per night held, with the triple-swap day from `swap_rollover3days`.
@@ -246,7 +261,7 @@ Reference math (approximate):
 ## 11. Test plan
 
 1. Signals only: **print the signal funnel and signals per pair per month first** (section 2), then plot on charts and hand-check a sample against the rules and the H4 shift. Do not look at P&L until the trade count is acceptable.
-2. Full simulation with costs. Metrics: expectancy (R), win rate, profit factor, max drawdown, trades/month, exits by type (target, stop, breakeven, trail, time stop), results per pair.
+2. Full simulation with costs. Metrics: expectancy (R), win rate, profit factor, max drawdown, trades/month, exits by type (target, stop, breakeven, trail), results per pair.
 3. **Thesis check before building more:** compute a variance ratio (or Hurst estimate) on each pair's returns at 1-5 day horizons to see whether momentum or mean reversion dominates in your data and period.
 4. **Ablation:** switch each hard rule (HR1-HR4), the stale-HL guard, the extension cap and each optional filter on/off one at a time and record the change in after-cost expectancy and trade count. Keep a rule only if it clearly helps, and not just in-sample.
 5. **Null model:** run the same stop, exit and sizing with random entries in the bias direction (many repetitions). The real system must beat the random-entry distribution (e.g. above its 95th percentile).
@@ -302,7 +317,7 @@ Demo forward test (2-3 months) checks plumbing (fills, timing, slippage, swaps) 
 - [ ] Whether to use `pair_pause` (test only)
 - [ ] Final 10 pairs and broker symbol names
 - [ ] B1 (20/50) vs B2 (20/100), E1 vs E2 vs E3 after testing
-- [ ] Trailing method (T1 with `trail_r` 1.0 as baseline) and whether to keep BE at +1R
+- [x] Trailing: T1 profit trail only (`trail_r` 1.0); BE is an optional leg, off
 - [ ] Drawdown limit, weekend rule
 
 ## 15. Parked (remembered, NOT active rules)

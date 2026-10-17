@@ -85,7 +85,7 @@ def test_breakeven_caps_a_reversal():
               "time": h1["time"].iloc[11]}]
     trades, _ = simulate(h1, "EURUSD", cands, {"stop_atr": 1.5, "tp_mult": 3.0,
                                                "be_trigger_r": 1.0, "be_buffer": 0,
-                                               "trail_r": 100.0, "atr_n": 7},
+                                               "trail_r": 100.0, "atr_n": 7, "use_be": True},
                          _costs(), 3.0, 0.10)
     assert trades["exit_type"].iloc[0] == "stop"
     assert abs(trades["pnl_R"].iloc[0]) < 0.2  # stopped near breakeven, not full R
@@ -117,7 +117,7 @@ def test_cost_filter_skips_expensive_setup():
 
 def test_metrics_on_empty_and_wheel():
     h1 = _h1([1.1] * 10)
-    m = metrics(h1.iloc[0:0].copy(), h1)
+    m = metrics(h1.iloc[0:0].copy(), 30, len(h1))
     assert m["trades"] == 0 and m["net_usd"] == 0.0
 
 
@@ -213,3 +213,169 @@ def test_scan_finds_calibrated_go():
     p = {"sep_atr": 0.3, "hr1": "a", "use_atr_sep": True, "warmup_bars": 300}
     funnel, cands = scan_pair(h1, build_h4(h1), "EURUSD", p)
     assert funnel["e1trigger"].iloc[0] >= 1 and len(cands) >= 1
+
+
+def _synthetic_csv(path, n=800, seed_phase=0.0):
+    import math
+
+    idx = pd.date_range("2020-01-06", periods=n, freq="h", tz="UTC")
+    closes = [1.1 + i * 0.00005 + 0.002 * math.sin(i / 9.0 + seed_phase) for i in range(n)]
+    rows = []
+    for i, c in enumerate(closes):
+        o = closes[i - 1] if i else c
+        rows.append({"time": idx[i], "open": o, "high": max(o, c) + 0.0006,
+                     "low": min(o, c) - 0.0006, "close": c, "tick_volume": 5})
+    pd.DataFrame(rows).to_csv(path, index=False)
+
+
+def test_resolve_workers():
+    from quant.backtest import resolve_workers
+
+    assert resolve_workers(1, 10) == 1  # linear
+    assert resolve_workers(10, 4) == 4  # capped at pair count
+    assert resolve_workers(10, 10) == 10
+    assert 1 <= resolve_workers(0, 3) <= 3  # auto never exceeds the pair count
+
+
+def test_parallel_run_matches_linear_and_isolates_failures(tmp_path):
+    import argparse
+
+    from quant.backtest import run_all
+
+    a, b = tmp_path / "EURUSD_H1.csv", tmp_path / "GBPUSD_H1.csv"
+    _synthetic_csv(a)
+    _synthetic_csv(b, seed_phase=1.3)
+    jobs = [("EURUSD", a), ("MISSING", tmp_path / "nope.csv"), ("GBPUSD", b)]
+    p = {"sep_atr": 0.3, "hr1": "a", "use_atr_sep": True, "warmup_bars": 300}
+    args = argparse.Namespace(risk_usd=3.0, max_cost_ratio=0.10, bias_flip_exit=False,
+                              weekend_flat=False, lot=0.01)
+    lin, lin_fail = run_all(jobs, p, _costs(), args, None, workers=1)
+    par, par_fail = run_all(jobs, p, _costs(), args, None, workers=3)
+    assert set(lin_fail) == set(par_fail) == {"MISSING"}  # bad pair does not lose the others
+    assert set(lin) == set(par) == {"EURUSD", "GBPUSD"}
+    for sym in lin:
+        pd.testing.assert_frame_equal(lin[sym]["trades"], par[sym]["trades"])
+        assert lin[sym]["metrics"] == par[sym]["metrics"]
+        assert lin[sym]["funnel"].equals(par[sym]["funnel"])
+
+
+_RM = {"stop_atr": 1.5, "tp_mult": 3.0, "be_trigger_r": 1.0, "be_buffer": 0,
+       "trail_r": 1.0, "atr_n": 7}
+
+
+def _long_cand(h1):
+    return [{"t": 11, "direction": "LONG", "atr": 0.002, "time": h1["time"].iloc[11]}]
+
+
+def test_no_time_stop_trade_runs_to_target():
+    h1 = _h1([1.1 + i * 0.00004 for i in range(245)])  # slow grind, >120 bars to 3R
+    trades, _ = simulate(h1, "EURUSD", _long_cand(h1), _RM, _costs(), 3.0, 0.10)
+    assert len(trades) == 1 and trades["exit_type"].iloc[0] == "target"
+    assert trades["bars_held"].iloc[0] > 120  # the 5-day hard stop is gone
+
+
+def test_initial_stop_holds_until_trigger_point():
+    # best price only ~0.67R: trail not triggered, so no breakeven, full -1R stop
+    h1 = _trade_frame([1.1005, 1.1010, 1.1015, 1.1019, 1.1010, 1.0960])
+    trades, _ = simulate(h1, "EURUSD", _long_cand(h1), _RM, _costs(), 3.0, 0.10)
+    assert trades["exit_type"].iloc[0] == "stop"
+    assert abs(trades["exit"].iloc[0] - 1.0971) < 1e-9
+    assert abs(trades["pnl_R"].iloc[0] + 1.0) < 0.02
+
+
+def test_be_leg_is_redundant_when_trigger_equals_trail_r():
+    h1 = _trade_frame([1.1005, 1.1010, 1.1070, 1.1075, 1.1060, 1.1040])
+    on, _ = simulate(h1, "EURUSD", _long_cand(h1), {**_RM, "use_be": True},
+                     _costs(), 3.0, 0.10)
+    off, _ = simulate(h1, "EURUSD", _long_cand(h1), {**_RM, "use_be": False},
+                      _costs(), 3.0, 0.10)
+    pd.testing.assert_frame_equal(on, off)
+
+
+def test_trail_and_be_can_both_be_switched_off():
+    h1 = _trade_frame([1.1005, 1.1010, 1.1070, 1.1075, 1.1060, 1.1040])
+    trades, _ = simulate(h1, "EURUSD", _long_cand(h1),
+                         {**_RM, "use_trail": False, "use_be": False},
+                         _costs(), 3.0, 0.10)
+    assert len(trades) == 0  # nothing moves the stop: trade stays open on its initial stop
+
+
+def test_short_pays_spread_on_exit():
+    h1 = _trade_frame([1.0995, 1.0990, 1.0930, 1.0925, 1.0940, 1.0900])
+    cands = [{"t": 11, "direction": "SHORT", "atr": 0.002, "time": h1["time"].iloc[11]}]
+    trades, _ = simulate(h1, "EURUSD", cands, {**_RM, "trail_r": 100.0, "use_be": True},
+                         _costs(spread_points=20), 3.0, 0.10)
+    assert trades["exit_type"].iloc[0] == "target"
+    assert abs(trades["exit"].iloc[0] - (1.0911 + 0.0002)) < 1e-9  # bought back on the ask
+
+
+def test_apply_daily_cap_keeps_earliest():
+    from quant.backtest import apply_daily_cap
+
+    a = pd.DataFrame([{"symbol": "A", "entry_time": "2020-01-06 01:00:00"},
+                      {"symbol": "A", "entry_time": "2020-01-07 01:00:00"}])
+    b = pd.DataFrame([{"symbol": "B", "entry_time": "2020-01-06 05:00:00"},
+                      {"symbol": "B", "entry_time": "2020-01-06 09:00:00"}])
+    out, dropped = apply_daily_cap({"A": a, "B": b}, 2)
+    assert len(out["A"]) == 2 and len(out["B"]) == 1
+    assert dropped == [{"symbol": "B", "entry_time": "2020-01-06 09:00:00"}]
+    same, none = apply_daily_cap({"A": a, "B": b}, 0)  # 0 = off
+    assert none == [] and len(same["B"]) == 2
+
+
+def test_no_trade_window_blocks_entry():
+    h1 = _trade_frame([1.1005, 1.1010, 1.1120])  # fill day = Jan 6
+    trades, extra = simulate(h1, "EURUSD", _long_cand(h1), _RM, _costs(), 3.0, 0.10,
+                             no_trade_ranges=(("01-06", "01-07"),))
+    assert len(trades) == 0 and extra["window"] == 1 and extra["sized"] == 0
+    trades, extra = simulate(h1, "EURUSD", _long_cand(h1), _RM, _costs(), 3.0, 0.10)
+    assert len(trades) == 1 and extra["window"] == 0  # no ranges: trade happens
+
+
+def _m1_frame(rows):
+    return pd.DataFrame([{"time": t, "open": o, "high": max(o, c) + 0.0001,
+                          "low": min(o, c) - 0.0001, "close": c, "tick_volume": 1}
+                         for t, o, c in rows])
+
+
+def test_position_checks_walk_m1_and_fall_back_per_hour():
+    # Hour 13 rises to ~+1.2R in minutes 0-29 and collapses in minutes 30-59:
+    # minute checks arm the trail mid-hour and stop at the trail level inside
+    # the hour; a run without m1 (H1 checks) cannot see the dip within the bar
+    # and rides to the 3R target instead.
+    h1 = _trade_frame([1.1005, 1.1012, 1.1045, 1.1055, 1.1065, 1.1075, 1.1095])
+    t13 = h1["time"].iloc[13]  # 13:00, the fill bar is 12:00 (H1 fallback there)
+    rows = []
+    for m in range(30):  # rise: minute closes 1.1005 -> 1.1035
+        o = 1.1005 if m == 0 else 1.1005 + m * 0.0001
+        rows.append((t13 + pd.Timedelta(minutes=m), o, 1.1005 + (m + 1) * 0.0001))
+    for m in range(30, 60):  # fall: closes 1.1030 -> 1.1000, crosses the trail level
+        rows.append((t13 + pd.Timedelta(minutes=m), 1.1035, 1.1035 - (m - 29) * 0.0005))
+    m1 = _m1_frame(rows)
+    trades_m1, _ = simulate(h1, "EURUSD", _long_cand(h1), _RM, _costs(), 3.0, 0.10, m1=m1)
+    trades_h1, _ = simulate(h1, "EURUSD", _long_cand(h1), _RM, _costs(), 3.0, 0.10)
+    assert trades_m1["exit_type"].iloc[0] == "stop"
+    level = float(m1["high"].max()) - 0.003  # trail gap = trail_r x initial risk
+    assert abs(trades_m1["exit"].iloc[0] - level) < 1e-6
+    assert str(trades_m1["exit_time"].iloc[0]).endswith("13:35:00+00:00")  # minute-precision exit
+    assert trades_h1["exit_type"].iloc[0] == "target"  # hour checks miss the intra-bar dip
+
+
+def test_m1_slice_anchors_at_true_hour_edge():
+    # Vendor H1 stamps can sit at :01 when the raw :00 minute is missing. The
+    # minute walk must anchor at the hour edge: a :01 anchor would swallow the
+    # next hour's 13:00 row into the 12:0x bar (exit one bar early, bars_held 1).
+    closes = [1.1000 + (0.0001 if i % 2 else -0.0001) for i in range(12)]
+    h1 = _h1(closes + [1.1005, 1.1012, 1.1045, 1.1095])
+    h1.loc[12, "time"] = pd.Timestamp("2020-01-06 12:01", tz="UTC")  # the :01 stamp
+    t13 = pd.Timestamp("2020-01-06 13:00", tz="UTC")
+    rows = [
+        (pd.Timestamp("2020-01-06 12:01", tz="UTC"), 1.1005, 1.1006),  # fill-bar minutes
+        (pd.Timestamp("2020-01-06 12:59", tz="UTC"), 1.1005, 1.1004),  #  no stop, no trigger
+        (t13, 1.1004, 1.0960),  # next bar's own minute: dips below the initial stop
+    ]
+    trades, _ = simulate(h1, "EURUSD", _long_cand(h1), _RM, _costs(), 3.0, 0.10, m1=_m1_frame(rows))
+    assert trades["exit_type"].iloc[0] == "stop"
+    assert abs(trades["exit"].iloc[0] - 1.0971) < 1e-9  # initial stop level, untouched by trail
+    assert trades["bars_held"].iloc[0] == 2  # 13:00 shown to the NEXT hour bar, not the 12:0x bar
+    assert str(trades["exit_time"].iloc[0]).endswith("13:00:00+00:00")
