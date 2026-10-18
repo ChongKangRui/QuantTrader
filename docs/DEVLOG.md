@@ -2,23 +2,37 @@
 
 ## TODO (living checklist — strike the line when done; finished work goes into the dated log below)
 
+### Now (housekeeping, no backtest needed)
 
+- [x] Fixed the `max_total_positions` mismatch (2026-10-18): `_base.yaml` (= 5) is the single source; STRATEGY.md sections 8 + 8A and this log now say 5. RUNBOOK and TESTLOG never carried a number — nothing to align there.
 - [ ] Monday spreadcheck re-sample (peak + off-peak), then recalibrate the 3 JPY-pair yamls (USDJPY/EURJPY/GBPJPY swaps were ~1.5x wrong under the old /100 math).
-- [ ] Portfolio pass runs: pre-declare pass lines in `docs/TESTLOG.md` FIRST (max_total_positions 4 / max_ccy_net 2 / weekly halt 15%), then rerun the batch as a new declared change-set (only on user instruction).
-- [x] Build the live trading loop: `quant.monitor --trade` supervisor (new-H1 wake, magic-filtered adoption, per-pair open check before every send, caps/portfolio/weekly/no-trade gates, trail management, restart idempotency via bar-stamp memory). Demo only, dry-run default; `start-trader.bat`. Validation staircase on the terminal next.
-- [ ] Go-live demo smoke: 0.01 lots EURUSD + one JPY pair → all 10; compare fills vs backtest. Rotate the demo password (it appeared in chat).
-- [ ] Strategy-core redesign (open track): ladder shows nothing beats R0 and R2 verdict FAIL — design the next change-set with pass lines pre-declared in `docs/TESTLOG.md`.
 
 ### Verdict track (timebox: 2-3 more experiments, then decide)
 
-- [ ] Zero-cost backtest: `run-backtest.bat --spread-points 0 --slippage-pips 0 --flat-swaps` — gross expectancy; expect ≈ 0.
-- [ ] Random-entry null (spec §11.5): random entries in the bias direction, same exits and sizing; ≈ -0.05R would mean the entry rules add nothing.
-- [ ] Variance-ratio / Hurst test per pair (spec §11.3): do these pairs trend at all on 1-5 day horizons? Never done.
-- [ ] Write the two scripts above (random null + variance ratio) — waiting on user's "go ahead".
+- [ ] Pre-declare pass lines in `docs/TESTLOG.md` BEFORE running anything below:
+  - Random-entry null: entry rules "add value" only if the real result is above the 95th percentile of the random results, on pooled expectancy R.
+  - Variance ratio: "trends" only if VR > 1 beyond 2 SE at 1-5 day horizons on most pairs.
+- [ ] Write the random-entry null script (waiting on user's "go ahead"). Same bias, stops, TP, sizing, costs, caps. Only the entry bar is random. Seeded, 200+ repetitions.
+- [ ] Write the variance-ratio / Hurst script (spec §11.3). Never done.
+- [ ] Run both. Record results in `docs/TESTLOG.md` (user runs them).
 - [ ] Decide from the results:
-  - gross ≈ 0 AND variance ratio ≈ 1 → no trend to harvest on these 10 pairs at H1/H4 in 2015-2025 → change market, timeframe or edge type — or stop.
-  - gross > 0 but costs kill it → structural (spread is a big share of 15-20 pip stops) → wider stops via a longer timeframe, or a cent account.
-- Standing rule: each hypothesis → `docs/TESTLOG.md` BEFORE running, one change per run; keep the last ~3 years unseen for any new idea. Stopping is a valid result — the pipeline caught it before real money; the tooling/engine/ledger/report are reusable for the next idea; keep it demo-only.
+  - real result inside the random cloud AND variance ratio ≈ 1 → no edge from these entry rules / no trend to harvest on these pairs at H1/H4 → change market, timeframe or edge type — or stop.
+  - real result clearly above the cloud, or gross > 0 but costs kill it → structural (spread/swap is a big share of 15-20 pip stops) → wider stops via a longer timeframe, or a cent account.
+- Standing rules:
+  - each hypothesis → `docs/TESTLOG.md` BEFORE running, one change per run
+  - keep the last ~3 years unseen for any new idea
+  - do NOT drop or keep pairs based on this run (about 200 trades per pair; the best/worst pairs are within noise)
+  - stopping is a valid result; the tooling/engine/ledger/report are reusable; keep it demo-only
+
+### Parked until the verdict is in
+
+- [ ] Account size decision: 2.5-3.6 USD risk on a 100 USD account gave 254% MTM drawdown even at ~zero edge. Decide a bigger account, cent account, or smaller risk before any real money.
+- [ ] Swap timing check (low priority): engine charges swap at UTC midnight, broker rolls at ~21-22 UTC. Triple day is approximated.
+- [ ] Strategy-core redesign (open track): design the next change-set with pass lines pre-declared.
+- [ ] Go-live demo smoke: 0.01 lots EURUSD + one JPY pair → all 10; compare fills vs backtest. Rotate the demo password (it appeared in chat).
+- [x] Build the live trading loop (`quant.monitor --trade`; demo only, dry-run default; `start-trader.bat`).
+
+
 
 ## 2026-10-18
 
@@ -97,7 +111,7 @@
   Pepperstone-Demo = POINTS): converts via the point value of a 0.01 lot and the
   broker's own quote for non-USD profit currencies — the plain /100 was wrong for
   JPY pairs (~1.5x) by luck right for EURUSD/XAUUSD. BACKTEST ENGINE now runs a
-  portfolio pass after the daily cap: max_total_positions (4), max_ccy_net (2),
+  portfolio pass after the daily cap: max_total_positions (5), max_ccy_net (2),
   weekly loss halt (limits.weekly_loss_pct) — new knobs live in `_base.yaml`,
   CLI-overridable, 0 = rule off; any run with the pass ON is a NEW declared
   change-set vs R2. Dead yaml keys removed (regime_rule, risk_pct,
