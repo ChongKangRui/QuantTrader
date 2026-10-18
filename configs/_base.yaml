@@ -1,69 +1,66 @@
 # Shared defaults. Per-pair files override risk/strategy only; costs are global.
-# Units: spread in POINTS (20 points = 2.0 pips on 5-digit broker). Swaps in
-# account-currency per 0.01 lot per night, charged both sides unless overridden.
-# Stop/target/BE/trail are checked on the M1 feed (tick-like trail); signals,
-# bias and fills stay H1. An hour with no M1 rows falls back to H1 checks.
-# Build data/<SYM>_M1.csv with: uv run python -m quant.mkdata --symbol <SYM> --m1-csv
+# Units: spread in POINTS (20 pts = 2.0 pips), swaps in account-ccy per 0.01 lot/night.
+# No M1 rows for an hour -> H1 fallback checks. Build M1: uv run python -m quant.mkdata --symbol <SYM> --m1-csv
 timeframes: { execution: H1, regime: H4, position_checks: M1 }
-regime_rule: TODO_define  # e.g. H4 EMA200 slope + Donchian breakout; same fn for backtest + live
+regime_rule: TODO_define
 execution: { signal_bar: t, fill_bar: t+1, fill: next_open_plus_costs }
 costs: { spread_points: 20, swap_long_per_0_01: -0.08, swap_short_per_0_01: -0.08, triple_swap_days: [Wednesday, weekend], commission_per_lot: 0.0, slippage_pips: 0.3 }
-risk: { risk_pct: 0.5, max_positions_per_pair: 1, max_total_positions: 4 }
+# Backtest sizing scope: every trade's 1R must land inside [low, high] USD.
+risk: { risk_pct: 0.5, max_positions_per_pair: 1, max_total_positions: 4,
+        sizing_scope_usd: { low: 2.5, high: 3.6 } }
 account: { currency: USD, contract_size: 100000 }
 live: { magic: 100001, dry_run_default: true }
 limits:
-  weekly_loss_pct: 15.0      # halt new entries at this % of week-start equity
-  max_trades_per_day: 5      # portfolio-wide cap on NEW entries per calendar day; 0 = off
-  # No-trade windows: list of {start, end} month-day ranges (MM-DD, UTC),
-  # inclusive both ends, repeated every year; start > end wraps the New Year.
-  # No NEW entries whose fill day falls inside a window; open positions keep
-  # their stop/trail. Add as many ranges as wanted.
+  weekly_loss_pct: 15.0    # halt new entries at this % of week-start equity
+  max_trades_per_day: 20   # 0 = off
+  max_cost_ratio: 0.10     # new entries: round-trip cost below this share of stop distance (0 = off)
+  # {start, end} = MM-DD UTC ranges (wrap the New Year). No NEW fills inside.
   no_trade_ranges:
-    - { start: "12-15", end: "01-01" }   # holiday season, every year
-# Strategy holds every indicator/strategy setting (STRATEGY.md section 5 table).
-# Three layers: BIAS decides direction, ENTRY fires the trade, RISK MANAGEMENT
-# handles the open position. A bias of FLAT blocks entry; entry only runs on
-# bars where bias is UP/DOWN; risk management starts after the fill.
-# use_* = false lets that gate/leg auto-pass (ablation flips one at a time).
-# Pair files carry symbol + pip_size only; anything under a pair-level
-# `strategy` key is ignored. Pair selection lives in scan-selection.yml.
+    - { start: "12-15", end: "01-01" }
+benchmarks:
+  account_usd: 100         # drawdown % is graded against this equity
+  max_dd_pct: { good: 30.0, ok: 50.0 }
+  profit_factor: { good: 1.50, ok: 1.00 }
+  expect_r: { good: 0.10, ok: 0.00 }
+  per_month: { good: 2.0, ok: 0.2 }
+  worst_year_r: { ok: -20.0 }
+# use_x: false = that gate auto-passes, its knobs just sit idle. h4_* = 4H bias
+# chart, h1_* = 1H entry chart. Pair files never set these.
 strategy:
-  # ================================================================ BIAS (section 4)
-  # Direction from the last CLOSED H4 bar: long = all three true, short =
-  # mirror, else FLAT (no new entries in either direction).
-  use_atr_sep: true   # false = MA-only leg: pure EMA20/50 sign, no HR1, no FLAT
-  hr1: a              # H4 candle vs EMA50: a = close past, b = body past, c = whole candle past
-  sep_atr: 0.3        # min (EMA20-EMA50) / ATR14 gap; lower = bias earlier
-  warmup_bars: 300    # first bars ignored so EMAs/ATR settle (H4 bias and H1 scan both)
-  # ================================================================ ENTRY (section 5)
-  # Rules read the closed H1 signal candle; the fill is the NEXT bar's open.
-  atr_n: 7            # H1 Wilder ATR period used by every rule below
-  ema_fast: 20        # H1 fast EMA: extension cap + E1 trigger line
-  ema_slow: 50        # H1 slow EMA: E1 pullback line
-  use_hr2: true       # body/range >= min_body_ratio, candle colour matches the trade
-  use_hr3: true       # body <= max_body_atr x ATR (no exhaustion spike)
-  use_hr4: true       # signal close within edge_atr x ATR of the last HL/LH
-  hl_guard: true      # HR4 stale guard: skip when structure broke past HL/LH already
-  use_ext: true       # |close - EMA20| <= ext_atr x ATR (not chasing)
-  use_e1_setup: true  # pullback touched EMA50 without closing beyond the floor
-  use_e1_trigger: true  # close beyond EMA20 and the previous bar's extreme
+  # --- 4H bias, last closed H4 bar ---
+  use_atr_sep: true    # false = MA-only, no HR1, no NEUTRAL
+  h4_ema_fast: 20
+  h4_ema_slow: 100
+  h4_atr_n: 14
+  hr1: a               # a close / b body / c whole candle past h4_ema_slow
+  sep_atr: 0.3
+  warmup_bars: 100
+  # --- 1H entry, closed signal bar (fill = next open) ---
+  atr_n: 7
+  h1_ema_fast: 20
+  h1_ema_slow: 50
+  use_e1_setup: true
+  lookback: 5
+  touch_atr: 0.5
+  breakdown_atr: 1.0
+  use_e1_trigger: true
+  use_ext: false
+  ext_atr: 1.5
+  use_hr2: true
   min_body_ratio: 0.5
+  use_hr3: false
   max_body_atr: 1.5
-  lookback: 12        # E1 window length in H1 bars, signal bar included
-  touch_atr: 0.5      # E1 touch: low/high within this of EMA50 (may pierce)
-  breakdown_atr: 1.0  # E1 floor: no close beyond EMA50 shifted by this
-  edge_atr: 1.5       # HR4 max close-to-HL/LH distance in ATR units
-  pivot_n: 3          # bars each side a pivot must beat (sets confirm lag)
-  ext_atr: 1.5        # extension cap distance in ATR units
-  # ================================================================ RISK MANAGEMENT (sections 6-8)
-  stop_atr: 1.5       # 1R unit: initial stop = this x signal-bar ATR (frozen)
-  tp_mult: 3.0        # take profit = this many R from entry
-  use_trail: true     # T1 profit trail (trail_r); false = stop stays at its initial level
-  trail_r: 1.0        # trail gap in R: stop = best-since-entry minus this x risk,
-                      # active only once best profit reaches it (trigger point);
-                      # before that the position keeps its initial stop
-  use_be: false       # optional earlier BE leg: stop to entry+be_buffer at be_trigger_r
-  be_trigger_r: 1.0   # BE trigger in R (equal to trail_r makes BE redundant)
-  be_buffer: 0        # BE stop padding in R
-  bias_flip_exit: false  # close when the H4 bias turns against the trade
-  weekend_flat: false    # close positions before the weekend gap
+  use_hr4: false
+  edge_atr: 1.5
+  pivot_n: 3
+  hl_guard: false
+  # --- open trade (after the fill) ---
+  stop_atr: 1.5
+  tp_mult: 3.0
+  use_trail: false
+  trail_r: 1.5
+  use_be: false
+  be_trigger_r: 1.0
+  be_buffer: 0
+  bias_flip_exit: false
+  weekend_flat: false

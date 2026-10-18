@@ -3,6 +3,45 @@
 Terminal must be open and logged in for anything that reads MT5.
 Monitor and smoke send no orders.
 
+## Live broker costs (read-only, no orders)
+
+```powershell
+$env:PYTHONPATH="python"; uv run python -m quant.spreadcheck
+```
+
+Prints each enabled symbol's live spread and swaps from the terminal.
+Sample it at different hours — demos spread out massively in dead sessions,
+and the backtest cost model needs calibrated numbers.
+
+Numbers land in each pair yaml as a `costs:` override (spread + swaps,
+2026-10-17 Friday-close sample). CLI sweep flags (`--spread-points`,
+`--flat-swaps`, ...) beat pair yaml values, so sensitivity sweeps stay global.
+Zero spreads in the output mean the market is closed or the quote is stale.
+
+## Edge probe (R1 — bias-only measurement, no trades)
+
+```powershell
+$env:PYTHONPATH="python"; uv run python -m quant.edge_probe --batch
+```
+
+Reads the same H1/H4 data as the backtest. Verdict line lives by the
+pre-decided rule in `docs/TESTLOG.md`; per-pair rows are information only.
+
+## Backtest
+
+```powershell
+run-backtest.bat
+```
+
+or: `$env:PYTHONPATH="python"; uv run python -m quant.backtest --batch`
+
+Every run writes `report.html` next to `summary.csv` (skip note if plotly
+is missing). Rebuild for an old folder without re-running backtests:
+
+```powershell
+$env:PYTHONPATH="python"; uv run python -m quant.report --run backtest_results/<id>
+```
+
 ## First time
 
 ```powershell

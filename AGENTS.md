@@ -21,6 +21,9 @@ Always flag real risks, even when I did not ask. If you are unsure, say so.
 - Backtest: `$env:PYTHONPATH="python"; uv run python -m quant.backtest --config configs/EURUSD.yaml --data data/EURUSD_H1.csv [--spread-pips 1.5 --flat-swaps]`
 - Live (terminal running + logged in): `uv run python -m quant.live --config configs/EURUSD.yaml`. Dry-run is the default. Real orders need `--no-dry-run`.
 - M1 CSVs (once per pair, BEFORE tick trails work): `$env:PYTHONPATH="python"; uv run python -m quant.mkdata --symbol EURUSD --m1-csv`. Without `data/<SYM>_M1.csv` the backtest's `position_checks: M1` silently falls back to H1 checks. All-11 parallel loop: `docs/RUNBOOK.md`.
+- Edge probe (R1, no orders): `$env:PYTHONPATH="python"; uv run python -m quant.edge_probe --batch` — verdict rule pre-decided in docs/TESTLOG.md.
+- Live broker costs (read-only): `$env:PYTHONPATH="python"; uv run python -m quant.spreadcheck` — sample at several hours; feeds the spread calibration.
+- Every backtest also writes `report.html` into its run folder (plotly). Rebuild old runs: `python -m quant.report --run backtest_results/<id>`.
 - No lint/typecheck yet. If added, run lint -> typecheck -> test.
 
 ## Config / cost model (required in every backtest)
@@ -53,6 +56,7 @@ Always flag real risks, even when I did not ask. If you are unsure, say so.
 - You may run tests. Ignore failures outside the current task.
 - If a request is ambiguous, give options and a recommendation first.
 - Only when I ask you to do the backtest, you are allow to do that. You can propose to me but never run a backtest process
+- Every new variable to control the strategy, should be able to enable or disable. Numeric value should be able to control and change rather than hardcoded into code.
 
 ## Modes
 | I say | Mode | Edit files? |

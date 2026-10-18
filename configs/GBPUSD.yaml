@@ -3,3 +3,6 @@ base: _base.yaml
 symbol: GBPUSD
 pip_size: 0.0001
 # Note: wider stop + breakout confirmation to cut false breaks
+# Live costs from quant.spreadcheck 2026-10-17 (Friday close): spread = 0.9 pips,
+# swaps per 0.01 lot. Re-sample in a live session - demo spreads move.
+costs: { spread_points: 9, swap_long_per_0_01: -0.0341, swap_short_per_0_01: -0.0174 }

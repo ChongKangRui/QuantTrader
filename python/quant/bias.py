@@ -21,9 +21,9 @@ MIN_BARS = 70  # slow EMA + ATR warmup plus margin
 @dataclass(frozen=True)
 class Bias:
     direction: str  # LONG | SHORT | NEUTRAL
-    ema20: float | None
-    ema50: float | None
-    atr14: float | None
+    ema_fast: float | None
+    ema_slow: float | None
+    atr_n: float | None
     sep_atr: float | None
     hr1_long: bool
     hr1_short: bool
@@ -43,12 +43,16 @@ def _atr_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int =
 
 
 def h4_bias(h4: pd.DataFrame, sep_min: float = SEP_MIN_DEFAULT, hr1: str = "a",
-            use_atr_sep: bool = True, min_bars: int = 300) -> Bias:
+            use_atr_sep: bool = True, min_bars: int = 300,
+            ema_fast: int = EMA_FAST, ema_slow: int = EMA_SLOW,
+            atr_n: int = ATR_PERIOD) -> Bias:
     """Bias from the last row of a closed-bar H4 frame (needs open/high/low/close).
 
-    hr1 selects the STRATEGY.md section 4 variant: a = close past EMA50
+    ema_fast/ema_slow/atr_n come from config (h4_ema_fast/h4_ema_slow/h4_atr_n);
+    the constants above are the locked B1 defaults, never re-tuned silently.
+    hr1 selects the STRATEGY.md section 4 variant: a = close past ema_slow
     (baseline), b = full body past, c = whole candle past.
-    use_atr_sep=False is the MA-only comparison leg: pure EMA20/50 direction,
+    use_atr_sep=False is the MA-only comparison leg: pure ema_fast/slow direction,
     no separation gate, no HR1, no FLAT (ties go UP).
     min_bars is the spec warmup (warmup_bars, default 300): fewer bars -> FLAT.
     """
@@ -57,34 +61,34 @@ def h4_bias(h4: pd.DataFrame, sep_min: float = SEP_MIN_DEFAULT, hr1: str = "a",
         n = 0 if h4 is None else len(h4)
         return Bias("NEUTRAL", None, None, None, None, False, False, f"warmup:bars={n}")
     close, high, low = h4["close"], h4["high"], h4["low"]
-    e20 = float(_ema(close, EMA_FAST).iloc[-1])
-    e50 = float(_ema(close, EMA_SLOW).iloc[-1])
-    atr = float(_atr_wilder(high, low, close).iloc[-1])
+    e_fast = float(_ema(close, int(ema_fast)).iloc[-1])
+    e_slow = float(_ema(close, int(ema_slow)).iloc[-1])
+    atr = float(_atr_wilder(high, low, close, int(atr_n)).iloc[-1])
     o, c = float(h4["open"].iloc[-1]), float(close.iloc[-1])
     hi, lo = float(high.iloc[-1]), float(low.iloc[-1])
-    if pd.isna(e20) or pd.isna(e50) or pd.isna(atr) or atr <= 0:
+    if pd.isna(e_fast) or pd.isna(e_slow) or pd.isna(atr) or atr <= 0:
         return Bias("NEUTRAL", None, None, None, None, False, False, "warmup:nan-atr")
     if variant == "b":
-        hr1_long, hr1_short = min(o, c) > e50, max(o, c) < e50
+        hr1_long, hr1_short = min(o, c) > e_slow, max(o, c) < e_slow
     elif variant == "c":
-        hr1_long, hr1_short = lo > e50, hi < e50
+        hr1_long, hr1_short = lo > e_slow, hi < e_slow
     else:
-        hr1_long, hr1_short = c > e50, c < e50
-    sep = (e20 - e50) / atr
+        hr1_long, hr1_short = c > e_slow, c < e_slow
+    sep = (e_fast - e_slow) / atr
     if not use_atr_sep:
-        if e20 >= e50:
-            return Bias("LONG", e20, e50, atr, sep, hr1_long, hr1_short, "ma-only:up")
-        return Bias("SHORT", e20, e50, atr, sep, hr1_long, hr1_short, "ma-only:down")
-    if e20 > e50 and hr1_long and sep >= sep_min:
-        return Bias("LONG", e20, e50, atr, sep, True, False, f"stack+HR1{variant}+sep{sep:+.2f}")
-    if e20 < e50 and hr1_short and -sep >= sep_min:
-        return Bias("SHORT", e20, e50, atr, sep, False, True, f"stack+HR1{variant}+sep{sep:+.2f}")
-    if e20 > e50 and not hr1_long:
-        veto = f"veto:HR1{variant}"  # pullback under EMA50 while stack still up
-    elif e20 < e50 and not hr1_short:
+        if e_fast >= e_slow:
+            return Bias("LONG", e_fast, e_slow, atr, sep, hr1_long, hr1_short, "ma-only:up")
+        return Bias("SHORT", e_fast, e_slow, atr, sep, hr1_long, hr1_short, "ma-only:down")
+    if e_fast > e_slow and hr1_long and sep >= sep_min:
+        return Bias("LONG", e_fast, e_slow, atr, sep, True, False, f"stack+HR1{variant}+sep{sep:+.2f}")
+    if e_fast < e_slow and hr1_short and -sep >= sep_min:
+        return Bias("SHORT", e_fast, e_slow, atr, sep, False, True, f"stack+HR1{variant}+sep{sep:+.2f}")
+    if e_fast > e_slow and not hr1_long:
+        veto = f"veto:HR1{variant}"  # pullback under ema_slow while stack still up
+    elif e_fast < e_slow and not hr1_short:
         veto = f"veto:HR1{variant}"
-    elif (e20 > e50 and sep < sep_min) or (e20 < e50 and -sep < sep_min):
+    elif (e_fast > e_slow and sep < sep_min) or (e_fast < e_slow and -sep < sep_min):
         veto = "veto:sep"
     else:
         veto = "veto:stack"
-    return Bias("NEUTRAL", e20, e50, atr, sep, hr1_long, hr1_short, veto)
+    return Bias("NEUTRAL", e_fast, e_slow, atr, sep, hr1_long, hr1_short, veto)

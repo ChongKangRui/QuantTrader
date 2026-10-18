@@ -29,8 +29,8 @@ Earlier changes carried: H1-based ATR, HR4 edge = previous H1 HL/LH, extension c
 
 - Trade with the trend on about 10 FX pairs, entries on H1, bias from H4.
 - Typical holding 2-3 days. No hard time cap: a trade runs until its stop, target, or an optional bias-flip / weekend exit.
-- Target 1:3 reward-to-risk, with breakeven at +1R and then a trailing stop.
-- Max loss per trade: USD 3 (locked).
+- Target 1:3 reward-to-risk. Breakeven (+1R) and the T1 profit trail are toggles (`use_be`, `use_trail`) — both OFF in the R2 working baseline (section 7).
+- Per-trade risk comes from `risk.sizing_scope_usd` in `_base.yaml`: actual 1R lands inside the low-high band (2.5-3.6 USD); the old fixed USD 3 cap is retired (section 8, section 12 sizing rule).
 - Python on Windows, `MetaTrader5` package, demo account first.
 - Success is judged on **expectancy in R after costs**, drawdown and robustness, not win rate or signal count.
 
@@ -41,7 +41,7 @@ Candidates (finalize after a correlation check):
 
 - `[DECIDE]` Final 10 and broker symbol names.
 - Sanity check: print signals per pair per month. Expect well over 4-5 a month across the portfolio. Far fewer = rules too strict (the hard rules below stack, so watch this closely).
-- **Signal funnel (first output of every backtest run, before any P&L):** count candidate H1 bars surviving each rule in order: H4 bias (EMA stack, plus separation if on) -> HR1 -> HR2 -> HR3 -> HR4 (edge, including the stale-HL guard) -> extension cap -> E1 setup -> E1 trigger (or E2) -> USD 3 cap / min lot / cost filter -> risk rules (1 open per pair, 1 entry per pair per day, `max_trades_per_day` across the portfolio, 5 open max, loss limits in 8A). Report per pair and per month. This shows exactly which rule kills the trade count. If a test variant such as HR5 is switched on, and for each enabled optional filter, give it its own column.
+- **Signal funnel (first output of every backtest run, before any P&L):** count candidate H1 bars surviving each rule in order: H4 bias (EMA stack, plus separation if on) -> HR1 -> HR2 -> HR3 -> HR4 (edge, including the stale-HL guard) -> extension cap -> E1 setup -> E1 trigger (or E2) -> scope sizing band / min lot / cost filter -> risk rules (1 open per pair, 1 entry per pair per day, `max_trades_per_day` across the portfolio, `max_total_positions` open max, loss limits in 8A). Report per pair and per month. This shows exactly which rule kills the trade count. If a test variant such as HR5 is switched on, and for each enabled optional filter, give it its own column.
 
 ## 3. Data and timing conventions (avoid lookahead)
 
@@ -51,26 +51,29 @@ Candidates (finalize after a correlation check):
 - H4 bias at H1 time `t` uses the **last fully completed H4 bar** only (never the forming one).
 - EMA = standard exponential MA. ATR and RSI = Wilder smoothing. **H1 ATR period = `atr_n` (default 7)**. H4 ATR (bias separation and the optional H4 filters only) and RSI use period 14.
 - Candle terms: body = |close - open|, range = high - low. A bar with range = 0 never qualifies as a signal bar.
-- **Warmup:** ignore the first `warmup_bars` (default 300) bars of each series so EMA50 and ATR have settled.
+- Warmup: ignore the first `warmup_bars` bars of each series so the EMAs and ATR have settled (code default 300; the current `_base.yaml` value is 100).
 - **Position checks are tick-like.** With `timeframes.position_checks: M1` (the default), everything that manages an open position — stop, target, breakeven, trail — is checked on the minute (M1) feed built from the same data source (`data/<SYM>_M1.csv`). An H1 bar with no M1 rows falls back to H1 checks for that bar only. Backtest and live share these conventions.
 
 ## 4. H4 bias (direction filter)
 
-### HR1 (hard rule): H4 candle must be on the trend side of EMA50
+### HR1 (hard rule): H4 candle must be on the trend side of EMA(h4_ema_slow)
 The last completed H4 candle must satisfy, for longs (mirror for shorts), one of `[TEST]`:
-- **HR1a (baseline):** close > EMA(50, H4)
-- **HR1b:** body fully above: min(open, close) > EMA(50, H4)
-- **HR1c (strict):** whole candle above: low > EMA(50, H4)
+- **HR1a (baseline):** close > EMA(`h4_ema_slow`, H4)
+- **HR1b:** body fully above: min(open, close) > EMA(`h4_ema_slow`, H4)
+- **HR1c (strict):** whole candle above: low > EMA(`h4_ema_slow`, H4)
 
-Note: HR1c removes most signals during pullbacks and may leave too few trades. HR1 overlaps with the EMA20 > EMA50 condition but is not identical: during a pullback the close can dip under EMA50 while EMA20 is still above it, and HR1 reacts first.
+Note: HR1c removes most signals during pullbacks and may leave too few trades. HR1 overlaps with the `h4_ema_fast > h4_ema_slow` condition but is not identical: during a pullback the close can dip under the slow line while the fast line is still above it, and HR1 reacts first.
 
 ### Bias definition
-Baseline **B1 (20/50 EMA on H4)**. Long bias when all are true on the last completed H4 bar:
-1. EMA(20) > EMA(50)
+Baseline **B1: EMA(20/50) on H4** — the MA periods are now CONFIG keys, not code
+constants: `h4_ema_fast = 20`, `h4_ema_slow = 50`, `h4_atr_n = 14` in
+`configs/_base.yaml` (locked defaults; changing them is its own declared
+change-set). Long bias when all are true on the last completed H4 bar:
+1. EMA(`h4_ema_fast`) > EMA(`h4_ema_slow`)
 2. HR1 satisfied
-3. (EMA20 - EMA50) >= `sep_atr` x ATR(14, H4)   `[TEST]` 0.0 / 0.2 / 0.4 (default 0.3)
+3. (EMA(`h4_ema_fast`) - EMA(`h4_ema_slow`)) >= `sep_atr` x ATR(`h4_atr_n`, H4)   `[TEST]` 0.0 / 0.2 / 0.4 (default 0.3)
 
-Short bias is the mirror. Otherwise NEUTRAL (no new entries). Variant **B2** uses EMA(100) instead of EMA(50) for the slow line (and HR1 against that line). Comparison leg (not baseline): `use_atr_sep: false` drops the separation gate, HR1 and FLAT — pure EMA20/50 direction, for ablation only.
+Short bias is the mirror. Otherwise NEUTRAL (no new entries). Variant **B2** uses EMA(100) instead of EMA(50) for the slow line (and HR1 against that line). Comparison leg (not baseline): `use_atr_sep: false` drops the separation gate, HR1 and NEUTRAL — pure `h4_ema_fast`/`h4_ema_slow` direction, for ablation only.
 
 On H4, EMA20 is about 3 days, EMA50 about 8 days, EMA100 about 17 days.
 
@@ -91,8 +94,8 @@ All ATR in sections 5-7 means ATR(`atr_n`, H1). Everything is evaluated at the c
 | Parameter | Default | Test range | Used in |
 |---|---|---|---|
 | `atr_n` | 7 | 7 / 14 | every H1 ATR rule |
-| `ema_fast` (H1) | 20 | fixed | extension cap, E1 trigger |
-| `ema_slow` (H1) | 50 | fixed | E1 setup |
+| `h1_ema_fast` | 20 | config | extension cap, E1 trigger |
+| `h1_ema_slow` | 50 | config | E1 setup |
 | `warmup_bars` | 300 | fixed | all indicators |
 | `stop_atr` | 1.5 | 1.0 / 1.5 / 2.0 | S1 stop |
 | `tp_mult` | 3.0 (R) = 4.5 ATR | 2 / 3 | take profit |
@@ -123,13 +126,13 @@ All ATR in sections 5-7 means ATR(`atr_n`, H1). Everything is evaluated at the c
 - Note: the hard rules plus the trigger can make E1 behave almost like a breakout from a young leg. That is fine, but check that trade count stays healthy in the funnel.
 
 ### Fill-time re-check
-The signal is built on the signal bar's close, but the order fills at the next open. Before accepting the fill, recompute with the actual fill price: the extension cap, the USD 3 cap distance, the lot size and the cost filter. If any fails (for example after a gap), skip the trade. This check lives in the backtest and execution layers, which know the real fill price.
+The signal is built on the signal bar's close, but the order fills at the next open. Before accepting the fill, recompute with the actual fill price: the extension cap, the sizing-scope risk distance, the lot size and the cost filter. If any fails (for example after a gap), skip the trade. This check lives in the backtest and execution layers, which know the real fill price.
 
 ### E1: Pullback-resume (baseline trigger)
-Long, short is the mirror, in addition to the hard rules. Over the window of the last `lookback` H1 bars **including the signal bar**, using **each bar's own** EMA(`ema_slow`) and ATR:
+Long, short is the mirror, in addition to the hard rules. Over the window of the last `lookback` H1 bars **including the signal bar**, using **each bar's own** EMA(`h1_ema_slow`) and ATR:
 - **Touch:** at least one bar in the window has `low - EMA50 <= touch_atr x ATR`. Lows may pierce below EMA50; the touch only requires price to have reached down to within `touch_atr x ATR` above it (or lower).
 - **No breakdown:** no bar in the window has `close < EMA50 - breakdown_atr x ATR`. Only closes are floored, not lows (a pullback, not a breakdown).
-- **Trigger:** the signal candle closes above H1 EMA(`ema_fast`) and above the previous H1 bar's high.
+- **Trigger:** the signal candle closes above H1 EMA(`h1_ema_fast`) and above the previous H1 bar's high.
 - **Entry:** market order at the next H1 open.
 
 ### E2: Channel breakout (variant)
@@ -162,17 +165,17 @@ A measurable rule on closed bars, never a feeling. Common archetypes: channel br
 ## 6. Stop loss and take profit
 
 - **S1 (baseline):** stop = `entry -/+ stop_atr x ATR`, with ATR **frozen at the signal bar close** and not updated afterwards. Take profit = `entry +/- tp_mult x stop distance` (3R = 4.5 x ATR at the defaults).
-- **S3 (variant):** structure + clamp. Stop beyond the last H1 HL / LH plus `0.25 x ATR`. If the distance is below `1.0 x ATR` use `1.0 x ATR`. If it is above the smaller of `2.5 x ATR` and the USD 3 cap distance (section 8), skip the trade.
+- **S3 (variant):** structure + clamp. Stop beyond the last H1 HL / LH plus `0.25 x ATR`. If the distance is below `1.0 x ATR` use `1.0 x ATR`. If it is above the smaller of `2.5 x ATR` and the sizing-scope risk distance (section 8), skip the trade.
 - **S2 (variant):** pure structure (HL / LH plus buffer), skip if wider than 3 x ATR.
 
 Skip rules that apply to every stop type:
-- If the stop distance exceeds the USD 3 cap distance, skip the trade. Never widen risk.
+- If the smallest lot already risks more than `sizing_scope_usd.high`, skip the trade (the engine's `scope` funnel gate). Never widen risk.
 - If lots would fall below `volume_min`, skip.
 - Skip if `(spread + expected slippage) / stop distance > max_cost_ratio`.
 
 ## 7. Exit
 
-Baseline **X4:** take profit at `tp_mult` (3R). The stop is managed by the profit trail T1 below. All exit legs are toggles in `_base.yaml` (`use_trail`, `use_be`, `bias_flip_exit`, `weekend_flat`).
+Take profit at `tp_mult` (3R). **Working baseline (R2, docs/TESTLOG.md) is X1: frozen initial stop** (`use_trail: false`, `use_be: false`). The T1 profit trail and the BE leg stay as toggles for the comparison runs. All exit legs are toggles in `_base.yaml` (`use_trail`, `use_be`, `bias_flip_exit`, `weekend_flat`).
 
 Trail:
 - **T1 (baseline, profit-based):** profit = best price since entry, in R of the initial risk. While profit < `trail_r` (the trigger point, default 1R) the position keeps its initial stop; `profit - trail_r` is negative, so nothing moves. From the trigger on, stop = `best price since entry - trail_r x initial risk` for longs (mirror for shorts). At the trigger the stop equals entry (breakeven); beyond it the stop follows (peak +1.5R, stop +0.5R; peak +3R, stop +2R). It only moves in the trade's favor, never back. ATR is not used.
@@ -185,8 +188,8 @@ Timing rules (no lookahead):
 - If stop and target are both inside the same row (M1 minute or H1 bar), assume the **stop was hit first**.
 
 Comparison runs `[TEST]` (these decide whether the BE rule is worth it):
-- **X1:** fixed 3R, no breakeven, no trail (`use_trail: false`, `use_be: false`)
-- **X4a:** BE at +1R then trail (baseline)
+- **X1:** fixed 3R, no breakeven, no trail (`use_trail: false`, `use_be: false`) — R2 working baseline
+- **X4a:** BE at +1R then trail (pre-R2 design default, not the current baseline)
 - **X4b:** BE at +1.5R then trail
 - **X4c:** no BE, trail only after +1.5R
 - **X3:** close 50% at 1.5R, stop to breakeven, remainder targets 3R
@@ -200,27 +203,27 @@ Caution: breakeven stops get hit by ordinary pullbacks and can reduce the share 
 
 ## 8. Risk and sizing (LOCKED rules)
 
-- **Max loss per trade: USD 3.** Lots = 3 / (stop distance in ticks x `trade_tick_value`), rounded **down** to `volume_step`.
+- **Per-trade risk (sizing scope, since 2026-10-17):** the engine sizes the smallest 0.01-lot multiple whose actual 1R reaches `risk.sizing_scope_usd.low` (2.5 USD) and refuses the trade when that would overshoot `high` (3.6 USD) — including when even `volume_min` already risks more than `high`. The old fixed USD 3 cap is retired (section 12 sizing rule; funnel gate renamed `scope`). A fixed `--lot` is a diagnostic override and must still land inside the band.
 - If the result is below `volume_min` (usually 0.01), **skip the trade**. Do not round up.
 - **Max 1 open position per pair.** If the pair already has an ongoing trade, skip it — no new entries.
 - **Max 1 entry per pair per calendar day** (broker server date of the H1 signal bar). A stop-out or time-stop exit does not allow same-day re-entry. Ablation may later test whether this adds value beyond the bar-cooldown in section 5.
 - **No-trade windows:** `limits.no_trade_ranges`, a list of `{start, end}` month-day pairs (`MM-DD`, UTC), inclusive on both ends, repeated every year; a range whose start is later than its end wraps the New Year (e.g. `12-15` to `01-01`). **No new entries whose fill day falls inside a window.** Open positions keep their stop / target / trail — windows are entry filters, not forced repairs. The funnel records skipped candidates in the `window` column, and `params.json` stores the active list.
 - **Max entries per day across the portfolio:** `limits.max_trades_per_day` (default 5, 0 = off). The backtest applies it as a deterministic post-filter: per calendar day the earliest entries stay, later ones drop, and a pair is not refilled that day.
-- **Max 5 open trades portfolio-wide.** Total open risk is then at most 5 x USD 3 = USD 15.
+- **Max open trades portfolio-wide: `risk.max_total_positions` = 4.** Total open risk is then at most 4 x `sizing_scope_usd.high` = USD 14.4.
 - What the cap implies at minimum lot 0.01 (approximate, check the symbol info):
   - USD-quoted pairs (EURUSD, GBPUSD, AUDUSD): about USD 0.10 per pip, so the stop can be at most about 30 pips.
   - JPY pairs: about USD 0.06-0.07 per pip, so at most about 40-45 pips.
-  - Compute per symbol: `max_stop_distance = 3 / (tick_value / tick_size x volume_min)`.
+  - Compute per symbol: `max_stop_distance = high / (tick_value / tick_size x volume_min)`.
 - Currency exposure: count a long EURUSD as +EUR, -USD. Cap net exposure per currency at `max_ccy_net` trades in one direction `[TEST]` (suggested 2).
 - Margin check: with all positions open, free margin must stay comfortably positive.
-- **Log risk as a percentage of equity on every trade** (`3 / equity`). USD 3 is a fixed amount, so its percentage changes with the account, and it is the number that matters for drawdown (see 8A).
+- **Log risk as a percentage of equity on every trade** (per-trade risk / equity). The USD risk is scoped, not fixed, so its percentage changes with the account and the stop, and it is the number that matters for drawdown (see 8A).
 
 ## 8A. Loss limits and drawdown rules (PROPOSED, not locked)
 
 Principles:
 - Losing trades are normal in a trend system (most trades lose). Rules here protect against an unusual run, a regime change, or a bug. They are **circuit breakers, not strategy tuning**.
 - Calibrate every limit in the backtest so it triggers rarely (for example around the 95th percentile of historical daily and weekly losses). A limit that triggers often changes the strategy and can cut off the winners that follow losses.
-- Limits are written in R and in percent of equity, so they stay meaningful as the account changes. R here is the actual risk taken on each trade (at most USD 3, less when lot rounding makes it smaller).
+- Limits are written in R and in percent of equity, so they stay meaningful as the account changes. R here is the actual risk taken on each trade (at most `sizing_scope_usd.high`, less when lot rounding makes it smaller).
 
 Proposed limits `[DECIDE]` / `[TEST]`:
 - **Daily loss limit:** realized loss of `daily_loss_r` (start 2R) on trades closed in the broker-server day: no new entries until the next day. Open trades keep their SL / TP / trail.
@@ -230,7 +233,7 @@ Proposed limits `[DECIDE]` / `[TEST]`:
   - L2 at `dd2_pct` (start 15%): no new entries for the rest of the week, then review.
   - L3 at `dd3_pct` (start 20%): stop the system (kill switch). Restart only after a written review and, preferably, a demo re-test.
   - If the account is large enough for lot sizes to scale, L1 may instead halve the per-trade risk.
-- **Open-risk cap** `[DECIDE]`: total open risk is 5 x USD 3 = USD 15 under the locked rules. Decide whether a lower cap in USD or percent is appropriate for the account size (for example 3 trades), because one USD move can stop several positions at once.
+- **Open-risk cap** `[DECIDE]`: total open risk is 4 x `sizing_scope_usd.high` ≈ USD 14.4 under the current rules. Decide whether a lower cap in USD or percent is appropriate for the account size (for example 3 trades), because one USD move can stop several positions at once.
 - **After a loss: no change to sizing.** No martingale, no size-up to "win it back". Risk changes only through the ladder above.
 - **Pair level:**
   - No pair ban after a single loss.
@@ -245,7 +248,7 @@ Reference math (approximate):
 
 ## 9. Trade filters
 
-- Skip if `(spread + expected slippage) / stop distance` > `max_cost_ratio` (start 10%, `[TEST]`). With a small stop and USD 3 risk, spread weighs more, so this filter matters.
+- Skip if `(spread + expected slippage) / stop distance` > `max_cost_ratio` (start 10%, `[TEST]`). With a small stop and per-trade risk in the 2.5-3.6 USD band, spread weighs more, so this filter matters.
 - No new entries within about one hour of the daily rollover (broker server time).
 - Optional session filter `[TEST]`: London and New York hours only.
 - News filter: not in v1; add only if losses cluster around events.
@@ -257,11 +260,13 @@ Reference math (approximate):
 - Slippage: fixed addition per fill `[TEST]` (e.g. 0.2 x typical spread), plus a 2x spread stress run.
 - Swap: `swap_long` / `swap_short` per night held, with the triple-swap day from `swap_rollover3days`.
 - Commission: per the broker's account type.
+- **Per-pair calibrated costs (since 2026-10-17):** pair yamls carry their own `costs` (spread/swaps/slippage sampled by `python -m quant.spreadcheck`); CLI sweep flags (`--spread-points` / `--spread-pips`, `--slippage-pips`, `--flat-swaps`) beat them globally. Every run records the applied costs — global in `params.json: costs`, per pair in `pair_costs`.
 
 ## 11. Test plan
 
 1. Signals only: **print the signal funnel and signals per pair per month first** (section 2), then plot on charts and hand-check a sample against the rules and the H4 shift. Do not look at P&L until the trade count is acceptable.
 2. Full simulation with costs. Metrics: expectancy (R), win rate, profit factor, max drawdown, trades/month, exits by type (target, stop, breakeven, trail), results per pair.
+2a. **Bias-only probe (`python -m quant.edge_probe`) comes before any entry work:** direction-aligned forward move over 24/48/72 H1 bars in ATR units at onset flips, all bias-on bars (state), and a random-direction null; costs live in the units. Verdict rule is pre-decided in `docs/TESTLOG.md`: pooled onset edge >= 0 beyond 2 SE at 48 and 72 bars; per-pair rows and the 24-bar horizon are information only.
 3. **Thesis check before building more:** compute a variance ratio (or Hurst estimate) on each pair's returns at 1-5 day horizons to see whether momentum or mean reversion dominates in your data and period.
 4. **Ablation:** switch each hard rule (HR1-HR4), the stale-HL guard, the extension cap and each optional filter on/off one at a time and record the change in after-cost expectancy and trade count. Keep a rule only if it clearly helps, and not just in-sample.
 5. **Null model:** run the same stop, exit and sizing with random entries in the bias direction (many repetitions). The real system must beat the random-entry distribution (e.g. above its 95th percentile).
@@ -287,8 +292,11 @@ A variant passes only if all hold on out-of-sample data after full costs:
 - Neighboring parameter sets mostly positive (e.g. 70%+), not a single spike.
 - No single pair contributes more than about 40% of profit.
 - Max drawdown at the chosen risk within your limit `[DECIDE]`.
+- Numeric bands now live in `configs/_base.yaml` (`benchmarks:`): the backtest grades each run into `summary.csv` (PASS/WARN/FAIL per metric plus an overall `verdict` per row). Declared account 100 USD, so drawdown % = USD drawdown / 100 — an aggressive yardstick, retunable in yaml without code edits.
 
 Reference math (fixed 1:3 target, no breakeven or trailing): breakeven win rate = (1 + c) / (RR + 1), where c is the average cost in R. With RR = 3 and c = 0: 25%. With c = 0.10R: 27.5%. A zero-drift random walk reaches +3R before -1R about 25% of the time, so a real edge shows up as a win rate meaningfully above that after costs. With breakeven and trailing the formula no longer applies, so use the simulation.
+Entry gate: `limits.max_cost_ratio` in `_base.yaml` rejects any candidate whose round-trip cost exceeds that share of its stop distance (0 disables the gate). It is a visible knob now — it used to hide in engine defaults and silently selected only volatility spikes. Calibrate spreads per pair from `python -m quant.spreadcheck` before tuning it.
+Sizing rule (2026-10-17): `risk.sizing_scope_usd` in `_base.yaml` is the only sizing input — the engine picks the smallest 0.01-lot multiple whose actual 1R reaches `low` (2.5 USD) and refuses the trade when that overshoots `high` (3.6 USD), or when even 0.01 lot already risks more than `high`. Granularity holes (no lot fits the band, e.g. stops of 18-25 pips on EURUSD) show up as `scope` skips in funnel.csv — widen `high` only if the funnel proves the hole eats good setups. A fixed `--lot` is a diagnostic override and still must land inside the band. The legacy `risk_usd` target and the USD3 cap-distance gate are retired (funnel gate renamed `scope`).
 
 Demo forward test (2-3 months) checks plumbing (fills, timing, slippage, swaps) more than edge. Go live only at minimum size.
 
@@ -297,15 +305,17 @@ Demo forward test (2-3 months) checks plumbing (fills, timing, slippage, swaps) 
 - Python on Windows with the MT5 terminal open and logged in. Evaluate once per H1 bar close for all pairs.
 - Every order carries a server-side SL and TP. The trailing stop is applied by modifying the SL each bar. On startup, reconcile open positions with system state.
 - Log every decision with its reason (including which rule vetoed a candidate). Kill switch: the daily, weekly and drawdown limits in 8A, plus a manual stop file.
-- Trade record: every fill appends one row to `trades/journal.csv` (`time_utc,symbol,direction,entry,sl,tp,lot,h4_bias,h4_ema20,h4_ema50,h4_sep_atr,hr1,trigger,spread_pts,slippage_pips,magic,comment,ticket,dry_run,reason`). The MT5 on-chain comment is a short code only (`QT B1-L E1`, 31-char limit); the full reason lives in the journal + log.
+- Trade record: every fill appends one row to `trades/journal.csv` (`time_utc,symbol,direction,entry,sl,tp,lot,h4_bias,h4_ema20,h4_ema50,h4_sep_atr,hr1,trigger,spread_pts,slippage_pips,magic,comment,ticket,dry_run,reason`; the `h4_ema20`/`h4_ema50` column names are legacy labels — their VALUES follow the configured `h4_ema_fast`/`h4_ema_slow` periods). The MT5 on-chain comment is a short code only (`QT B1-L E1`, 31-char limit); the full reason lives in the journal + log.
 - Panel: `python -m quant.monitor` prints bias + entry checklist per pair (`GO` or first failing section-5 rule, `*` = open position), repainted only on a new closed H1 bar. Header rows: laptop local time (Malaysia UTC+8), broker last-H1-close time (UTC), per-account week P&L with `HALTED` banner at the `WEEKLY_LOSS_PCT` limit. `NONE DETECTED` when no pair holds UP/DOWN H4 bias; per-pair `DATA ERROR` rows otherwise. Halt state persists in `memory/weekly_<demo|real>.json`.
 - Executor: `python -m quant.live --roundtrip` (open + immediate market close) and `--touch-close` (open with close SL+TP, broker closes on first touch, timeout falls back to market close). No signal entries yet. Dry-run default; real orders need `--no-dry-run` plus exactly one enabled account. Both legs journaled.
-- Backtest: `python -m quant.backtest --batch` loops `configs/scan-selection.yml` (tick pairs on/off there; missing `data/<SYM>_H1.csv` prints SKIP and continues). Results to `backtest_results/<local-time>/`: `summary.csv`, `funnel.csv`, `trades_<SYM>.csv`, `params.json`. Build H1 with `python -m quant.mkdata --symbol <SYM>`.
+- Backtest: `python -m quant.backtest --batch` loops `configs/scan-selection.yml` (tick pairs on/off there; missing `data/<SYM>_H1.csv` prints SKIP and continues). Results to `backtest_results/<local-time>/`: `summary.csv`, `funnel.csv`, `trades_<SYM>.csv`, `yearly.csv`, `params.json`, plus `report.html` (auto, plotly; import-guarded). Every run also appends one summary row to `backtest_results/_ledger.csv` (auto, best-effort; `python -m quant.ledger --rebuild` rebuilds it). Build H1 with `python -m quant.mkdata --symbol <SYM>`.
 - Demo account only until section 12 is satisfied.
+
+
 
 ## 14. Open decisions
 
-- [x] USD 3 = max loss per trade (locked, section 8)
+- [x] Per-trade risk = sizing scope 2.5-3.6 USD (`sizing_scope_usd`, section 8/12) — supersedes the old "USD 3 max loss" lock (2026-10-17)
 - [x] Baseline bias = original B1 (EMA20 > EMA50, HR1a, separation); HR5 is an off-by-default test variant
 - [x] HR4 edge = previous H1 higher low / lower high (section 5)
 - [x] HR1 variant: HR1a (close) is the baseline (section 4)

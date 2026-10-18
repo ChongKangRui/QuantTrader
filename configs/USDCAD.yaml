@@ -3,3 +3,6 @@ base: _base.yaml
 symbol: USDCAD
 pip_size: 0.0001
 # Note: H4-led; H1 only for entry timing
+# Live costs from quant.spreadcheck 2026-10-17 (Friday close): spread = 0.6 pips,
+# swaps per 0.01 lot. Re-sample in a live session - demo spreads move.
+costs: { spread_points: 6, swap_long_per_0_01: 0.0403, swap_short_per_0_01: -0.1027 }

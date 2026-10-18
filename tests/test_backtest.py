@@ -1,7 +1,8 @@
 ﻿"""Backtest tests. Synthetic H1 only, never data/, never a terminal."""
 import pandas as pd
 
-from quant.backtest import bias_frames, build_h4, map_bias, metrics, scan_pair, simulate
+from quant.backtest import (bias_frames, build_h4, grade_benchmarks, map_bias,
+                            metrics, scan_pair, simulate, total_row)
 from quant.bias import h4_bias
 
 
@@ -245,12 +246,13 @@ def test_parallel_run_matches_linear_and_isolates_failures(tmp_path):
     a, b = tmp_path / "EURUSD_H1.csv", tmp_path / "GBPUSD_H1.csv"
     _synthetic_csv(a)
     _synthetic_csv(b, seed_phase=1.3)
-    jobs = [("EURUSD", a), ("MISSING", tmp_path / "nope.csv"), ("GBPUSD", b)]
+    jobs = [("EURUSD", a, _costs()), ("MISSING", tmp_path / "nope.csv", _costs()),
+            ("GBPUSD", b, _costs())]
     p = {"sep_atr": 0.3, "hr1": "a", "use_atr_sep": True, "warmup_bars": 300}
     args = argparse.Namespace(risk_usd=3.0, max_cost_ratio=0.10, bias_flip_exit=False,
-                              weekend_flat=False, lot=0.01)
-    lin, lin_fail = run_all(jobs, p, _costs(), args, None, workers=1)
-    par, par_fail = run_all(jobs, p, _costs(), args, None, workers=3)
+                              weekend_flat=False, lot=0.01, scope_low=0.0, scope_high=0.0)
+    lin, lin_fail = run_all(jobs, p, args, None, workers=1)
+    par, par_fail = run_all(jobs, p, args, None, workers=3)
     assert set(lin_fail) == set(par_fail) == {"MISSING"}  # bad pair does not lose the others
     assert set(lin) == set(par) == {"EURUSD", "GBPUSD"}
     for sym in lin:
@@ -359,6 +361,147 @@ def test_position_checks_walk_m1_and_fall_back_per_hour():
     assert abs(trades_m1["exit"].iloc[0] - level) < 1e-6
     assert str(trades_m1["exit_time"].iloc[0]).endswith("13:35:00+00:00")  # minute-precision exit
     assert trades_h1["exit_type"].iloc[0] == "target"  # hour checks miss the intra-bar dip
+
+
+def test_max_dd_counts_first_loss():
+    m = metrics(pd.DataFrame([{"pnl_usd": -2.86, "pnl_R": -1.0, "bars_held": 5}]), 30, 100)
+    assert m["max_dd"] == 2.86  # equity starts at 0, so the first loss is drawdown
+    t = pd.DataFrame([
+        {"symbol": "X", "exit_time": "2020-05-01 00:00:00+00:00", "pnl_usd": -3.0,
+         "pnl_R": -1.0, "bars_held": 5},
+        {"symbol": "X", "exit_time": "2020-05-02 00:00:00+00:00", "pnl_usd": 4.0,
+         "pnl_R": 1.0, "bars_held": 5}])
+    assert total_row(t)["max_dd"] == 3.0  # same for the portfolio curve
+
+
+def test_simulate_reports_named_gates():
+    from quant.backtest import simulate
+
+    h1 = _trade_frame([1.1005, 1.1010, 1.1020])
+    _, extra = simulate(h1, "EURUSD", [], {}, {"spread_points": 20, "slippage_pips": 0.3},
+                        3.0, 0.10)
+    for key in ("sized", "window", "open", "day", "tick", "scope", "cost", "lot"):
+        assert key in extra  # every skip reason is named, nothing hides in "sized"
+
+
+def test_cli_costs_beat_everything():
+    import argparse
+
+    from quant.backtest import _cli_costs
+
+    args = argparse.Namespace(spread_pips=None, spread_points=None,
+                              slippage_pips=0.5, flat_swaps=True)
+    out = _cli_costs(args)
+    assert out == {"slippage_pips": 0.5,
+                   "swap_long_per_0_01": 0.0, "swap_short_per_0_01": 0.0}
+    assert _cli_costs(argparse.Namespace(spread_pips=None, spread_points=None,
+                                         slippage_pips=None, flat_swaps=False)) == {}
+
+
+def test_cost_gate_sensitivity_to_spread():
+    """The gate must respond to smaller/larger spreads (per-pair calibration relies on it)."""
+    import argparse
+
+    from quant.backtest import simulate
+
+    # spread 20 points (2 pips): stop 23.2 pips -> cost ratio 0.0993 passes at 0.10
+    h1 = _trade_frame([1.1000, 1.1010, 1.1200])
+    cands = [{"t": 0, "direction": "LONG", "atr": 0.00155}]  # stop = 1.5 x 15.5 pips
+    args = argparse.Namespace(risk_usd=3.0, max_cost_ratio=0.10, lot=0.01)
+    _, ex = simulate(h1, "EURUSD", cands, {"stop_atr": 1.5, "tp_mult": 3.0},
+                     {"spread_points": 20, "slippage_pips": 0.3}, args.risk_usd,
+                     args.max_cost_ratio, lot=args.lot)
+    _, ex_tight = simulate(h1, "EURUSD", cands, {"stop_atr": 1.5, "tp_mult": 3.0},
+                           {"spread_points": 22, "slippage_pips": 0.3}, 3.0, 0.10,
+                           lot=0.01)
+    assert ex["cost"] == 0 and ex["sized"] == 1         # 2 pips: fits the gate
+    assert ex_tight["cost"] == 1                        # 2.2 pips: gate says no
+
+
+def test_scope_sizing_sizes_up_and_skips():
+    """scope [2.5, 3.6] USD: size up to >= 2.5; skip when no 0.01 multiple fits."""
+    # EURUSD: $0.10 per pip per 0.01 lot -> a 10-pip stop risks $1.00 at 0.01 lot
+    h1 = _trade_frame([1.1000, 1.1010, 1.1200])
+    cands = [{"t": 0, "direction": "LONG", "atr": 0.001000 / 1.5}]  # stop = 10 pips
+    tr, _ = simulate(h1, "EURUSD", cands, {"stop_atr": 1.5, "tp_mult": 3.0},
+                     {"spread_points": 2, "slippage_pips": 0.3}, 3.0, 0.0,
+                     scope_low=2.5, scope_high=3.6)
+    assert len(tr) == 1
+    assert round(float(tr["lot"].iloc[0]), 2) == 0.03   # sized up: 3 x $1.00 = $3.00
+    assert abs(float(tr["risk_usd"].iloc[0]) - 3.0) < 0.011  # 1R stays in band
+
+    h1b = _trade_frame([1.1000, 1.1010, 1.1200])
+    cands = [{"t": 0, "direction": "LONG", "atr": 0.002400 / 1.5}]  # stop = 24 pips
+    _, ex = simulate(h1b, "EURUSD", cands, {"stop_atr": 1.5, "tp_mult": 3.0},
+                     {"spread_points": 2, "slippage_pips": 0.3}, 3.0, 0.0,
+                     scope_low=2.5, scope_high=3.6)
+    assert ex["scope"] == 1  # hole: 0.01 lot = $2.40 < low, 0.02 lots = $4.80 > high
+
+    h1c = _trade_frame([1.1000, 1.1010, 1.1200])
+    cands = [{"t": 0, "direction": "LONG", "atr": 0.004000 / 1.5}]  # stop = 40 pips
+    _, ex = simulate(h1c, "EURUSD", cands, {"stop_atr": 1.5, "tp_mult": 3.0},
+                     {"spread_points": 2, "slippage_pips": 0.3}, 3.0, 0.0,
+                     scope_low=2.5, scope_high=3.6)
+    assert ex["scope"] == 1  # even 0.01 lot ($4.00) is already above the ceiling
+
+
+def test_scope_filters_fixed_lot():
+    h1 = _trade_frame([1.1000, 1.1010, 1.1200])
+    cands = [{"t": 0, "direction": "LONG", "atr": 0.002400 / 1.5}]  # stop = 24 pips
+    tr, ex = simulate(h1, "EURUSD", cands, {"stop_atr": 1.5, "tp_mult": 3.0},
+                      {"spread_points": 2, "slippage_pips": 0.3}, 3.0, 0.0, lot=0.01,
+                      scope_low=2.5, scope_high=3.6)
+    assert len(tr) == 0 and ex["scope"] == 1  # fixed 0.01 lot risks $2.40, below low
+
+
+def test_mtm_equity_marks_open_positions():
+    from quant.backtest import mtm_equity
+
+    times = pd.date_range("2024-01-02 00:00", periods=6, freq="h", tz="UTC")
+    h1 = pd.DataFrame({"time": times,
+                       "close": [1.1000, 1.1010, 1.1020, 1.1030, 1.0990, 1.1015]})
+    tr = pd.DataFrame([
+        {"symbol": "EURUSD", "direction": "SHORT",
+         "entry_time": str(times[0]), "exit_time": str(times[1]),
+         "entry": 1.1000, "sl": 1.1010, "pnl_usd": -3.0, "risk_usd": 3.0},
+        {"symbol": "EURUSD", "direction": "LONG",
+         "entry_time": str(times[1]), "exit_time": str(times[5]),
+         "entry": 1.1010, "sl": 1.1000, "pnl_usd": 5.0, "risk_usd": 2.5},
+    ])
+    curve = mtm_equity({"EURUSD": tr}, {"EURUSD": h1}, 100.0)
+    got = [round(float(v), 2) for v in curve["usd"]]
+    # long trade's mark rides its close: +1R, +2R, then -2R before realizing +5
+    assert got == [100.0, 97.0, 99.5, 102.0, 92.0, 102.0]
+    dd = float((curve["usd"].cummax() - curve["usd"]).max())
+    assert abs(dd - 10.0) < 1e-6  # open floating loss deeper than the 3.0 closed dip
+
+
+def test_grading_bands_and_edges():
+    bench = {"account_usd": 100.0, "max_dd_pct": {"good": 30.0, "ok": 50.0},
+             "profit_factor": {"good": 1.5, "ok": 1.0}, "expect_r": {"good": 0.1, "ok": 0.0}}
+    g = grade_benchmarks({"trades": 10, "max_dd": 29.0, "profit_factor": 1.6, "expect_R": 0.2}, bench)
+    assert g["max_dd_pct"] == 29.0 and "dd_band" not in g  # per-pair DD band is gone
+    assert g["verdict"] == "PASS"
+    g = grade_benchmarks({"trades": 10, "max_dd": 40.0, "profit_factor": 1.2, "expect_R": 0.05}, bench)
+    assert (g["pf_band"], g["expect_band"], g["verdict"]) == ("WARN", "WARN", "WARN")
+    g = grade_benchmarks({"trades": 10, "max_dd": 75.0, "profit_factor": 1.6, "expect_R": 0.2},
+                         bench, portfolio=True)
+    assert g["dd_band"] == "FAIL" and g["verdict"] == "FAIL"  # drawdown bands: TOTAL only
+    # zero trades: no evidence, not a verdict -> NA
+    g = grade_benchmarks({"trades": 0, "max_dd": 0.0, "profit_factor": 0.0, "expect_R": 0.0}, bench)
+    assert g["verdict"] == "NA"
+    # profit factor inf (no losing trades) must grade PASS, not crash
+    g = grade_benchmarks({"trades": 3, "max_dd": 0.0, "profit_factor": float("inf"), "expect_R": 1.0}, bench)
+    assert g["pf_band"] == "PASS"
+    # portfolio-only metrics: trades/month and worst calendar year
+    pb = {"account_usd": 100.0, "max_dd_pct": {"good": 30.0, "ok": 50.0},
+          "profit_factor": {"good": 1.5, "ok": 1.0}, "expect_r": {"good": 0.1, "ok": 0.0},
+          "per_month": {"good": 2.0, "ok": 0.2}, "worst_year_r": {"ok": -20.0}}
+    m = {"trades": 50, "max_dd": 10.0, "profit_factor": 1.5, "expect_R": 0.1, "per_month": 1.0}
+    g = grade_benchmarks(m, pb, portfolio=True, min_year_R=-5.0)
+    assert g["freq_band"] == "WARN" and g["year_band"] == "PASS" and g["verdict"] == "WARN"
+    g = grade_benchmarks(m, pb, portfolio=True, min_year_R=-25.0)
+    assert g["year_band"] == "FAIL"  # a -25R year fails even with a green rest
 
 
 def test_m1_slice_anchors_at_true_hour_edge():

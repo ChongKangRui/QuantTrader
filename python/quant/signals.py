@@ -13,8 +13,8 @@ import pandas as pd
 # use_* flags switch gates off for ablation (off = gate auto-passes).
 DEFAULTS = {
     "atr_n": 7,
-    "ema_fast": 20,
-    "ema_slow": 50,
+    "h1_ema_fast": 20,
+    "h1_ema_slow": 50,
     "warmup_bars": 300,
     "stop_atr": 1.5,
     "tp_mult": 3.0,
@@ -91,8 +91,8 @@ def check_entry(h1: pd.DataFrame, direction: str, params: dict | None = None) ->
         return _result(False, "direction", {}, None, None)
 
     close, high, low = h1["close"], h1["high"], h1["low"]
-    efast = _ema(close, int(p["ema_fast"]))
-    eslow = _ema(close, int(p["ema_slow"]))
+    efast = _ema(close, int(p["h1_ema_fast"]))
+    eslow = _ema(close, int(p["h1_ema_slow"]))
     atr = _atr_wilder(high, low, close, int(p["atr_n"]))
     t = len(h1) - 1
     o, hi, lo, c = (float(h1[col].iloc[t]) for col in ("open", "high", "low", "close"))

@@ -21,7 +21,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from quant.bias import SEP_MIN_DEFAULT, h4_bias
+from quant.bias import ATR_PERIOD, EMA_FAST, EMA_SLOW, SEP_MIN_DEFAULT, h4_bias
 from quant.limits import md_in_ranges, parse_no_trade_ranges
 from quant.signals import check_entry
 
@@ -73,21 +73,30 @@ def _atr_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int =
     return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
 
 
+def _bias_periods(p: dict) -> tuple[int, int, int]:
+    """H4 bias MA/ATR periods from strategy keys (h4_ema_fast/h4_ema_slow/h4_atr_n);
+    defaults stay the locked B1 constants so old configs keep identical behavior."""
+    return (int(p.get("h4_ema_fast") or EMA_FAST),
+            int(p.get("h4_ema_slow") or EMA_SLOW),
+            int(p.get("h4_atr_n") or ATR_PERIOD))
+
+
 def bias_frames(h4: pd.DataFrame, p: dict) -> pd.DataFrame:
     """Per-H4-bar bias direction plus funnel components (same math as h4_bias)."""
     warmup = int(p.get("warmup_bars", 300))
     sep_min = float(p.get("sep_atr", SEP_MIN_DEFAULT))
     hr1 = str(p.get("hr1", "a")).lower()
     use_sep = bool(p.get("use_atr_sep", True))
-    e20 = _ema(h4["close"], 20)
-    e50 = _ema(h4["close"], 50)
-    atr = _atr_wilder(h4["high"], h4["low"], h4["close"], 14)
+    e_fast_n, e_slow_n, atr_n = _bias_periods(p)
+    e_fast = _ema(h4["close"], e_fast_n)
+    e_slow = _ema(h4["close"], e_slow_n)
+    atr = _atr_wilder(h4["high"], h4["low"], h4["close"], atr_n)
     rows = []
     for i in range(len(h4)):
         if i < warmup or pd.isna(atr.iloc[i]) or atr.iloc[i] <= 0:
             rows.append(("NEUTRAL", False, False))
             continue
-        a, b, c = float(e20.iloc[i]), float(e50.iloc[i]), float(h4["close"].iloc[i])
+        a, b, c = float(e_fast.iloc[i]), float(e_slow.iloc[i]), float(h4["close"].iloc[i])
         o, hi, lo = float(h4["open"].iloc[i]), float(h4["high"].iloc[i]), float(h4["low"].iloc[i])
         v = float(atr.iloc[i])
         if hr1 == "b":
@@ -155,10 +164,14 @@ def tick_spec(symbol: str, price: float, rates: dict[str, float] | None = None,
 def scan_pair(h1: pd.DataFrame, h4: pd.DataFrame, symbol: str, p: dict) -> tuple[pd.DataFrame, list[dict]]:
     """Entry scan. Returns (funnel_counts, candidates). Candidates hold sizing inputs."""
     bf = bias_frames(h4, p)
+    # shared-core guard: the frame math and the single-bar core must agree,
+    # including the same period set (h4_ema_fast/h4_ema_slow/h4_atr_n)
     assert bf["direction"].iloc[-1] == h4_bias(
         h4, float(p.get("sep_atr", SEP_MIN_DEFAULT)), str(p.get("hr1", "a")),
-        bool(p.get("use_atr_sep", True)),
-        min_bars=int(p.get("warmup_bars", 300))).direction  # shared-core guard
+        bool(p.get("use_atr_sep", True)), min_bars=int(p.get("warmup_bars", 300)),
+        ema_fast=int(p.get("h4_ema_fast") or EMA_FAST),
+        ema_slow=int(p.get("h4_ema_slow") or EMA_SLOW),
+        atr_n=int(p.get("h4_atr_n") or ATR_PERIOD)).direction  # shared-core guard
     mapped = map_bias(h1, h4, bf)
     funnel = {"scanned": 0, "stacksep": 0, "hr1": 0, "hr2": 0, "hr3": 0,
               "hr4": 0, "ext": 0, "e1setup": 0, "e1trigger": 0}
@@ -213,11 +226,17 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
              mapped: pd.DataFrame | None = None, lot: float | None = None,
              converters: dict[str, pd.Series] | None = None,
              m1: pd.DataFrame | None = None,
-             no_trade_ranges: tuple = ()) -> tuple[pd.DataFrame, dict]:
+             no_trade_ranges: tuple = (), *,
+             scope_low: float = 0.0, scope_high: float = 0.0
+             ) -> tuple[pd.DataFrame, dict]:
     """Walk candidates in time order; 1 open/pair and 1 entry/day enforced here.
 
-    lot set (e.g. 0.01) fixes size; None sizes from risk_usd. Either way the
-    USD3 cap-distance skip and the cost filter still apply, and R uses actual risk.
+    Sizing: with the scope (default path) the lot is the smallest 0.01 multiple
+    whose actual 1R reaches scope_low; the trade is refused when that lot
+    overshoots scope_high or when even 0.01 lot already risks more than
+    scope_high. A fixed `lot` is a diagnostic override and still must land
+    inside [scope_low, scope_high]. With the scope off and no fixed lot, the
+    legacy risk_usd target sizing applies. R uses actual risk in either mode.
     jpy carries USDJPY closes for JPY-cross USD conversion (None = unconvertible).
     m1, when given, is the minute feed: stop/target/BE/trail are checked row by
     row on it (tick-like); an hour with no M1 rows falls back to the H1 row.
@@ -252,14 +271,18 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
     trades = []
     funnel_sized = 0
     window_skips = 0
+    # named gates so the funnel never hides WHY candidates die (the old "sized" lump)
+    open_skips = day_skips = tick_skips = scope_skips = cost_skips = lot_skips = 0
     open_until = -1
     last_day = None
     for cand in cands:
         t, direction = cand["t"], cand["direction"]
         if t + 1 >= len(h1) or t <= open_until:
+            open_skips += 1  # a position is still open or bars overlap
             continue
         day = h1["time"].iloc[t].date()
         if day == last_day:
+            day_skips += 1  # one entry per pair per day
             continue
         if no_trade_ranges and md_in_ranges(
                 h1["time"].iloc[t + 1].strftime("%m-%d"), no_trade_ranges):
@@ -268,19 +291,39 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
         tick = tick_spec(symbol, float(h1["open"].iloc[t + 1]), _converter_rates(
             converters, h1["time"].iloc[t]))
         if tick is None:
-            continue  # no USD conversion path for this bar
+            tick_skips += 1  # no USD conversion path for this bar
+            continue
         tick_size, tick_value = tick
-        max_stop = risk_usd / ((tick_value / tick_size) * 0.01)  # USD3 cap distance
         atr_f = float(cand["atr"])
         stop_dist = stop_mult * atr_f
-        if stop_dist <= 0 or stop_dist > max_stop:
+        if max_cost_ratio > 0 and (spread_px + slip_px) / stop_dist > max_cost_ratio:
+            cost_skips += 1  # round-trip cost too large vs the stop distance
             continue
-        if (spread_px + slip_px) / stop_dist > max_cost_ratio:
-            continue
-        lots = float(lot) if lot else risk_usd / ((stop_dist / tick_size) * tick_value)
-        lots = int(lots // 0.01) * 0.01
-        if lots < 0.01:
-            continue
+        step_risk = (stop_dist / tick_size) * tick_value * 0.01  # 1R at 0.01 lot
+        if lot:  # fixed diagnostic lot: the scope still filters its risk
+            lots = float(lot)
+            risk_fixed = step_risk * lots / 0.01
+            if (scope_low > 0 or scope_high > 0) and not (
+                    (scope_low <= 0 or risk_fixed + 1e-9 >= scope_low)
+                    and (scope_high <= 0 or risk_fixed <= scope_high + 1e-9)):
+                scope_skips += 1
+                continue
+        elif scope_high > 0:
+            # scope sizing: smallest 0.01 multiple whose risk reaches the low bound
+            if step_risk > scope_high:
+                scope_skips += 1  # even the minimum lot busts the ceiling
+                continue
+            n = max(1, int(-(-scope_low // step_risk)))  # ceil(scope_low / step_risk)
+            lots = n * 0.01
+            if step_risk * n > scope_high:
+                scope_skips += 1  # no lot size lands inside the band (granularity hole)
+                continue
+        else:
+            lots = risk_usd / ((stop_dist / tick_size) * tick_value)  # legacy target
+            lots = int(lots // 0.01) * 0.01
+            if lots < 0.01:
+                lot_skips += 1
+                continue
         funnel_sized += 1
         last_day = day
         fill = float(h1["open"].iloc[t + 1])
@@ -366,15 +409,21 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
                                "pnl_usd": round(pnl, 2),
                                "pnl_R": round(pnl / risk_actual, 3) if risk_actual > 0 else 0.0,
                                "swap": round(swap, 2), "atr": round(atr_f, 5),
-                               "bars_held": held + 1})
+                               "bars_held": held + 1,
+                               "risk_usd": round(risk_actual, 2),
+                               "tp_usd": round(tp_mult * risk_actual, 2)})
                 open_until = b
                 break
             held += 1
         else:
             continue
     cols = ["symbol", "direction", "entry_time", "entry", "sl", "tp", "lot",
-            "exit_time", "exit", "exit_type", "pnl_usd", "pnl_R", "swap", "atr", "bars_held"]
-    return pd.DataFrame(trades, columns=cols), {"sized": funnel_sized, "window": window_skips}
+            "exit_time", "exit", "exit_type", "pnl_usd", "pnl_R", "swap", "atr",
+            "bars_held", "risk_usd", "tp_usd"]
+    return pd.DataFrame(trades, columns=cols), {
+        "sized": funnel_sized, "window": window_skips, "open": open_skips,
+        "day": day_skips, "tick": tick_skips, "scope": scope_skips,
+        "cost": cost_skips, "lot": lot_skips}
 
 
 def metrics(trades: pd.DataFrame, months_days: float, n_bars: int) -> dict:
@@ -388,7 +437,8 @@ def metrics(trades: pd.DataFrame, months_days: float, n_bars: int) -> dict:
     wins = trades[trades["pnl_usd"] > 0]
     gross_pos = float(wins["pnl_usd"].sum())
     gross_neg = -float(trades[trades["pnl_usd"] <= 0]["pnl_usd"].sum())
-    eq = trades["pnl_usd"].cumsum()
+    # equity starts at 0 (the account baseline), so a first-trade loss is DD too
+    eq = pd.concat([pd.Series([0.0]), trades["pnl_usd"].cumsum()], ignore_index=True)
     dd = float((eq.cummax() - eq).max())
     months = max(months_days / 30.44, 1.0)
     held = float(trades["bars_held"].sum()) if "bars_held" in trades else 0.0
@@ -425,13 +475,71 @@ def total_row(all_trades: pd.DataFrame) -> dict:
     gross_pos = float(wins["pnl_usd"].sum())
     gross_neg = -float(t[t["pnl_usd"] <= 0]["pnl_usd"].sum())
     eq = t["pnl_usd"].cumsum()
+    # months span: first entry to last exit (entry column can be absent in test frames)
+    t_exit = pd.to_datetime(t["exit_time"], utc=True)
+    t_entry = pd.to_datetime(t["entry_time"], utc=True) if "entry_time" in t.columns else t_exit
+    months = max((t_exit.max() - t_entry.min()).days / 30.44, 0.5)
+    eq0 = pd.concat([pd.Series([0.0]), eq], ignore_index=True)  # DD counts the first loss too
     return {"symbol": "TOTAL", "trades": n,
             "net_usd": round(float(t["pnl_usd"].sum()), 2),
             "net_R": round(float(t["pnl_R"].sum()), 2),
             "expect_R": round(float(t["pnl_R"].mean()), 3),
             "win_rate": round(len(wins) / n, 3),
             "profit_factor": round(gross_pos / gross_neg, 3) if gross_neg > 0 else float("inf"),
-            "max_dd": round(float((eq.cummax() - eq).max()), 2)}
+            "max_dd": round(float((eq0.cummax() - eq0).max()), 2),
+            "per_month": round(n / months, 2)}
+
+
+def _band(val: float, thr: dict | None, lower_better: bool = False) -> str:
+    """PASS/WARN/FAIL from benchmark thresholds {good, ok}: either may be absent
+    (single threshold gives PASS/FAIL only). Absolute-tie: PASS sits at `good`,
+    WARN strictly worse than good but still inside `ok`. NA when unset or NaN."""
+    if thr is None or val != val:
+        return "NA"
+    good, ok = thr.get("good"), thr.get("ok")
+    if good is None and ok is None:
+        return "NA"
+
+    def inside_level(t: float) -> bool:
+        return val <= float(t) if lower_better else val >= float(t)
+
+    if good is None:
+        return "PASS" if inside_level(ok) else "FAIL"
+    if inside_level(good):
+        return "PASS"
+    if ok is None or not inside_level(ok):
+        return "FAIL"
+    return "WARN"
+
+
+def grade_benchmarks(m: dict, bench: dict, portfolio: bool = False,
+                     min_year_R: float | None = None) -> dict:
+    """Acceptance bands from `_base.yaml benchmarks:`. Verdict = worst band of
+    the graded metrics (WARN-first reporting; a FAIL is loud). 0-trade rows are
+    NA, not FAIL — no trades is no evidence, not a broken strategy."""
+    out: dict = {}
+    account = float(bench.get("account_usd", 0) or 0)
+    dd_pct = float("nan")
+    if account > 0:
+        dd_pct = float(m.get("max_dd", 0) or 0) / account * 100
+    out["max_dd_pct"] = round(dd_pct, 2) if dd_pct == dd_pct else dd_pct
+    if int(m.get("trades", 0) or 0) == 0:
+        out["verdict"] = "NA"
+        return out
+    # per-pair DD% is informational only (each pair does not own its own 100 USD);
+    # the drawdown bands grade the shared account -> TOTAL (portfolio) rows only
+    out["pf_band"] = _band(float(m.get("profit_factor", 0) or 0), bench.get("profit_factor"))
+    out["expect_band"] = _band(float(m.get("expect_R", 0) or 0), bench.get("expect_r"))
+    if portfolio and bench.get("max_dd_pct"):
+        out["dd_band"] = _band(dd_pct, bench.get("max_dd_pct"), lower_better=True)
+    if portfolio and bench.get("per_month"):
+        out["freq_band"] = _band(float(m.get("per_month", 0) or 0), bench["per_month"])
+    if portfolio and bench.get("worst_year_r") and min_year_R is not None:
+        out["year_band"] = _band(min_year_R, bench["worst_year_r"])
+    rank = {"FAIL": 2, "WARN": 1, "PASS": 0}
+    bands = [v for k, v in out.items() if k.endswith("_band") and v in rank]
+    out["verdict"] = max(bands, key=rank.get) if bands else "NA"
+    return out
 
 
 def _m1_path(h1_path: str | Path) -> Path:
@@ -468,9 +576,13 @@ def run_pair(symbol: str, h1_path: str | Path, p: dict, costs: dict, args,
                              bias_flip_exit=bool(p.get("bias_flip_exit", False)),
                              weekend_flat=bool(p.get("weekend_flat", False)),
                              mapped=mapped, lot=args.lot, converters=converters,
-                             m1=m1, no_trade_ranges=ranges)
+                             m1=m1, no_trade_ranges=ranges,
+                             scope_low=getattr(args, "scope_low", 0.0),
+                             scope_high=getattr(args, "scope_high", 0.0))
     funnel["sized"] = extra["sized"]
     funnel["window"] = extra.get("window", 0)
+    for key in ("open", "day", "tick", "scope", "cost", "lot"):
+        funnel[key] = extra.get(key, 0)  # every named gate lands in funnel.csv
     funnel["taken"] = len(trades)
     days = (h1["time"].iloc[-1] - h1["time"].iloc[0]).days
     m = metrics(trades, days, len(h1))
@@ -503,13 +615,14 @@ def _done_line(sym: str, m: dict) -> str:
             f"expect={m['expect_R']}R pf={m['profit_factor']} dd={m['max_dd']}")
 
 
-def run_all(jobs: list[tuple[str, Path]], p: dict, costs: dict, args, converters,
+def run_all(jobs: list[tuple[str, Path, dict]], p: dict, args, converters,
             workers: int) -> tuple[dict[str, dict], dict[str, str]]:
-    """Run every pair. One pair never splits across processes. Returns (results, failures)."""
+    """Run every pair. Jobs are (symbol, csv path, per-pair costs). One pair never
+    splits across processes. Returns (results, failures)."""
     results: dict[str, dict] = {}
     failures: dict[str, str] = {}
     if workers <= 1:
-        for sym, h1_path in jobs:
+        for sym, h1_path, costs in jobs:
             print(f"RUN {sym} <- {h1_path}", flush=True)
             try:
                 results[sym] = _run_one(sym, h1_path, p, costs, args, converters)
@@ -521,7 +634,7 @@ def run_all(jobs: list[tuple[str, Path]], p: dict, costs: dict, args, converters
         return results, failures
     with ProcessPoolExecutor(max_workers=workers, initializer=_worker_init) as pool:
         futures = {}
-        for sym, h1_path in jobs:
+        for sym, h1_path, costs in jobs:
             print(f"RUN {sym} <- {h1_path}", flush=True)
             futures[pool.submit(_run_one, sym, h1_path, p, costs, args, converters)] = sym
         for fut in as_completed(futures):
@@ -534,6 +647,66 @@ def run_all(jobs: list[tuple[str, Path]], p: dict, costs: dict, args, converters
                 continue
             print(_done_line(sym, results[sym]["metrics"]), flush=True)
     return results, failures
+
+
+def _epoch_s(col: pd.Series) -> np.ndarray:
+    return pd.to_datetime(pd.Series(col), utc=True).astype("int64").to_numpy() // 1_000_000_000
+
+
+def mtm_equity(trades_by_sym: dict[str, pd.DataFrame],
+               h1_by_sym: dict[str, pd.DataFrame],
+               account_usd: float) -> pd.DataFrame:
+    """Hourly mark-to-market account curve over ALL shared-account positions.
+
+    Open positions are marked at the pair's last closed H1 bar: unrealized P/L =
+    R-multiple (close vs entry over the initial stop distance) x the trade's
+    recorded 1R USD — so marks need no tick-value/converters. Realized P/L lands
+    at the exit bar (pnl_usd, all costs included). Price marks only: swap accrual
+    is ignored intraday. Runs without a risk_usd column degrade to the
+    closed-trade curve, which keeps the starting 100 USD baseline.
+    """
+    pairs = [s for s in trades_by_sym if len(trades_by_sym[s]) and s in h1_by_sym]
+    if not pairs:
+        return pd.DataFrame(columns=["time", "usd"])
+    g = np.unique(np.concatenate([_epoch_s(h1_by_sym[s]["time"]) for s in pairs]))
+    eq = np.full(g.size, float(account_usd))
+    for s in pairs:
+        h1 = h1_by_sym[s]
+        p_times = _epoch_s(h1["time"])
+        closes = h1["close"].to_numpy(dtype=float)
+        idx = np.searchsorted(p_times, g, side="right") - 1
+        px = np.where(idx >= 0, closes[np.clip(idx, 0, None)], np.nan)
+        t = trades_by_sym[s]
+        n = len(t)
+        entries = _epoch_s(t["entry_time"])
+        exits = _epoch_s(t["exit_time"])
+        entry = t["entry"].to_numpy(dtype=float)
+        stop = np.abs(entry - t["sl"].to_numpy(dtype=float))
+        # 0 risk (old runs) or a zero stop contributes no mark
+        risk = np.nan_to_num(t["risk_usd"].to_numpy(dtype=float)
+                             if "risk_usd" in t.columns else np.zeros(n))
+        signs = np.where(t["direction"].to_numpy() == "LONG", 1.0, -1.0)
+        # unrealized: R-multiple at the last pair bar <= t, inside [entry, exit);
+        # per-trade loop keeps memory flat for runs with thousands of trades
+        unreal = np.zeros(g.size)
+        for i in range(n):
+            if stop[i] == 0 or risk[i] == 0:
+                continue
+            m = (g >= entries[i]) & (g < exits[i])
+            if not m.any():
+                continue
+            with np.errstate(divide="ignore", invalid="ignore"):
+                r = signs[i] * (px - entry[i]) / stop[i]
+            unreal += np.where(m, np.where(np.isfinite(r), r, 0.0) * risk[i], 0.0)
+        eq += unreal
+        # realized: each pnl_usd applies from its exit bar onward
+        order = np.argsort(exits)
+        step_idx = np.searchsorted(g, exits[order], side="left")
+        valid = step_idx < g.size
+        step = np.zeros(g.size)
+        np.add.at(step, step_idx[valid], t["pnl_usd"].to_numpy(dtype=float)[order][valid])
+        eq += np.cumsum(step)
+    return pd.DataFrame({"time": pd.to_datetime(g, unit="s", utc=True), "usd": eq})
 
 
 def apply_daily_cap(trades_by_sym: dict[str, pd.DataFrame],
@@ -564,6 +737,22 @@ def apply_daily_cap(trades_by_sym: dict[str, pd.DataFrame],
     return out, dropped
 
 
+def _cli_costs(args) -> dict:
+    """Only the CLI-provided cost overrides; they beat base and pair yamls so
+    sensitivity sweeps stay global even where pair yamls carry live spreads."""
+    out: dict = {}
+    if args.spread_pips is not None:
+        out["spread_points"] = args.spread_pips * 10.0
+    if args.spread_points is not None:
+        out["spread_points"] = args.spread_points
+    if args.slippage_pips is not None:
+        out["slippage_pips"] = args.slippage_pips
+    if args.flat_swaps:
+        out["swap_long_per_0_01"] = 0.0
+        out["swap_short_per_0_01"] = 0.0
+    return out
+
+
 def main(argv: list[str] | None = None) -> int:
     import yaml
 
@@ -577,10 +766,16 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--spread-points", type=float, default=None)
     ap.add_argument("--flat-swaps", action="store_true")
     ap.add_argument("--slippage-pips", type=float, default=None)
-    ap.add_argument("--risk-usd", type=float, default=3.0)
-    ap.add_argument("--lot", type=float, default=0.01,
-                    help="fixed lot size; <=0 sizes from --risk-usd instead")
-    ap.add_argument("--max-cost-ratio", type=float, default=0.10)
+    ap.add_argument("--risk-usd", type=float, default=3.0,
+                    help="legacy fixed target; only used when the sizing scope is off")
+    ap.add_argument("--lot", type=float, default=None,
+                    help="fixed diagnostic lot; default = size by risk.sizing_scope_usd")
+    ap.add_argument("--scope-low", type=float, default=None,
+                    help="override risk.sizing_scope_usd.low from _base.yaml")
+    ap.add_argument("--scope-high", type=float, default=None,
+                    help="override risk.sizing_scope_usd.high from _base.yaml")
+    ap.add_argument("--max-cost-ratio", type=float, default=None,
+                    help="override limits.max_cost_ratio from _base.yaml")
     ap.add_argument("--atr-n", type=int, default=None)
     ap.add_argument("--sep-atr", type=float, default=None)
     ap.add_argument("--ma-only", action="store_true")
@@ -599,6 +794,17 @@ def main(argv: list[str] | None = None) -> int:
     strat = flatten_strategy(base)
     costs = dict((base.get("costs") or {}))
     max_day = int((base.get("limits") or {}).get("max_trades_per_day", 0) or 0)
+    bench = dict(base.get("benchmarks") or {})
+    # the cost gate lives in _base.yaml limits (visible config), CLI overrides it
+    if args.max_cost_ratio is None:
+        args.max_cost_ratio = float(
+            (base.get("limits") or {}).get("max_cost_ratio", 0.10) or 0.0)
+    scope = dict((base.get("risk") or {}).get("sizing_scope_usd") or {})
+    # sizing scope: actual 1R must land inside [low, high] USD; 0 disables a side
+    if args.scope_low is None:
+        args.scope_low = float(scope.get("low", 0.0) or 0.0)
+    if args.scope_high is None:
+        args.scope_high = float(scope.get("high", 0.0) or 0.0)
     try:
         args.no_trade_ranges = tuple(parse_no_trade_ranges(base))
     except ValueError as exc:
@@ -617,17 +823,11 @@ def main(argv: list[str] | None = None) -> int:
         strat["sep_atr"] = args.sep_atr
     if args.ma_only:
         strat["use_atr_sep"] = False
-    if args.spread_pips is not None:
-        costs["spread_points"] = args.spread_pips * 10.0
-    if args.spread_points is not None:
-        costs["spread_points"] = args.spread_points
-    if args.slippage_pips is not None:
-        costs["slippage_pips"] = args.slippage_pips
-    if args.flat_swaps:
-        costs["swap_long_per_0_01"] = 0.0
-        costs["swap_short_per_0_01"] = 0.0
+    costs.update(_cli_costs(args))
 
-    jobs: list[tuple[str, Path]] = []
+    # jobs carry per-pair costs: base + pair yaml + CLI (CLI always wins last)
+    jobs: list[tuple[str, Path, dict]] = []
+    pair_costs_recorded: dict[str, dict] = {}
     if args.batch:
         pairs = load_pairs(args.config_dir)
         selection = read_selection(args.config_dir)
@@ -641,7 +841,12 @@ def main(argv: list[str] | None = None) -> int:
             if not h1_path.exists():
                 print(f"SKIP {sym} - no {h1_path}", flush=True)
                 continue
-            jobs.append((sym, h1_path))
+            pc = dict(costs)
+            pc.update(pr.get("costs") or {})
+            pc.update(_cli_costs(args))
+            if pr.get("costs"):
+                pair_costs_recorded[sym] = dict(pr["costs"])
+            jobs.append((sym, h1_path, pc))
         if disabled:
             print(f"disabled in scan-selection.yml: {', '.join(disabled)}", flush=True)
     else:
@@ -649,7 +854,13 @@ def main(argv: list[str] | None = None) -> int:
             print("Need --config + --data, or --batch.", flush=True)
             return 2
         cfg = yaml.safe_load(open(args.config, encoding="utf-8")) or {}
-        jobs.append((str(cfg.get("symbol") or Path(args.config).stem), Path(args.data)))
+        sym = str(cfg.get("symbol") or Path(args.config).stem)
+        pc = dict(costs)
+        pc.update(cfg.get("costs") or {})
+        pc.update(_cli_costs(args))
+        if cfg.get("costs"):
+            pair_costs_recorded[sym] = dict(cfg["costs"])
+        jobs.append((sym, Path(args.data), pc))
     if not jobs:
         print("Nothing to run.", flush=True)
         return 1
@@ -659,7 +870,7 @@ def main(argv: list[str] | None = None) -> int:
     conv_map = {"JPY": "USDJPY", "GBP": "GBPUSD", "AUD": "AUDUSD",
                 "NZD": "NZDUSD", "CAD": "USDCAD", "CHF": "USDCHF"}
     need: dict[str, list[str]] = {}
-    for s, _ in jobs:
+    for s, _, _ in jobs:
         if s[3:] == "USD" or s.startswith("USD"):
             continue
         feed = conv_map.get(s[3:])
@@ -667,7 +878,7 @@ def main(argv: list[str] | None = None) -> int:
             need.setdefault(feed, []).append(s)
         else:
             print(f"SKIP {s} - no converter feed for quote {s[3:]}", flush=True)
-    jobs = [(s, p) for s, p in jobs if s[3:] == "USD" or s.startswith("USD")
+    jobs = [(s, p, c) for s, p, c in jobs if s[3:] == "USD" or s.startswith("USD")
             or s in [x for v in need.values() for x in v]]
     converters: dict[str, pd.Series] = {}
     for feed, syms in need.items():
@@ -675,7 +886,7 @@ def main(argv: list[str] | None = None) -> int:
         if not fp.exists():
             for s in syms:
                 print(f"SKIP {s} - no {feed} converter feed", flush=True)
-            jobs = [(s, p) for s, p in jobs if s not in syms]
+            jobs = [(s, p, c) for s, p, c in jobs if s not in syms]
             continue
         converters[feed] = load_h1(fp).set_index("time")["close"]
     if not jobs:
@@ -687,16 +898,20 @@ def main(argv: list[str] | None = None) -> int:
     workers = resolve_workers(args.jobs, len(jobs))
     params = {
         "strategy": strat, "costs": costs, "risk_usd": args.risk_usd,
-        "max_cost_ratio": args.max_cost_ratio, "lot": args.lot,
+        "max_cost_ratio": args.max_cost_ratio,
+        "sizing_scope_usd": {"low": args.scope_low, "high": args.scope_high},
+        "lot": args.lot,
         "max_trades_per_day": max_day, "workers": workers,
         "no_trade_ranges": args.no_trade_ranges,
         "position_checks": args.position_checks,
-        "jobs": [[s, str(p)] for s, p in jobs]}
+        "benchmarks": bench,
+        "pair_costs": pair_costs_recorded,
+        "jobs": [[s, str(path)] for s, path, _ in jobs]}
     params_path = outdir / "params.json"
     params_path.write_text(json.dumps(params, indent=1), encoding="utf-8")
 
     print(f"running {len(jobs)} pair(s) on {workers} worker(s)", flush=True)
-    results, failures = run_all(jobs, strat, costs, args, converters, workers)
+    results, failures = run_all(jobs, strat, args, converters, workers)
     dropped: list[dict] = []
     if max_day > 0 and results:
         capped, dropped = apply_daily_cap({s: r["trades"] for s, r in results.items()}, max_day)
@@ -717,15 +932,31 @@ def main(argv: list[str] | None = None) -> int:
         params["daily_cap_dropped"] = dropped
         params_path.write_text(json.dumps(params, indent=1), encoding="utf-8")
 
+    # MTM account curve: hourly equity over open + closed positions, TOTAL only
+    curve = None
+    taken = {s: r["trades"] for s, r in results.items() if len(r["trades"])}
+    if taken:
+        h1_by_sym, account_usd = {}, float(bench.get("account_usd") or 0) or 100.0
+        for sym, h1_path, _ in jobs:
+            if sym in taken:
+                try:
+                    h1_by_sym[sym] = load_h1(h1_path)
+                except Exception:
+                    pass
+        usable = {s: taken[s] for s in taken if s in h1_by_sym}
+        if usable:
+            curve = mtm_equity(usable, h1_by_sym, account_usd)
+            curve.to_csv(outdir / "equity_curve.csv", index=False)
+
     summaries, funnels, yearlies, all_trades = [], [], [], []
-    for sym, _ in jobs:  # input order, so output files do not depend on finish order
+    for sym, _, _ in jobs:  # input order, so output files do not depend on finish order
         res = results.get(sym)
         if res is None:
             continue
         f = res["funnel"]
         f["symbol"] = sym
         funnels.append(f)
-        summaries.append(res["metrics"])
+        summaries.append({**res["metrics"], **grade_benchmarks(res["metrics"], bench)})
         res["trades"].to_csv(outdir / f"trades_{sym}.csv", index=False)
         yearlies.append(yearly_table(res["trades"]))
         if len(res["trades"]):
@@ -734,12 +965,38 @@ def main(argv: list[str] | None = None) -> int:
         print(f"FAILED: {', '.join(failures)}", flush=True)
     if summaries:
         if all_trades:
-            summaries.append(total_row(pd.concat(all_trades, ignore_index=True)))
+            trow = total_row(pd.concat(all_trades, ignore_index=True))
+            gsrc = trow
+            if curve is not None and len(curve):
+                # drawdown bands grade the mark-to-market curve (closed-only DD stays visible)
+                dd_mtm = float((curve["usd"].cummax() - curve["usd"]).max())
+                trow["max_dd_mtm"] = round(dd_mtm, 2)
+                trow["max_dd_mtm_pct"] = round(
+                    100.0 * dd_mtm / float(bench.get("account_usd") or 0 or 100.0), 1)
+                gsrc = {**trow, "max_dd": dd_mtm, "max_dd_pct": trow["max_dd_mtm_pct"]}
+            year_all = pd.concat(yearlies, ignore_index=True)
+            min_year = (float(year_all.groupby("year")["net_R"].sum().min())
+                        if len(year_all) else None)
+            grade = grade_benchmarks(gsrc, bench, portfolio=True, min_year_R=min_year)
+            summaries.append({**trow, **grade})
+            print(f"benchmarks TOTAL: {grade['verdict']} "
+                  f"(dd MTM {grade.get('max_dd_pct')}% {grade.get('dd_band')}, "
+                  f"pf {trow['profit_factor']} {grade.get('pf_band')}, "
+                  f"expect {trow['expect_R']}R {grade.get('expect_band')})", flush=True)
         pd.DataFrame(summaries).to_csv(outdir / "summary.csv", index=False)
     if funnels:
         pd.concat(funnels, ignore_index=True).to_csv(outdir / "funnel.csv", index=False)
     if yearlies:
         pd.concat(yearlies, ignore_index=True).to_csv(outdir / "yearly.csv", index=False)
+    # report is best-effort: a missing plotly or any renderer error only prints
+    from quant.report import try_write_report
+    try_write_report(outdir)
+    # run ledger: append is best-effort too — a broken row must not fail the run
+    from quant import ledger
+    try:
+        ledger.append(outdir)
+    except Exception as exc:
+        print(f"ledger: append failed ({exc})", flush=True)
     print(f"backtest results -> {outdir}", flush=True)
     return 0
 

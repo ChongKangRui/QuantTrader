@@ -148,11 +148,13 @@ def load_pairs(config_dir: str | Path) -> list[dict]:
                 hr1 = "a"
             pairs.append({"name": path.stem, "symbol": symbol, "sep": sep, "hr1": hr1,
                           "params": strat,
-                          "use_atr_sep": _as_bool(strat.get("use_atr_sep", True))})
+                          "use_atr_sep": _as_bool(strat.get("use_atr_sep", True)),
+                          "costs": dict((cfg.get("costs") or {}))})
         except Exception as exc:
             pairs.append({"name": path.stem, "symbol": path.stem,
                           "sep": SEP_MIN_DEFAULT, "hr1": "a", "use_atr_sep": True,
                           "params": {},
+                          "costs": {},
                           "load_error": f"{path.name}: {exc}"})
     return pairs
 

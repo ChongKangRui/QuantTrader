@@ -46,18 +46,18 @@ def test_pullback_close_kills_bias_without_lookahead():
 
 def test_hr1b_vetoes_body_straddling_ema50():
     base = _frame([100.0 + i * 1.0 for i in range(320)])
-    e50 = h4_bias(base).ema50
+    e50 = h4_bias(base).ema_slow  # the actual configured slow line (default 50)
     last = {"time": 1_700_000_000 + 320 * 14_400, "open": e50 - 10.0,
             "high": e50 + 10.2, "low": e50 - 10.2, "close": e50 + 10.0}
     df = pd.concat([base, pd.DataFrame([last])], ignore_index=True)
-    assert h4_bias(df, hr1="a").direction == "LONG"  # close past EMA50 is enough
+    assert h4_bias(df, hr1="a").direction == "LONG"  # close past ema_slow is enough
     b = h4_bias(df, hr1="b")
     assert b.direction == "NEUTRAL" and b.reason == "veto:HR1b"
 
 
 def test_hr1c_vetoes_wick_piercing_ema50():
     base = _frame([100.0 + i * 1.0 for i in range(320)])
-    e50 = h4_bias(base).ema50
+    e50 = h4_bias(base).ema_slow
     last = {"time": 1_700_000_000 + 320 * 14_400, "open": e50 + 23.7,
             "high": e50 + 24.3, "low": e50 - 10.0, "close": e50 + 24.0}
     df = pd.concat([base, pd.DataFrame([last])], ignore_index=True)
@@ -71,9 +71,17 @@ def test_unknown_hr1_variant_falls_back_to_a():
     assert h4_bias(df, hr1="zzz").direction == "LONG"
 
 
+def test_periods_come_from_params_not_constants():
+    df = _frame([100.0 + i * 1.0 for i in range(320)])
+    # the same frame under two configured period sets -> different slow lines
+    a = h4_bias(df, ema_fast=20, ema_slow=50)
+    b = h4_bias(df, ema_fast=20, ema_slow=100)
+    assert a.ema_slow != b.ema_slow and a.ema_fast == b.ema_fast
+
+
 def test_ma_only_ignores_sep_and_hr1_and_never_flat():
     base = _frame([100.0 + i * 1.0 for i in range(319)])
-    e50 = h4_bias(base).ema50  # pullback stays above the stack break
+    e50 = h4_bias(base).ema_slow  # pullback stays above the stack break
     last = {"time": 1_700_000_000 + 319 * 14_400, "open": e50 - 29.0,
             "high": e50 - 28.5, "low": e50 - 30.5, "close": e50 - 30.0}
     df = pd.concat([base, pd.DataFrame([last])], ignore_index=True)

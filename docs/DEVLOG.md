@@ -1,5 +1,150 @@
 # Dev Log
 
+## 2026-10-17 — v0.9.4: honest costs, scope sizing, R1b probe, MTM drawdown
+
+- **spreadcheck fixed**: `symbol_select(sym, True)` adds symbols to Market Watch
+  (with False, only already-listed pairs returned info — 9/10 pairs "refused").
+  Added a closed-market hint when spread reads 0.
+- **Per-pair costs wired**: pair yamls now accept a `costs:` block
+  (spread/swaps); `load_pairs` carries it, backtest + edge_probe merge it over
+  base costs, CLI sweep flags still win on top. All 10 pair yamls calibrated
+  from the 2026-10-17 Friday-close sample (EURUSD 0.2 pips ... GBPJPY 2.2).
+  `params.json` records `pair_costs`. Monday re-sample may refine.
+- **R1b probe run** (`edge_probe_R1b_20261017.csv`): NOT CONFIRMED again — cost
+  line halved (0.164 -> 0.085 ATR) yet pooled onset drift unchanged
+  (+0.030 / -0.027). The gap is the missing signal, not costs.
+- **Sizing scope** (per user decision): `risk.sizing_scope_usd {low 2.5,
+  high 3.6}` replaces the risk_usd target and the USD3 cap gate. Engine sizes
+  up in 0.01-lot steps to reach `low`, refuses when nothing fits the band
+  (funnel gate `scope`); `--lot` stays as diagnostic override; `--scope-low/
+  --scope-high` CLI overrides. Known holes: EURUSD stops 18-25 pips, USDJPY
+  ~27-37.5 pips.
+- **MTM portfolio drawdown**: hourly mark-to-market account curve
+  (`equity_curve.csv`; open positions marked as R-multiple x recorded 1R at
+  each pair's close; swap accrual ignored intraday). TOTAL drawdown bands now
+  grade the MTM curve; `max_dd_mtm`/`max_dd_mtm_pct` columns + report MTM USD
+  overlay + glossary. Runs without risk_usd degrade to the closed-trade curve.
+- run_all jobs are 3-tuples (symbol, path, per-pair costs) — internal change.
+- Tests 116 -> 123. NOT run: weekday spread re-sample; live anything.
+- **R2 baseline captured after the above landed** (`20261017_191201`, deterministic
+  re-run of the deleted `20261017_183837` — identical figures): 7274 trades,
+  −1379.19 USD (−449.29R), MTM DD 1479.8%, verdict FAIL — ledgered in TESTLOG with
+  the no-edge takeaway. Ladder status: nothing beats R0; strategy core rethink is
+  the open track, not parameter tuning.
+
+## Addendum (same day, after user review of the R2 report)
+
+- Trade list and chart titles now show P/L in USD next to R (user request:
+  dollars, not R-only); rows with no embedded window are dimmed in the list.
+- Chart embedding cap removed entirely (user-approved size): **all 7274 windows
+  embed, report 53 MB**, every trade of every pair clickable. History: the 600-cap
+  first zeroed winners (negative fill budget), then a fair 300/300 split still
+  starved 8/10 pairs because the global bundle is pair-ordered — only full
+  embedding removes the class of bug. Click path verified programmatically over
+  every id (fields resolve for all 7274; 10/10 pairs have win+loss windows).
+- Trade-chart UX (user request): charts open in a **separate popup window**
+  (one reused window per browser); 1H/4H toggle inside the popup with EMA20/50
+  on both — 4H windows use the broker H4 CSV when present, else the engine's
+  `build_h4` resample (same bars the backtest traded on; no broker H4 files
+  exist yet). Entry marker is yellow now, not green. Report 73 MB; tests 125.
+- Second UX pass: windows doubled (1H 120 before/40 after, 4H 60/20; caps 800/400)
+  and the popup's y zoom is pinned to candles + stop + target + entry/exit marks
+  (15% pad) — before, 4216/7274 trades had stop or target outside the candle span
+  and Plotly's auto-zoom cut the levels out of the picture. USD labels kept.
+  Report now 125 MB; embed-all + doubled windows = user-approved size.
+- Popup root cause found (user-visible bug: stop/target lines never shown): the
+  first popup drew candles with the MAIN page's plotly into the popup's foreign
+  document — candles rendered but layout directives (axis ranges, shapes) were
+  silently mis-applied. Fix: the popup now writes its own copy of the embedded
+  plotly-lib script at popup-open (one copy per window, no static duplicate) and
+  draws natively inside its own document. Level lines also get a null guard for
+  pre-sl/tp runs. Both fixes render-only; confirmed via embedded-JS checks.
+- `_base.yaml` strategy block reorganized: every knob now sits directly under
+  its owning gate and is tagged `[use_x]` (dead while false), always-live knobs
+  marked `(always live)`; values untouched (parsed dict identical, 31 keys).
+- **2026-10-18 — bias EMAs became config, naming split by chart family.**
+  `_base.yaml` now has TWO key families: `h4_ema_fast/h4_ema_slow/h4_atr_n`
+  (BIAS watchman; were hardcoded 20/50/14 in `bias.py`+`backtest.py`) and
+  `h1_ema_fast/h1_ema_slow` (ENTRY; renamed from `ema_fast/ema_slow`). Old
+  `ema_fast` names still accepted by the report for pre-rename run folders.
+  `h4_bias()` takes period args defaulting to locked constants; `Bias` fields
+  renamed (ema20/ema50/atr14 → ema_fast/ema_slow/atr_n). Report chart legends
+  now show periods read from each run's `params.json` (`"emaH1"/"emaH4"`
+  blocks, `efast/eslow` window keys) — the chart displays what the engine used.
+  Values preserved from the user's own edits: warmup_bars 100, use_hr2 true,
+  trail_r 1.5 (any R-run with these is a NEW declared change-set vs R2 pass
+  lines). Tests 125 → 128 passed.
+- **2026-10-18 — run ledger.** `backtest_results/_ledger.csv`: one row per run
+  (summary.csv TOTAL + params.json + trades swap sum). Appended automatically
+  after every backtest; `uv run python -m quant.ledger --rebuild` rebuilds all
+  folders. Off gates = blank cells. Current ledger: 6 runs incl. 5 previously
+  unledgered 10-18 runs (no_trail, trail_1R/1.5R, +2); all verdict FAIL. Note:
+  R2 params.json records lookback 12 — TESTLOG said 5; ledger reads
+  params.json as source of truth. Tests 128 → 131.
+
+## 2026-10-17 — v0.9.3: DD baseline fix, named funnel gates, visible cost gate, spreadcheck
+
+- **DD fix** (`metrics()` + `total_row()`): equity now starts at 0, so a first-trade
+  loss counts as drawdown (EURGBP was shown 0.0, really 2.86; GBPJPY 27.43 -> 29.51).
+- **Per-pair drawdown bands removed** (user decision): per-pair DD% treats each pair as
+  owning the whole 100 USD account — misleading with a shared account. `max_dd_pct` stays
+  informational per pair; PASS/WARN/FAIL DD banding now happens only on the TOTAL row.
+- **Funnel gates named** (`simulate()` returns per-gate counts; funnel.csv gains columns):
+  `open` (position open/overlap), `day` (1 entry/day), `tick`, `usd3` (stop > USD3 cap
+  distance — blocks stops > ~30 pips = ATR > ~20), `cost` (round-trip cost share of stop),
+  `lot` (risk lot < 0.01). The old `sized` lump can no longer hide why EURGBP lost 171
+  of 172 candidates.
+- **`max_cost_ratio` surfaced**: now a visible `limits.max_cost_ratio` in _base.yaml
+  (CLI `--max-cost-ratio` overrides; 0 disables the gate). It was an engine-side default
+  (0.10) only recorded in params.json — the user never saw it, and it silently forced
+  entry ATR into a ~15.3–20 pip band on majors (together with the USD3 cap).
+- Trades CSV gains `risk_usd` (1R at the initial stop) and `tp_usd` (take-profit amount);
+  report trade list shows both + an exit-type filter; SL/TP chart lines are labelled
+  with their USD values. Summary/report headers now use readable names
+  (Avg P/L per trade (R), Trades per month, Max drawdown (% of account), ...), and a
+  glossary line states the shared-account rule.
+- `quant/spreadcheck.py` (`python -m quant.spreadcheck`, read-only): live spread/swap
+  per enabled symbol from the terminal, for cost calibration (demo spreads vary by
+  session; sample at different hours). No orders, no settings changes.
+- Tests 112 -> 116 (DD-first-loss, gate contract, per-pair band removal, spreadcheck
+  formatting). Report re-rendered on the real run: old CSVs (no risk_usd) render "-",
+  all checks pass. NOT run: spreadcheck against a live terminal; any backtest.
+
+## 2026-10-17 — v0.9.2: edge probe + auto HTML report (R1 tooling)
+
+- `quant/edge_probe.py` (`python -m quant.edge_probe --batch`): bias-only measurement, opens no trades.
+  Onset flips (verdict set), all bias-on bars (state), random bars with random direction (null). Move =
+  direction-aligned close-to-close over 24/48/72 H1 bars ÷ ATR(atr_n). Cost line per pair = spread +
+  2×slippage in that pair's mean-ATR units. Pooled verdict (rule fixed in docs/TESTLOG.md before results):
+  onset edge ≥ 0 beyond 2 SE at 48 AND 72; per-pair rows and the 24-bar horizon are information only.
+  `--csv` writes the table (per-pair + pooled rows).
+- `quant/report.py` + `uv add plotly` (7.1.0): every backtest now also writes `report.html` into its own
+  run folder (call is import-guarded; report problems never kill the run). plotly.js embedded exactly
+  once; overview figs (equity R/USD + drawdown R, net R/year) render on load; each trade's candle window
+  (60 H1 bars before entry -> 20 after exit) is a compact JSON blob drawn on row click; EMA20/50 computed
+  on the full H1 series then sliced. Standalone rebuild for old runs: `python -m quant.report --run <id>`.
+- `_base.yaml`: R2 simple baseline — use_hr2/hr3/hr4, hl_guard, use_ext OFF; use_trail OFF;
+  max_trades_per_day 5 -> 20. E1-setup + E1-trigger stay on. Ladder + revert values in docs/TESTLOG.md.
+- `docs/TESTLOG.md` (new ledger): pass line + run ladder fixed before any probe/backtest result;
+  R0 row = real numbers of `20261017_153137` (282 trades, −98.36 USD, −40.91R, PF 0.737, DD 110.9%,
+  benchmark verdict FAIL), bars avg/med 9.6/7.5. R1/R2 rows pending until the user runs them.
+- Tests: 103 -> 112 (probe events/alignment/cost/pooling/verdict gating; report lazy plotly embed,
+  per-trade blobs, missing-data skips). Report smoke-rendered on the real `20261017_153137` run:
+  6.5 MB, 282/282 windows embedded, JSON clean. NOT run: edge_probe against real data, any backtest.
+- R1 probe executed 2026-10-17 (user approved): pooled onset edge −0.13/−0.19 ATR at 48/72 bars,
+  move ≈ 0 before costs, null ≈ +0.10/+0.14 -> NOT CONFIRMED. Per ladder: R2 paused; result ledgered.
+
+## 2026-10-17 — v0.9.1: benchmark grading in the backtest
+
+- `benchmarks:` block in `_base.yaml`: declared account 100 USD (user's planned size — aggressive),
+  max-dd bands 30/50 %, PF 1.50/1.00, net expectancy 0.10R/0.00R, portfolio trades/month
+  2.0/0.2, worst calendar year −20R. Numbers only, no code edits to retune.
+- `grade_benchmarks()` grades every `summary.csv` row: `max_dd_pct` + PASS/WARN/FAIL band
+  columns, overall `verdict` per row (0 trades = NA). `TOTAL` also gets trades/month
+  (fixes the old NaN) and a worst-year band; console prints one TOTAL line.
+- Win rate deliberately not benchmarked — PF/expectancy already encode it.
+- Tests 101 M1-math + 1 new grading test -> 103 passing.
+
 ## 2026-10-17 — v0.9: no-trade windows + tick-like position checks
 
 - `limits.no_trade_ranges` in `_base.yaml`: recurring yearly arrays of `{start, end}` MM-DD

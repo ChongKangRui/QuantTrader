@@ -99,6 +99,21 @@ def test_load_pairs_strategy_comes_only_from_base(tmp_path):
     assert p["params"]["hr1"] == "b"
 
 
+def test_load_pairs_carries_pair_costs(tmp_path):
+    d = tmp_path / "configs"
+    d.mkdir()
+    (d / "_base.yaml").write_text("strategy: {hr1: b}\n", encoding="utf-8")
+    (d / "a.yaml").write_text(
+        "symbol: EURUSD\ncosts: {spread_points: 2, swap_long_per_0_01: -0.072}\n",
+        encoding="utf-8")
+    (d / "b.yaml").write_text(":\n: not yaml\n", encoding="utf-8")
+    pairs = load_pairs(d)
+    good = [p for p in pairs if not p.get("load_error")][0]
+    assert good["costs"]["spread_points"] == 2   # live spreadcheck calibration
+    bad = [p for p in pairs if p.get("load_error")][0]
+    assert bad["costs"] == {}                    # error path still exposes the key
+
+
 def test_load_pairs_skips_base_and_scan_selection(tmp_path):
     d = tmp_path / "configs"
     d.mkdir()
