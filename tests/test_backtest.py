@@ -453,6 +453,19 @@ def test_max_dd_counts_first_loss():
     assert total_row(t)["max_dd"] == 3.0  # same for the portfolio curve
 
 
+def test_swap_totals_per_pair_and_total():
+    t = pd.DataFrame([
+        {"symbol": "X", "exit_time": "2020-05-01 00:00:00+00:00", "pnl_usd": 3.0,
+         "pnl_R": 1.0, "bars_held": 5, "swap": -0.3},
+        {"symbol": "X", "exit_time": "2020-05-02 00:00:00+00:00", "pnl_usd": 6.0,
+         "pnl_R": 2.0, "bars_held": 5, "swap": -0.5}])
+    assert metrics(t, 30, 100)["swap_usd"] == -0.8
+    assert total_row(t)["swap_usd"] == -0.8
+    # runs older than the swap column: 0.0, never a KeyError
+    assert metrics(t.drop(columns=["swap"]), 30, 100)["swap_usd"] == 0.0
+    assert total_row(t.drop(columns=["swap"]))["swap_usd"] == 0.0
+
+
 def test_simulate_reports_named_gates():
     from quant.backtest import simulate
 

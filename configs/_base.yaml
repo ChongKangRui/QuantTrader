@@ -102,9 +102,12 @@ strategy:
 # (1 open position per pair is structural — not a knob here)
 # ────────────────────────────────────────────────────────────────────────
 risk:
-  max_total_positions: 4      # max open trades, all pairs combined (0 = off)
+  max_total_positions: 5      # max open trades, all pairs combined (0 = off)
   max_ccy_net: 2              # max NET positions per currency (0 = off)
                               # long EURUSD = +EUR/-USD; hedging nets to ~0
+                              # basically determine how many same direction of trade to pair
+                              # like EURUSD and GBPUSD both bet for buy, but not USDCHF for sell
+                              # if example is 2
   sizing_scope_usd:           # every trade's 1R must land inside (USD)
     low: 2.5                  # minimum 1R (USD; 0 = no minimum)
     high: 3.6                 # maximum 1R (USD; 0 = no maximum)
@@ -117,7 +120,7 @@ costs:
   swap_long_per_0_01: -0.08   # nightly carry, long (ccy per 0.01 lot/night)
   swap_short_per_0_01: -0.08  # nightly carry, short (ccy per 0.01 lot/night)
   commission_per_lot: 0.0     # commission per 1.0 lot (USD)
-  slippage_pips: 0.3          # assumed fill slip (pips; backtest and live)
+  slippage_pips: 0.0          # assumed fill slip (pips; backtest and live)
 
 # Triple swap = broker charges 3x on the Wednesday rollover; the engine
 # approximates it as the first bar after Wed 21:xx UTC (hardcoded, STRATEGY 10).

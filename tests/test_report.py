@@ -84,6 +84,7 @@ def test_write_report_full(tmp_path):
     tb = _blob(html, "trades-json")
     figs = _blob(html, "figs-json")
     assert len(tb["meta"]) == 2 and all(not r["missing"] for r in tb["meta"])
+    assert all(r["swap"] == 0.0 for r in tb["meta"])  # per-trade swap feeds the JS totals
     assert set(tb["embedded"]) == {"S1-0", "S1-1"}
     ctx = tb["embedded"]["S1-0"]
     # entry at index 100: window 0..160 (120 before, 40 after exit at 120)

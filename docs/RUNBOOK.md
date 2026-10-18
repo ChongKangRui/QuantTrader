@@ -46,6 +46,7 @@ run-backtest.bat
 ```
 
 or: `$env:PYTHONPATH="python"; uv run python -m quant.backtest --batch`
+or: `$env:PYTHONPATH="python"; uv run python -m quant.backtest --batch --flat-swaps` for zero swaps
 
 Every run writes `report.html` next to `summary.csv` (skip note if plotly
 is missing). Rebuild for an old folder without re-running backtests:

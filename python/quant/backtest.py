@@ -437,8 +437,8 @@ def metrics(trades: pd.DataFrame, months_days: float, n_bars: int) -> dict:
     exposure denominators, so a filtered trade list can be re-scored later."""
     n = len(trades)
     if n == 0:
-        return {"trades": 0, "net_usd": 0.0, "net_R": 0.0, "expect_R": 0.0,
-                "win_rate": 0.0, "profit_factor": 0.0, "max_dd": 0.0,
+        return {"trades": 0, "net_usd": 0.0, "swap_usd": 0.0, "net_R": 0.0,
+                "expect_R": 0.0, "win_rate": 0.0, "profit_factor": 0.0, "max_dd": 0.0,
                 "exposure_pct": 0.0, "per_month": 0.0}
     wins = trades[trades["pnl_usd"] > 0]
     gross_pos = float(wins["pnl_usd"].sum())
@@ -449,6 +449,7 @@ def metrics(trades: pd.DataFrame, months_days: float, n_bars: int) -> dict:
     months = max(months_days / 30.44, 1.0)
     held = float(trades["bars_held"].sum()) if "bars_held" in trades else 0.0
     return {"trades": n, "net_usd": round(float(trades["pnl_usd"].sum()), 2),
+            "swap_usd": round(float(trades["swap"].sum()), 2) if "swap" in trades else 0.0,
             "net_R": round(float(trades["pnl_R"].sum()), 2),
             "expect_R": round(float(trades["pnl_R"].mean()), 3),
             "win_rate": round(len(wins) / n, 3),
@@ -488,6 +489,7 @@ def total_row(all_trades: pd.DataFrame) -> dict:
     eq0 = pd.concat([pd.Series([0.0]), eq], ignore_index=True)  # DD counts the first loss too
     return {"symbol": "TOTAL", "trades": n,
             "net_usd": round(float(t["pnl_usd"].sum()), 2),
+            "swap_usd": round(float(t["swap"].sum()), 2) if "swap" in t else 0.0,
             "net_R": round(float(t["pnl_R"].sum()), 2),
             "expect_R": round(float(t["pnl_R"].mean()), 3),
             "win_rate": round(len(wins) / n, 3),

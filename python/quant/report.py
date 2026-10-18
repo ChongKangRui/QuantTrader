@@ -57,6 +57,7 @@ def _summary_table(summary: pd.DataFrame) -> str:
     # readable header names for every column; unknown columns stay as-is
     LABELS = {
         "symbol": "Pair", "trades": "Trades", "net_usd": "Net P/L (USD)",
+        "swap_usd": "Swap (USD)",
         "net_R": "Net R", "expect_R": "Avg P/L per trade (R)",
         "win_rate": "Win rate (%)", "profit_factor": "Profit factor",
         "max_dd": "Max drawdown (USD)", "max_dd_pct": "Max drawdown (% of account)",
@@ -288,6 +289,7 @@ def write_report(run_dir: Path, data_dir: Path) -> bool:
              "entry": str(r["entry_time"])[:16], "pnlR": _round(r["pnl_R"]),
              "pnlUsd": _round(r["pnl_usd"]),
              "exitType": str(r["exit_type"]), "bars": int(r["bars_held"]),
+             "swap": _num(r, "swap"),  # null when the run predates the swap column
              "riskUsd": _num(r, "risk_usd"), "tpUsd": _num(r, "tp_usd"),
              "missing": r["_id"] not in embedded_ids}
             for _, r in all_trades.iterrows()]
@@ -342,9 +344,23 @@ function drawList() {
   var rows = listTrades();
   countEl.textContent = rows.length + ' trades (' +
     rows.filter(function (r) { return r.pnlR < 0; }).length + ' losses)';
+  // totals row = sums over the FILTERED selection (pair + loss/exit filters),
+  // styled like the summary table's TOTAL row; swap shows '-' when the run
+  // predates the swap column
+  var sum = function (get) {
+    return rows.reduce(function (a, r) { return a + (get(r) || 0); }, 0);
+  };
+  var rnd = function (v) { return Math.round(v * 100) / 100; };
+  var hasSwap = rows.some(function (r) { return r.swap != null; });
   rowsEl.innerHTML = '<tr><th>Entry time</th><th>Side</th><th>P/L (USD)</th>' +
     '<th>P/L (R)</th><th>Exit type</th><th>Held (bars)</th>' +
-    '<th>1R (USD)</th><th>TP amount (USD)</th></tr>' +
+    '<th>1R (USD)</th><th>TP amount (USD)</th><th>Swap (USD)</th></tr>' +
+    '<tr class="tot"><td>TOTAL ' + rows.length + '</td><td></td>' +
+    '<td>' + usd(rnd(sum(function (r) { return r.pnlUsd; }))) + '</td>' +
+    '<td>' + rnd(sum(function (r) { return r.pnlR; })) + '</td>' +
+    '<td></td><td></td><td></td><td></td>' +
+    '<td>' + (hasSwap ? usd(rnd(sum(function (r) { return r.swap; }))) : '-') +
+    '</td></tr>' +
     rows.map(function (r) {
       var col = r.pnlR < 0 ? '#f66' : '#6c6';
       return '<tr data-id="' + r.id + '"' + (r.missing ? ' class="nochart"' : '') +
@@ -352,7 +368,8 @@ function drawList() {
         '</td><td style="color:' + col + '">' + usd(r.pnlUsd) +
         '</td><td style="color:' + col + '">' + r.pnlR + '</td><td>' + r.exitType +
         '</td><td>' + r.bars + '</td><td>' + usd(r.riskUsd) +
-        '</td><td>' + usd(r.tpUsd) + '</td></tr>';
+        '</td><td>' + usd(r.tpUsd) + '</td><td>' +
+        (r.swap == null ? '-' : usd(r.swap)) + '</td></tr>';
     }).join('');
 }
 pairSel.onchange = drawList;
@@ -484,6 +501,7 @@ tr.tot td { font-weight: bold; background: #333; }
 #rows td { cursor: pointer; }
 #rows tr:hover td { background: #2a2a2a; }
 #rows tr.nochart td { opacity: 0.4; }  /* no embedded window: click shows only the note */
+#rows tr.tot td { cursor: default; }   /* totals row is not a trade; no chart opens */
 select { background: #222; color: #ddd; border: 1px solid #555; padding: 2px 6px; }
 .fig { display: inline-block; vertical-align: top; margin: 4px; }
 #hint { color: #888; margin-left: 10px; }
