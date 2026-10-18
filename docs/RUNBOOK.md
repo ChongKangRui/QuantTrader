@@ -3,6 +3,18 @@
 Terminal must be open and logged in for anything that reads MT5.
 Monitor and smoke send no orders.
 
+## Trading supervisor (the trading switch)
+
+```powershell
+start-trader.bat
+```
+
+Launches the panel WITH the trading loop (`quant.monitor --trade`).
+Dry-run by default: plans + journal rows only, nothing is sent.
+Closing this window means nothing trades. Real orders later: add
+`--no-dry-run` to the command line by hand (demo account first, exactly one
+enabled account). `start-panel.bat` stays read-only forever.
+
 ## Live broker costs (read-only, no orders)
 
 ```powershell
@@ -127,16 +139,13 @@ ENTRY is `GO` or the first failing section-5 rule (`HR2`, `HR3`, `HR4`,
 
 ## ATR separation switch
 
-Three places, top one wins:
+One place decides it; pair files and `.env` cannot override it:
 
-1. `.env`: `USE_ATR_SEP=false` — flips every pair on this machine.
-   Unset (default) = YAML decides. Add the line yourself; `.env` is never committed.
-2. `configs/_base.yaml`: `strategy: {use_atr_sep: ...}` — global default, currently `true`.
-3. Per-pair file, e.g. `configs/EURUSD.yaml`: `strategy: {use_atr_sep: false}` — overrides the base.
+1. `configs/_base.yaml`: `strategy.use_atr_sep` — global default, currently `true`.
+2. Backtest CLI `--ma-only` forces `false` for one run (sensitivity sweep).
 
 `false` = MA-only: UP if EMA20 >= EMA50 else DOWN, no HR1, no FLAT
-(except warmup). Panel title shows `MA-only`, or `MA-only (env)` when the
-`.env` override is active.
+(except warmup). Panel title shows `MA-only` when every pair reads it as off.
 
 ## Tests
 

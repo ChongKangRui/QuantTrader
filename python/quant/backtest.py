@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,7 +24,31 @@ import pandas as pd
 
 from quant.bias import ATR_PERIOD, EMA_FAST, EMA_SLOW, SEP_MIN_DEFAULT, h4_bias
 from quant.limits import md_in_ranges, parse_no_trade_ranges
+from quant.rules import combine_stop, cost_ok, scope_lots, step_risk as _step_risk
 from quant.signals import check_entry
+
+_YAML_COMMENT = re.compile(r"^\s*([A-Za-z_][\w]*)\s*:.*#\s*(.+?)\s*$")
+
+
+def yaml_notes(path) -> dict:
+    """Flat {yaml_key: inline comment} map from a config file (best effort).
+
+    Lets params.json carry the same one-line meaning the yaml shows, so a run
+    folder stays readable without opening the yaml. Full-line comments and
+    values without comments are skipped; only unique leaf key names map.
+    """
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return {}
+    notes: dict[str, str] = {}
+    for line in lines:
+        if line.lstrip().startswith("#"):
+            continue
+        m = _YAML_COMMENT.match(line)
+        if m:
+            notes[m.group(1)] = m.group(2).strip()
+    return notes
 
 MY_TZ = timezone(timedelta(hours=8))  # result stamps use laptop (Malaysia) time
 WIN_BARS = 400  # trailing window per signal check (periods <= 50: settled)
@@ -296,34 +321,20 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
         tick_size, tick_value = tick
         atr_f = float(cand["atr"])
         stop_dist = stop_mult * atr_f
-        if max_cost_ratio > 0 and (spread_px + slip_px) / stop_dist > max_cost_ratio:
+        # shared core: the live trader runs the identical math (quant/rules.py)
+        if not cost_ok(stop_dist, spread_px, slip_px, max_cost_ratio):
             cost_skips += 1  # round-trip cost too large vs the stop distance
             continue
-        step_risk = (stop_dist / tick_size) * tick_value * 0.01  # 1R at 0.01 lot
-        if lot:  # fixed diagnostic lot: the scope still filters its risk
-            lots = float(lot)
-            risk_fixed = step_risk * lots / 0.01
-            if (scope_low > 0 or scope_high > 0) and not (
-                    (scope_low <= 0 or risk_fixed + 1e-9 >= scope_low)
-                    and (scope_high <= 0 or risk_fixed <= scope_high + 1e-9)):
-                scope_skips += 1
-                continue
-        elif scope_high > 0:
-            # scope sizing: smallest 0.01 multiple whose risk reaches the low bound
-            if step_risk > scope_high:
-                scope_skips += 1  # even the minimum lot busts the ceiling
-                continue
-            n = max(1, int(-(-scope_low // step_risk)))  # ceil(scope_low / step_risk)
-            lots = n * 0.01
-            if step_risk * n > scope_high:
-                scope_skips += 1  # no lot size lands inside the band (granularity hole)
-                continue
-        else:
-            lots = risk_usd / ((stop_dist / tick_size) * tick_value)  # legacy target
-            lots = int(lots // 0.01) * 0.01
-            if lots < 0.01:
-                lot_skips += 1
-                continue
+        lots, _risk_fixed, why = scope_lots(
+            _step_risk(stop_dist, tick_size, tick_value),
+            scope_low, scope_high, fixed_lot=float(lot) if lot else 0.0,
+            risk_target_usd=risk_usd)
+        if why == "scope":
+            scope_skips += 1
+            continue
+        if why == "lot":
+            lot_skips += 1
+            continue
         funnel_sized += 1
         last_day = day
         fill = float(h1["open"].iloc[t + 1])
@@ -363,14 +374,9 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
                 hh, ll = max(hh, row_hi), min(ll, row_lo)  # best price since entry
                 eff_sl = sl
                 if activated:
-                    if use_be:
-                        eff_sl = max(eff_sl, entry + be_buf) if long else min(eff_sl, entry - be_buf)
-                    if use_trail:
-                        # T1: stop = best price - trail_r x initial risk. A level still
-                        # on the loss side of entry means the trigger point is not hit.
-                        level = hh - trail_r * stop_dist if long else ll + trail_r * stop_dist
-                        if (long and level >= entry) or (not long and level <= entry):
-                            eff_sl = max(eff_sl, level) if long else min(eff_sl, level)
+                    # shared core: BE + T1 overlays (quant/rules.combine_stop)
+                    eff_sl = combine_stop(sl, entry, stop_dist, hh if long else ll,
+                                          long, use_be, be_buf, use_trail, trail_r)
                 hit_sl = (row_lo <= eff_sl) if long else (row_hi >= eff_sl)
                 hit_tp = (row_hi >= tp) if long else (row_lo <= tp)
                 if hit_sl and hit_tp:
@@ -709,6 +715,96 @@ def mtm_equity(trades_by_sym: dict[str, pd.DataFrame],
     return pd.DataFrame({"time": pd.to_datetime(g, unit="s", utc=True), "usd": eq})
 
 
+def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
+                     max_ccy_net: int, weekly_pct: float, account_usd: float = 0.0
+                     ) -> tuple[dict[str, pd.DataFrame], list[dict]]:
+    """Portfolio pass over the per-pair trade lists (time-ordered, all pairs).
+
+    Enforces the locked portfolio rules the per-pair simulation cannot see:
+      - max_open: max concurrent open trades portfolio-wide (0 = off)
+      - max_ccy_net: |net currency count| per currency (long EURUSD = +EUR/-USD;
+        short = mirror; keeps one-sided currency stacks thin) (0 = off)
+      - weekly_pct: once a week's CLOSED P&L is a loss of that % of week-start
+        equity, no new entries until the next Monday 00:00 UTC (0 = off)
+    Deterministic: candidates by (entry_time, symbol); an exit at the same
+    timestamp is applied BEFORE entries (frees the slot). Week-start equity =
+    account_usd + all closed P&L before that Monday (closed-only, floating ignored).
+    Returns (kept frames by symbol, dropped records).
+    """
+    if max_open <= 0 and max_ccy_net <= 0 and weekly_pct <= 0:
+        return dict(trades_by_sym), []
+    cands = []
+    for sym, df in trades_by_sym.items():
+        if not len(df):
+            continue
+        for idx, t in df.iterrows():
+            cands.append((sym, int(idx), str(t["entry_time"]), str(t["exit_time"]),
+                          str(t.get("direction", "")), float(t["pnl_usd"])))
+    # one event per trade: exits (0) sort before entries (1) at equal timestamps
+    evs = []
+    for sym, idx, tin, tout, direction, pnl in cands:
+        evs.append((pd.Timestamp(tin), 1, sym, idx, direction, pnl))
+        evs.append((pd.Timestamp(tout), 0, sym, idx, direction, pnl))
+    evs.sort(key=lambda e: (e[0], e[1], e[2], e[3]))
+
+    active: dict = {}          # (sym, idx) -> direction
+    kept: dict[str, list[int]] = {}
+    dropped: list[dict] = []
+    ccy: dict = {}
+    realized = 0.0
+    week_key = None
+    week_realized = 0.0
+    wk_eq = float(account_usd)
+    halted = False
+
+    def _drop(sym, idx, tin, reason):
+        dropped.append({"symbol": sym, "entry_time": tin[:16], "reason": reason})
+
+    for t, kind, sym, idx, direction, pnl in evs:
+        if kind == 0:  # exit: free the slot, book the P&L, run the halt check
+            direction = active.pop((sym, idx), None)
+            if direction is None:
+                continue  # was dropped at entry — it never held currency exposure
+            base, quote = sym[:3].upper(), sym[3:].upper()
+            sgn = 1 if direction == "LONG" else -1
+            ccy[base] = ccy.get(base, 0) - sgn
+            ccy[quote] = ccy.get(quote, 0) + sgn
+            realized += pnl
+            week_realized += pnl
+            if weekly_pct > 0 and week_realized <= -weekly_pct / 100.0 * wk_eq:
+                halted = True
+            continue
+        # entry decision (exits at the same timestamp have already run)
+        t_utc = t.tz_localize("UTC") if t.tzinfo is None else t
+        wk = t_utc.normalize() - pd.Timedelta(days=t_utc.weekday())  # Monday 00:00 UTC
+        if wk != week_key:
+            week_key = wk
+            wk_eq = float(account_usd) + realized
+            week_realized = 0.0
+            halted = False
+        hh_mm = t.strftime("%Y-%m-%d %H:%M")
+        if halted:
+            _drop(sym, idx, hh_mm, "weekly_halt")
+            continue
+        if max_open > 0 and len(active) >= max_open:
+            _drop(sym, idx, hh_mm, "open_max")
+            continue
+        base, quote = sym[:3].upper(), sym[3:].upper()
+        sgn = 1 if direction == "LONG" else -1
+        d_base, d_quote = ccy.get(base, 0) + sgn, ccy.get(quote, 0) - sgn
+        if max_ccy_net > 0 and (abs(d_base) > max_ccy_net or abs(d_quote) > max_ccy_net):
+            _drop(sym, idx, hh_mm, "ccy")
+            continue
+        active[(sym, idx)] = direction
+        kept.setdefault(sym, []).append(idx)
+        ccy[base], ccy[quote] = d_base, d_quote
+    out_frames = {}
+    for sym, df in trades_by_sym.items():
+        ids = kept.get(sym, [])
+        out_frames[sym] = df[df.index.isin(ids)].reset_index(drop=True) if ids else df.iloc[0:0]
+    return out_frames, dropped
+
+
 def apply_daily_cap(trades_by_sym: dict[str, pd.DataFrame],
                     limit: int) -> tuple[dict[str, pd.DataFrame], list[dict]]:
     """Portfolio-wide cap: at most `limit` entries per calendar day, all pairs.
@@ -776,6 +872,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="override risk.sizing_scope_usd.high from _base.yaml")
     ap.add_argument("--max-cost-ratio", type=float, default=None,
                     help="override limits.max_cost_ratio from _base.yaml")
+    ap.add_argument("--max-total-positions", type=int, default=None,
+                    help="override risk.max_total_positions (portfolio pass; 0 = off)")
+    ap.add_argument("--max-ccy-net", type=int, default=None,
+                    help="override risk.max_ccy_net (currency exposure cap; 0 = off)")
+    ap.add_argument("--weekly-loss-pct", type=float, default=None,
+                    help="override limits.weekly_loss_pct (backtest weekly halt; 0 = off)")
     ap.add_argument("--atr-n", type=int, default=None)
     ap.add_argument("--sep-atr", type=float, default=None)
     ap.add_argument("--ma-only", action="store_true")
@@ -795,6 +897,15 @@ def main(argv: list[str] | None = None) -> int:
     costs = dict((base.get("costs") or {}))
     max_day = int((base.get("limits") or {}).get("max_trades_per_day", 0) or 0)
     bench = dict(base.get("benchmarks") or {})
+    # portfolio-pass knobs (locked rules the per-pair sim cannot see); 0 = off
+    risk_cfg = dict(base.get("risk") or {})
+    if args.max_total_positions is None:
+        args.max_total_positions = int(risk_cfg.get("max_total_positions") or 0)
+    if args.max_ccy_net is None:
+        args.max_ccy_net = int(risk_cfg.get("max_ccy_net") or 0)
+    if args.weekly_loss_pct is None:
+        args.weekly_loss_pct = float((base.get("limits") or {}).get(
+            "weekly_loss_pct", 0.0) or 0.0)
     # the cost gate lives in _base.yaml limits (visible config), CLI overrides it
     if args.max_cost_ratio is None:
         args.max_cost_ratio = float(
@@ -907,6 +1018,9 @@ def main(argv: list[str] | None = None) -> int:
         "benchmarks": bench,
         "pair_costs": pair_costs_recorded,
         "jobs": [[s, str(path)] for s, path, _ in jobs]}
+    # the yaml's own one-line comments travel into every run folder
+    notes = yaml_notes(Path(args.config_dir) / "_base.yaml")
+    params["notes"] = {"_source": "configs/_base.yaml", **notes}
     params_path = outdir / "params.json"
     params_path.write_text(json.dumps(params, indent=1), encoding="utf-8")
 
@@ -927,7 +1041,40 @@ def main(argv: list[str] | None = None) -> int:
         if dropped:
             print(f"day-cap {max_day}/day: dropped {len(dropped)} late same-day entries "
                   f"({', '.join(sorted({d['symbol'] for d in dropped}))})", flush=True)
-    if failures or dropped:
+    # portfolio pass (max_total_positions / max_ccy_net / weekly halt), after the
+    # daily cap: the calendar cap trims same-day duplicates first, then the
+    # concurrency rules run over the trimmed trade list
+    params["portfolio"] = {
+        "max_total_positions": max(args.max_total_positions, 0),
+        "max_ccy_net": max(args.max_ccy_net, 0),
+        "weekly_loss_pct": max(args.weekly_loss_pct, 0.0)}
+    account_base = float(bench.get("account_usd") or 0) or 0.0
+    kept_pf, pf_dropped = portfolio_filter(
+        {s: r["trades"] for s, r in results.items()},
+        params["portfolio"]["max_total_positions"], params["portfolio"]["max_ccy_net"],
+        params["portfolio"]["weekly_loss_pct"], account_base)
+    changed: set[str] = set()
+    if pf_dropped:
+        params["portfolio"]["dropped"] = pf_dropped
+        changed = {s for s in kept_pf
+                   if len(kept_pf[s]) != len(results[s]["trades"])}
+        for sym in sorted(changed):
+            res = results[sym]
+            res["trades"] = kept_pf[sym]
+            m = metrics(kept_pf[sym], res["span_days"], res["n_bars"])
+            m["symbol"], m["signals"] = sym, res["metrics"]["signals"]
+            res["metrics"] = m
+            res["funnel"]["taken"] = len(kept_pf[sym])
+        reasons: dict[str, int] = {}
+        for d in pf_dropped:
+            reasons[d["reason"]] = reasons.get(d["reason"], 0) + 1
+        print(f"portfolio pass: dropped {len(pf_dropped)} entries "
+              f"({', '.join(f'{k}={v}' for k, v in sorted(reasons.items()))}); "
+              f"affected pairs: {', '.join(sorted(changed))}", flush=True)
+    elif params["portfolio"]["weekly_loss_pct"] or params["portfolio"]["max_ccy_net"] \
+            or params["portfolio"]["max_total_positions"]:
+        print("portfolio pass: no entries dropped", flush=True)
+    if failures or dropped or pf_dropped:
         params["failed"] = failures
         params["daily_cap_dropped"] = dropped
         params_path.write_text(json.dumps(params, indent=1), encoding="utf-8")

@@ -31,6 +31,8 @@ COLUMNS = [
     "ticket",
     "dry_run",
     "reason",
+    "position",   # broker position id (live entries/adoption); empty otherwise
+    "risk_usd",   # 1R money at the initial stop, from the shared sizing math
 ]
 
 
@@ -42,10 +44,18 @@ def build_comment(bias: str, trigger: str = "E1", variant: str = "B1") -> str:
 
 def ensure_header(path: str | Path) -> Path:
     path = Path(path)
+    want = ",".join(COLUMNS)
     if not path.exists() or path.stat().st_size == 0:
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "w", newline="", encoding="utf-8") as fh:
             csv.DictWriter(fh, fieldnames=COLUMNS).writeheader()
+        return path
+    with open(path, newline="", encoding="utf-8") as fh:
+        first = fh.readline().rstrip("\r\n")
+    if first != want:  # legacy header: just widen line 1; data rows stay in place
+        body = path.read_text(encoding="utf-8").splitlines(keepends=True)
+        body[0] = want + "\n"
+        path.write_text("".join(body), encoding="utf-8")
     return path
 
 

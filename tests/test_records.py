@@ -76,6 +76,23 @@ def test_entry_missing_from_window_derives_side(tmp_path):
     assert row["side"] == "BUY" and row["entry_price"] == ""  # out SELL closes BUY
 
 
+def test_early_opened_position_keeps_entry_after_watermark_ran_ahead(tmp_path):
+    # A opens (ticket 1) while B (tickets 2-3) opens and closes; A's IN deal sits
+    # BELOW the watermark the old per-deal filter produced -> lost entry data.
+    p = tmp_path / "demo.csv"
+    b = [_deal(2, 0, 0, 1.1000, pid=21), _deal(3, 1, 1, 1.1050, profit=1.0, pid=21)]
+    assert sync_closed_positions(_FakeMT5(b), p, MAGIC, {}, "DEMO") == 1
+    full = [_deal(1, 0, 0, 1.2000, commission=-0.3, pid=20), b[0], b[1],
+            _deal(4, 1, 1, 1.2200, profit=-2.0, commission=-0.4, pid=20)]
+    assert sync_closed_positions(_FakeMT5(full), p, MAGIC, {"1": "stack+HR1a"}, "DEMO") == 1
+    import pandas as pd
+    rows = pd.read_csv(p)
+    a = rows[rows["ticket"] == 4].iloc[0]
+    assert a["entry_price"] == 1.2          # IN deal survived below the watermark
+    assert a["commission"] == -0.7          # IN + OUT commissions both counted
+    assert a["entry_condition"] == "stack+HR1a"
+
+
 def test_conditions_join_on_ticket(tmp_path):
     j = tmp_path / "journal.csv"
     j.write_text("ticket,reason,comment\n5,stack+HR1a,QT B1-L E1\n", encoding="utf-8")

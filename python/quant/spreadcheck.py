@@ -9,17 +9,69 @@ hours. Razor accounts bill commission per lot that this tool cannot see.
 
 import argparse
 
+SWAP_MODE_NAMES = {0: "disabled", 1: "points", 2: "ccy-symbol", 3: "ccy-deposit",
+                   4: "interest/yr", 5: "reopen-current", 6: "reopen-bid"}
 
-def _row(sym: str, info) -> str:
+
+def _profit_ccy_fx(mt5, info) -> tuple[float | None, str]:
+    """USD per 1 unit of the PROFIT currency, from the broker's own quote.
+
+    (rate, note): rate None means un convertible; note explains what was used.
+    mt5=None is allowed for USD-quoted symbols only (the identity conversion).
+    """
+    ccy = str(getattr(info, "currency_profit", "USD") or "USD")
+    if ccy == "USD":
+        return 1.0, "USD direct"
+    if mt5 is None:
+        return None, "no terminal: swap stays in profit ccy"
+    q = mt5.symbol_info(f"{ccy}USD")   # e.g. EURUSD: rate = price
+    if q is not None and getattr(q, "bid", 0):
+        return float(q.bid), f"via {ccy}USD bid"
+    q = mt5.symbol_info(f"USD{ccy}")   # e.g. USDJPY: rate = 1 / price
+    if q is not None and getattr(q, "bid", 0):
+        return 1.0 / float(q.bid), f"via 1/USD{ccy} bid"
+    return None, "no <CCY>USD/USD<CCY> quote: swap stays in profit ccy"
+
+
+def _per_001_swap(info) -> tuple[float | None, float | None, str]:
+    """(long, short) per 0.01 lot per night in the PROFIT currency, + mode label.
+
+    MT5 swap units depend on swap_mode: money modes are per 1.0 lot (divide by
+    100); 'points' is points per 1.0 lot -> multiply by the point value of a
+    0.01 lot (point x contract_size x 0.01). None = no money number convertible.
+    """
+    mode = getattr(info, "swap_mode", None)
+    label = SWAP_MODE_NAMES.get(mode, f"mode={mode}")
+    if mode == 0:
+        return 0.0, 0.0, label
+    if mode in (2, 3):  # account/symbol currency per 1.0 lot
+        return info.swap_long / 100.0, info.swap_short / 100.0, label
+    if mode == 1:  # points per 1.0 lot
+        contract = float(getattr(info, "trade_contract_size", 0) or 0)
+        pv = float(info.point) * contract * 0.01  # 1 point on 0.01 lot, profit ccy
+        if pv > 0:
+            return info.swap_long * pv, info.swap_short * pv, label
+    return None, None, label
+
+
+def _row(sym: str, info, mt5=None) -> str:
     """One human line per symbol from an MT5 symbol_info result (or a fallback)."""
     if info is None:
         return f"{sym}: no symbol info (check Market Watch / symbol name)"
     pip = 0.01 if "JPY" in sym else 0.0001
     spread_pips = info.spread * info.point / pip
-    # server swaps are per 1.0 lot; the config cost model uses per 0.01 lot
-    swap_l, swap_s = info.swap_long / 100.0, info.swap_short / 100.0
-    line = (f"{sym}: spread {info.spread} points = {spread_pips:.1f} pips | "
-            f"swap L/S {swap_l:+.4f} / {swap_s:+.4f} per 0.01 lot | "
+    swap_l, swap_s, mode = _per_001_swap(info)
+    if swap_l is None:
+        swap_txt = f"swap {mode}: no per-0.01-lot number (recalibrate by hand)"
+    else:
+        rate, note = _profit_ccy_fx(mt5, info)  # mt5=None is fine for USD ccy
+        if rate is None:
+            swap_txt = (f"swap L/S {swap_l:+.4f} / {swap_s:+.4f} profit-ccy per 0.01 lot "
+                        f"({mode}; {note})")
+        else:
+            swap_txt = (f"swap L/S {swap_l * rate:+.4f} / {swap_s * rate:+.4f} USD per 0.01 lot "
+                        f"({mode}; {note})")
+    line = (f"{sym}: spread {info.spread} points = {spread_pips:.1f} pips | {swap_txt} | "
             f"max lots {getattr(info, 'volume_max', '?')}")
     if info.spread == 0:
         # weekend/stale quote: the spread must be sampled in a live session
@@ -50,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
                 # True: add to Market Watch — False only succeeds for already-listed symbols
                 print(f"{sym}: broker refused the symbol", flush=True)
                 continue
-            print(_row(sym, mt5.symbol_info(sym)), flush=True)
+            print(_row(sym, mt5.symbol_info(sym), mt5), flush=True)
     finally:
         mt5.shutdown()
     return 0

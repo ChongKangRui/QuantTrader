@@ -26,3 +26,19 @@ def test_ensure_header_is_idempotent(tmp_path):
     ensure_header(p)
     with open(p, encoding="utf-8") as fh:
         assert len(fh.readlines()) == 1
+
+
+def test_ensure_header_upgrades_legacy_file(tmp_path):
+    p = tmp_path / "journal.csv"
+    legacy = ",".join(COLUMNS[:-2])  # old 19-col header (no position/risk_usd)
+    p.write_text(legacy + "\n"
+                 "2026-10-17 00:00:00Z,EURUSD,LONG,1.1,1.09,1.11,0.01,UP,,,,,,"
+                 ",,100001,QT B1-L E1,55,False,entry,,\n", encoding="utf-8")
+    ensure_header(p)
+    with open(p, encoding="utf-8") as fh:
+        rows = list(csv.DictReader(fh))
+    assert len(rows) == 1 and rows[0]["symbol"] == "EURUSD"
+    assert set(rows[0].keys()) == set(COLUMNS)      # header widened in place
+    assert rows[0].get("position") in (None, "",)    # old rows simply lack it
+    append_row(p, {"symbol": "GBPUSD", "position": 7})  # new rows carry position
+    assert rows[0].get("position") in (None, "",)

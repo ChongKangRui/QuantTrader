@@ -1,4 +1,11 @@
-"""H4 bias console panel. Read-only, sends no orders.
+"""H4 bias console + optional trading supervisor.
+
+Default (no --trade): read-only, sends no orders.
+`--trade` adds a trading loop on top of the panel: entries on closed H1 bars,
+position adoption, portfolio caps, weekly halt, trail/BE. Dry-run is the
+default state of that loop (plans + journal rows, nothing sent); real orders
+require `--no-dry-run` AND exactly one enabled account AND only the user
+launches it.
 
 Repaint rule: the screen only redraws when a new H1 bar closes. All bars are
 closed bars fetched via copy_rates_from_pos(..., start_pos=1); the H4 bias uses
@@ -17,7 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from quant.bias import SEP_MIN_DEFAULT, h4_bias
+from quant.bias import ATR_PERIOD, EMA_FAST, EMA_SLOW, SEP_MIN_DEFAULT, h4_bias
 from quant.signals import check_entry
 
 JOURNAL_DEFAULT = "trades/journal.csv"
@@ -99,6 +106,45 @@ def read_limits(config_dir: str | Path) -> float:
         return float((cfg.get("limits") or {}).get("weekly_loss_pct", 15.0))
     except Exception:
         return 15.0
+
+
+def read_trade_cfg(config_dir: str | Path) -> dict:
+    """`--trade` knobs: the SAME _base.yaml keys the backtest engine reads.
+
+    paths: live.magic/dry_run_default, risk.max_total_positions/max_ccy_net,
+    risk.sizing_scope_usd.low/high, limits.max_trades_per_day/max_cost_ratio,
+    limits.no_trade_ranges, costs (per-pair overrides merge on top later).
+    Missing file/keys fall back to the engine's defaults; 0 = off.
+    """
+    import yaml
+
+    from quant.limits import parse_no_trade_ranges
+
+    try:
+        cfg = yaml.safe_load(
+            _read_yaml_text(Path(config_dir) / "_base.yaml")) or {}
+    except Exception:
+        cfg = {}
+    risk = dict(cfg.get("risk") or {})
+    lim = dict(cfg.get("limits") or {})
+    scope = dict(risk.get("sizing_scope_usd") or {})
+    live = dict(cfg.get("live") or {})
+    try:
+        ranges = tuple(parse_no_trade_ranges(cfg))
+    except ValueError:
+        ranges = ()
+    return {
+        "magic": int(live.get("magic", 100001) or 100001),
+        "dry_run_default": bool(live.get("dry_run_default", True)),
+        "max_total_positions": int(risk.get("max_total_positions", 0) or 0),
+        "max_ccy_net": int(risk.get("max_ccy_net", 0) or 0),
+        "max_trades_per_day": int(lim.get("max_trades_per_day", 0) or 0),
+        "max_cost_ratio": float(lim.get("max_cost_ratio", 0.10) or 0.0),
+        "scope_low": float(scope.get("low", 0.0) or 0.0),
+        "scope_high": float(scope.get("high", 0.0) or 0.0),
+        "costs": dict(cfg.get("costs") or {}),
+        "ranges": ranges,
+    }
 
 
 def flatten_strategy(cfg: dict) -> dict:
@@ -216,8 +262,13 @@ def poll(mt5, pairs: list[dict], h4_bars: int = H4_BARS,
             times[symbol] = int(h1df["time"].iloc[-1])
             params = p.get("params") or {}
             warmup = int(params.get("warmup_bars", 300))
+            # bias periods come from the same flat params the backtest uses;
+            # defaults mirror the locked B1 constants, never re-tuned here
             b = h4_bias(h4df, p.get("sep", SEP_MIN_DEFAULT), p.get("hr1", "a"),
-                        p.get("use_atr_sep", True), min_bars=warmup)
+                        p.get("use_atr_sep", True), min_bars=warmup,
+                        ema_fast=int(params.get("h4_ema_fast") or EMA_FAST),
+                        ema_slow=int(params.get("h4_ema_slow") or EMA_SLOW),
+                        atr_n=int(params.get("h4_atr_n") or ATR_PERIOD))
             bias = DISP[b.direction]
             entry = "-"
             if bias in ("UP", "DOWN"):
@@ -233,13 +284,15 @@ def poll(mt5, pairs: list[dict], h4_bars: int = H4_BARS,
 
 def render_panel(rows: list[PairRow], local_time: str, broker_time: str,
                  account: str, mode: str = "B1", weeks: dict | None = None,
-                 loss_pct: float = 15.0) -> str:
+                 loss_pct: float = 15.0, banner: str | None = None) -> str:
     lines = [
         f"QuantTrader H4 bias panel (H4 {mode}, bias only)",
         f"local time : {local_time} (Malaysia, UTC+8)",
         f"broker time: {broker_time} (last H1 close, UTC)",
         f"account={account}  rule=repaint-on-new-H1-close-only",
     ]
+    if banner:
+        lines.append(banner)
     for tag, info in (weeks or {}).items():
         lines.append(f"week {tag}: {info['loss_pct']:+.2f}% (halt at -{loss_pct:g}%)")
     for tag, info in (weeks or {}).items():
@@ -295,8 +348,55 @@ def _merge_stars(base: list[PairRow], more: list[PairRow]) -> list[PairRow]:
     return out
 
 
+def _trade_pass(mt5, pairs, rows, times, tcfg: dict, atag: str, week: dict,
+                deals, now: datetime) -> None:
+    """The `--trade` beat inside one account's initialized session.
+
+    Two jobs per pass, in order: manage what we already hold (sync ghosts,
+    trail/BE), then attempt entries on new closed H1 bars for pairs with an
+    UP/DOWN bias. Everything mutable lives in the trader's mem file; prints
+    go to the console exactly once per finished event.
+    """
+    from quant import trader as tr
+
+    journal_path = tcfg["journal"]
+    mem_path = tcfg["mem_path"]
+    mem = tr.load_mem(mem_path)
+    journal_rows = tr.journal_by_position(journal_path)
+    row_by_sym = {r.symbol: r for r in rows if r.ok}
+    booked = {(v or {}).get("symbol") for v in (mem.get("open") or {}).values()}
+    for p in pairs:
+        if p.get("load_error"):
+            continue
+        sym = p["symbol"]
+        row = row_by_sym.get(sym)
+        if sym in booked or (row is not None and row.has_position):
+            # trailing/ghost sync runs every pass, poll error or not
+            for m in tr.manage_book(mt5, sym, sym, p["params"], tcfg["magic"],
+                                    tcfg["dry"], journal_path, mem, journal_rows):
+                print(f"trade {sym}: {m}", flush=True)
+        if row is None or row.bias not in ("UP", "DOWN"):
+            continue
+        cfg = dict(tcfg["base"])
+        cfg["costs"] = {**tcfg["base_costs"], **p["costs"]}
+        cfg["halted"] = bool((week or {}).get("halted"))
+        msg = tr.trade_on_bar(mt5, sym, sym, direction=dir_of(row.bias),
+                              bar_secs=int(times.get(sym) or 0), now=now,
+                              magic=tcfg["magic"], dry=tcfg["dry"],
+                              params=p["params"], journal_path=journal_path,
+                              mem=mem, cfg=cfg, deals=deals, ranges=tcfg["ranges"])
+        if msg and msg != "seen":
+            print(f"trade {sym}: {msg}", flush=True)
+    tr.save_mem(mem_path, mem)
+
+
+def dir_of(bias: str) -> str:
+    return "LONG" if bias == "UP" else "SHORT"
+
+
 def _cycle(mt5, accounts, pairs, args, conditions: dict[str, str],
-           loss_pct: float) -> tuple[list[PairRow], dict, dict]:
+           loss_pct: float, tcfg: dict | None = None
+           ) -> tuple[list[PairRow], dict, dict]:
     """One pass over every enabled account: bias poll, records sync, weekly halt.
 
     The terminal holds one MT5 session, so accounts log in sequentially.
@@ -338,6 +438,9 @@ def _cycle(mt5, accounts, pairs, args, conditions: dict[str, str],
                         deals, args.magic, equity, loss_pct, now)
                 except Exception as exc:
                     print(f"weekly halt check skipped ({atag}): {exc}", flush=True)
+                if tcfg:
+                    _trade_pass(mt5, pairs, rows, times, tcfg, atag,
+                                weeks.get(atag) or {}, deals, now)
                 merged = rows if merged is None else _merge_stars(merged, rows)
             finally:
                 mt5.shutdown()
@@ -347,15 +450,21 @@ def _cycle(mt5, accounts, pairs, args, conditions: dict[str, str],
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="H4 bias console panel (read-only, sends no orders).")
+    ap = argparse.ArgumentParser(
+        description="H4 bias console panel; add --trade for the trading loop (dry-run default).")
     ap.add_argument("--config-dir", default="configs")
     ap.add_argument("--journal", default=JOURNAL_DEFAULT)
     ap.add_argument("--records-dir", default=RECORDS_DEFAULT)
     ap.add_argument("--memory-dir", default=MEMORY_DEFAULT)
-    ap.add_argument("--magic", type=int, default=100001)
+    ap.add_argument("--magic", type=int, default=None,
+                    help="override live.magic from _base.yaml (default 100001)")
     ap.add_argument("--bars", type=int, default=H4_BARS)
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--interval", type=float, default=POLL_INTERVAL)
+    ap.add_argument("--trade", action="store_true",
+                    help="enable the trading loop (entries + management). OFF = read-only panel.")
+    ap.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=None,
+                    help="trade planner only, nothing sent (default: live.dry_run_default=true)")
     args = ap.parse_args(argv)
 
     from quant.config import get_accounts
@@ -398,26 +507,63 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     tag = "+".join("REAL" if a.live else "DEMO" for a in accounts)
 
+    tcfg: dict | None = None
+    banner: str | None = None
+    if args.trade:
+        # the loop trades THE ONE enabled account; two enabled = refuse loudly
+        # so demo and real can never fire together
+        if len(accounts) != 1:
+            print("DATA ERROR - --trade needs exactly ONE enabled account "
+                  "(USE_DEMO / USE_REAL). Refusing to trade.", flush=True)
+            return 2
+        atag = "REAL" if accounts[0].live else "DEMO"
+        tradecfg = read_trade_cfg(args.config_dir)
+        magic = args.magic if args.magic is not None else tradecfg["magic"]
+        dry = tradecfg["dry_run_default"] if args.dry_run is None else args.dry_run
+        args.magic = magic  # records sync + weekly halt must see the same magic
+        tcfg = {
+            "magic": magic, "dry": dry, "journal": args.journal,
+            "mem_path": Path(args.memory_dir) / f"live_{atag.lower()}.json",
+            "ranges": tradecfg["ranges"], "base_costs": tradecfg["costs"],
+            "base": {
+                "max_total_positions": tradecfg["max_total_positions"],
+                "max_ccy_net": tradecfg["max_ccy_net"],
+                "max_trades_per_day": tradecfg["max_trades_per_day"],
+                "max_cost_ratio": tradecfg["max_cost_ratio"],
+                "scope_low": tradecfg["scope_low"],
+                "scope_high": tradecfg["scope_high"],
+            },
+        }
+        banner = (f"TRADER: ON ({'DRY-RUN - plans only, nothing sent' if dry
+                  else f'REAL ORDERS on {atag}'}) magic={magic} "
+                  f"caps: total={tcfg['base']['max_total_positions'] or 'off'} "
+                  f"ccy-net={tcfg['base']['max_ccy_net'] or 'off'} "
+                  f"day={tcfg['base']['max_trades_per_day'] or 'off'}")
+
     from quant import records as rec
 
     try:
         if args.once:
             rows, times, weeks = _cycle(mt5, accounts, pairs, args,
-                                        rec.load_conditions(args.journal), loss_pct)
+                                        rec.load_conditions(args.journal), loss_pct,
+                                        tcfg)
             broker = _utc(max(times.values())) if times else "-"
             print(render_panel(rows, local_now(), broker, tag, _mode(pairs),
-                               weeks, loss_pct), flush=True)
+                               weeks, loss_pct, banner), flush=True)
+            if banner:
+                print(banner, flush=True)
             return 0
         last: dict | None = None
         first = True
         while True:
             rows, times, weeks = _cycle(mt5, accounts, pairs, args,
-                                          rec.load_conditions(args.journal), loss_pct)
+                                          rec.load_conditions(args.journal), loss_pct,
+                                          tcfg)
             if rows and should_rewrite(first, last, times):
                 _clear()
                 broker = _utc(max(times.values())) if times else "-"
                 print(render_panel(rows, local_now(), broker, tag, _mode(pairs),
-                                   weeks, loss_pct), flush=True)
+                                   weeks, loss_pct, banner), flush=True)
                 last = dict(times)
                 first = False
             time.sleep(args.interval)

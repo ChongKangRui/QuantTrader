@@ -1,4 +1,107 @@
-# Dev Log
+# Dev Log (newest first)
+
+## TODO (living checklist — strike the line when done; finished work goes into the dated log below)
+
+
+- [ ] Monday spreadcheck re-sample (peak + off-peak), then recalibrate the 3 JPY-pair yamls (USDJPY/EURJPY/GBPJPY swaps were ~1.5x wrong under the old /100 math).
+- [ ] Portfolio pass runs: pre-declare pass lines in `docs/TESTLOG.md` FIRST (max_total_positions 4 / max_ccy_net 2 / weekly halt 15%), then rerun the batch as a new declared change-set (only on user instruction).
+- [x] Build the live trading loop: `quant.monitor --trade` supervisor (new-H1 wake, magic-filtered adoption, per-pair open check before every send, caps/portfolio/weekly/no-trade gates, trail management, restart idempotency via bar-stamp memory). Demo only, dry-run default; `start-trader.bat`. Validation staircase on the terminal next.
+- [ ] Go-live demo smoke: 0.01 lots EURUSD + one JPY pair → all 10; compare fills vs backtest. Rotate the demo password (it appeared in chat).
+- [ ] Strategy-core redesign (open track): ladder shows nothing beats R0 and R2 verdict FAIL — design the next change-set with pass lines pre-declared in `docs/TESTLOG.md`.
+
+### Verdict track (timebox: 2-3 more experiments, then decide)
+
+- [ ] Zero-cost backtest: `run-backtest.bat --spread-points 0 --slippage-pips 0 --flat-swaps` — gross expectancy; expect ≈ 0.
+- [ ] Random-entry null (spec §11.5): random entries in the bias direction, same exits and sizing; ≈ -0.05R would mean the entry rules add nothing.
+- [ ] Variance-ratio / Hurst test per pair (spec §11.3): do these pairs trend at all on 1-5 day horizons? Never done.
+- [ ] Write the two scripts above (random null + variance ratio) — waiting on user's "go ahead".
+- [ ] Decide from the results:
+  - gross ≈ 0 AND variance ratio ≈ 1 → no trend to harvest on these 10 pairs at H1/H4 in 2015-2025 → change market, timeframe or edge type — or stop.
+  - gross > 0 but costs kill it → structural (spread is a big share of 15-20 pip stops) → wider stops via a longer timeframe, or a cent account.
+- Standing rule: each hypothesis → `docs/TESTLOG.md` BEFORE running, one change per run; keep the last ~3 years unseen for any new idea. Stopping is a valid result — the pipeline caught it before real money; the tooling/engine/ledger/report are reusable for the next idea; keep it demo-only.
+
+## 2026-10-18
+
+- **yaml comments travel into params.json.** `_base.yaml` now has one short
+  comment per knob (gate codes explained: HR1/HR2/HR3/HR4, EXT, E1-setup,
+  E1-trigger, B1 — codes kept, meaning inline). One-line dicts were expanded
+  to block style so each key holds its own comment; VALUES unchanged
+  (asserted). `backtest.py` gains `yaml_notes()` — parses the inline comments
+  and writes `params["notes"] = {"_source": ..., key: comment, ...}` into
+  every new run's `params.json`, so run folders stay readable without the
+  yaml open (ledger's empty `notes` CSV column is unrelated and untouched).
+  Tests 168 → 169. Old run folders keep their original params.json.
+
+- **live trading loop built (backtest==live shared math).**
+  - `quant/rules.py`: the engine's entry math extracted to one source —
+    `step_risk` (1R at 0.01 lot), `risk_usd`, `cost_ok` gate, `scope_lots`
+    (scope band + fixed-lot + legacy target), `target_dist`, `activated`,
+    `combine_stop` (BE + T1 trail overlays). `backtest.py` now calls these —
+    funnel behavior unchanged (all prior tests pass untouched).
+  - `quant/trader.py`: mechanics + orchestrators. `trade_on_bar` = full bar
+    decision (pair-open, weekly halt, daily portfolio cap + structural
+    1/pair/day, no-trade windows, `positions_breach` total/ccy caps, E1 gate
+    on fresh closed bars, then cost/sizing via the shared rules). Bar stamped
+    in the memory file only when the outcome is final (failed sends are
+    retried next cycle); stamps ARE the restart double-send guard.
+    `_send_or_plan` sends market orders with broker-side SL/TP; dry-run writes
+    plan rows only. `sync_book`/`adopt_ctx` rebuild position context from
+    broker IN-deal history + journal rows (position id captured on sends,
+    initial SL/1R restored from the journal; orphan positions adopted with
+    one loud row). `manage_book` trails via `TRADE_ACTION_SLTP` each cycle
+    (~60s) using the monotonic best bid, one sub-tick-nudge minimum.
+  - `monitor.py`: `--trade` turns the read-only panel into the supervisor
+    (banner on the panel: TRADER ON, dry-run vs real, caps values). `--trade`
+    refuses to run when demo AND real are enabled together; dry-run default
+    comes from `live.dry_run_default`; magic from `live.magic` (CLI override).
+    All knobs read the SAME `_base.yaml` keys the engine reads
+    (`read_trade_cfg`). Journal gained `position` + `risk_usd` columns
+    (legacy header auto-widens in place, data preserved).
+  - `start-trader.bat` = the trading switch (dry-run default); `start-panel.bat`
+    stays strictly read-only. Closing the trader window = no trading.
+  - Tests 131 → 168 (`test_rules`, `test_trader` on a purpose-built fake; no
+    terminal needed). NOT run against a live terminal — validation staircase
+    (dry-run evening → 0.01-lot demo trade → kill/restart with open position →
+    demo days) is the user's.
+  - Tripped-up during build, caught by tests: guard sequencing bug (caps
+    branch shadowed the E1 gate when `max_trades_per_day` > 0) and a falsy-0
+    bug where `DEAL_ENTRY_IN` (=0) made our own IN deals invisible. Both fixed;
+    worth remembering: never `getattr(x, -1) or -1` on a 0-valued field.
+
+- **bias EMAs became config, naming split by chart family.**
+  `_base.yaml` now has TWO key families: `h4_ema_fast/h4_ema_slow/h4_atr_n`
+  (BIAS watchman; were hardcoded 20/50/14 in `bias.py`+`backtest.py`) and
+  `h1_ema_fast/h1_ema_slow` (ENTRY; renamed from `ema_fast/ema_slow`). Old
+  `ema_fast` names still accepted by the report for pre-rename run folders.
+  `h4_bias()` takes period args defaulting to locked constants; `Bias` fields
+  renamed (ema20/ema50/atr14 → ema_fast/ema_slow/atr_n). Report chart legends
+  now show periods read from each run's `params.json` (`"emaH1"/"emaH4"`
+  blocks, `efast/eslow` window keys) — the chart displays what the engine used.
+  Values preserved from the user's own edits: warmup_bars 100, use_hr2 true,
+  trail_r 1.5 (any R-run with these is a NEW declared change-set vs R2 pass
+  lines). Tests 125 → 128 passed.
+- **run ledger.** `backtest_results/_ledger.csv`: one row per run
+  (summary.csv TOTAL + params.json + trades swap sum). Appended automatically
+  after every backtest; `uv run python -m quant.ledger --rebuild` rebuilds all
+  folders. Off gates = blank cells. Current ledger: 6 runs incl. 5 previously
+  unledgered 10-18 runs (no_trail, trail_1R/1.5R, +2); all verdict FAIL. Note:
+  R2 params.json records lookback 12 — TESTLOG said 5; ledger reads
+  params.json as source of truth. Tests 128 → 131. (`workers` column removed
+  in a later same-day sweep; CSV schema is now 50 columns.)
+- **review fixes (panel bias, records watermark, swap mode, portfolio pass).**
+  `monitor.py` now passes `h4_ema_fast/h4_ema_slow/h4_atr_n` to `h4_bias` — the
+  panel follows config (was locked 20/50 while yaml said 20/100). `records.py`
+  groups the FULL deal history per position_id and keeps whole groups whose OUT
+  is above the watermark (entry data of early-opened positions no longer lost;
+  commission sums IN+OUT deals). `spreadcheck.py` reads `swap_mode` (verified
+  Pepperstone-Demo = POINTS): converts via the point value of a 0.01 lot and the
+  broker's own quote for non-USD profit currencies — the plain /100 was wrong for
+  JPY pairs (~1.5x) by luck right for EURUSD/XAUUSD. BACKTEST ENGINE now runs a
+  portfolio pass after the daily cap: max_total_positions (4), max_ccy_net (2),
+  weekly loss halt (limits.weekly_loss_pct) — new knobs live in `_base.yaml`,
+  CLI-overridable, 0 = rule off; any run with the pass ON is a NEW declared
+  change-set vs R2. Dead yaml keys removed (regime_rule, risk_pct,
+  max_positions_per_pair, triple_swap_days, contract_size). Tests 131 → 142.
 
 ## 2026-10-17 — v0.9.4: honest costs, scope sizing, R1b probe, MTM drawdown
 
@@ -62,25 +165,6 @@
 - `_base.yaml` strategy block reorganized: every knob now sits directly under
   its owning gate and is tagged `[use_x]` (dead while false), always-live knobs
   marked `(always live)`; values untouched (parsed dict identical, 31 keys).
-- **2026-10-18 — bias EMAs became config, naming split by chart family.**
-  `_base.yaml` now has TWO key families: `h4_ema_fast/h4_ema_slow/h4_atr_n`
-  (BIAS watchman; were hardcoded 20/50/14 in `bias.py`+`backtest.py`) and
-  `h1_ema_fast/h1_ema_slow` (ENTRY; renamed from `ema_fast/ema_slow`). Old
-  `ema_fast` names still accepted by the report for pre-rename run folders.
-  `h4_bias()` takes period args defaulting to locked constants; `Bias` fields
-  renamed (ema20/ema50/atr14 → ema_fast/ema_slow/atr_n). Report chart legends
-  now show periods read from each run's `params.json` (`"emaH1"/"emaH4"`
-  blocks, `efast/eslow` window keys) — the chart displays what the engine used.
-  Values preserved from the user's own edits: warmup_bars 100, use_hr2 true,
-  trail_r 1.5 (any R-run with these is a NEW declared change-set vs R2 pass
-  lines). Tests 125 → 128 passed.
-- **2026-10-18 — run ledger.** `backtest_results/_ledger.csv`: one row per run
-  (summary.csv TOTAL + params.json + trades swap sum). Appended automatically
-  after every backtest; `uv run python -m quant.ledger --rebuild` rebuilds all
-  folders. Off gates = blank cells. Current ledger: 6 runs incl. 5 previously
-  unledgered 10-18 runs (no_trail, trail_1R/1.5R, +2); all verdict FAIL. Note:
-  R2 params.json records lookback 12 — TESTLOG said 5; ledger reads
-  params.json as source of truth. Tests 128 → 131.
 
 ## 2026-10-17 — v0.9.3: DD baseline fix, named funnel gates, visible cost gate, spreadcheck
 
@@ -169,19 +253,41 @@
 - Next: user builds M1 CSVs for the 10 pairs, then reruns the batch. Results will move
   vs run `20261017_100407` (both M1 resolution and holiday windows change exits/entries).
 
-## 2026-10-15 — Bootstrap + MT5 handshake
+## 2026-10-17 — Multi-pair intake (CSVs + zips)
 
-- Created repo layout: `python/quant/`, `configs/` (10 pairs + `_base.yaml`), `data/` (gitignored), `tests/fixtures/`.
-- Locked cost model: spread 20 points, swap −0.08/0.01 lot/night both sides, triple Wed + weekend.
-- Python 3.12 pinned (MT5 wheel has no 3.14 build); deps installed: `MetaTrader5 5.0.6231`, pandas, pyyaml, dotenv, pytest.
-- `USE_DEMO`/`USE_REAL` independent flags in `config.py`; `smoke.py` checks every enabled account, sends no orders.
-- Smoke OK on Pepperstone-Demo (margin_mode=2 hedging, symbols need no suffix).
-- Wrote `docs/STRATEGY.md` (this session).
+- All 10 present pairs have full 2015-2025 file coverage, zero missing years (2023 thin everywhere, vendor-wide). CSV: AUDUSD/EURUSD/GBPUSD/USDCAD/USDCHF/USDJPY. ZIP (HistData, same minute format inside): AUDJPY/EURJPY/GBPJPY/NZDUSD. EURGBP/AUDNZD have no data and no sizing path — stay off.
+- `quant/mkdata` reads zip members directly; H1 built for all 9 (~67.6k bars each).
+- JPY crosses (AUDJPY/EURJPY/GBPJPY) convert tick values through the USDJPY feed, auto-loaded by the batch (SKIP with notice when absent). True crosses (EURGBP/AUDNZD) still unsupported.
 
-## 2026-10-15 — Spec v0.3 risk lock
+## 2026-10-17 — v0.8: no time cap, one profit-trail rule, config reorg
 
-- Locked risk rules in STRATEGY.md section 8: USD 3/trade, 1 open/pair, 1 entry/pair/day (server date), 5 open max.
-- Parked body-EMA agreement to section 15 (not an active rule).
+- `_base.yaml` strategy split into BIAS / ENTRY / RISK MANAGEMENT; `flatten_strategy` (monitor.py) reads nested and flat layouts. New toggles `use_trail`, `use_be`; `bias_flip_exit` / `weekend_flat` now live in config (CLI flags still force them on).
+- T1: initial stop holds until best profit >= `trail_r`, then stop = best-since-entry - `trail_r` x risk. BE is optional (`use_be`, off; redundant while `be_trigger_r == trail_r`). Peak now counts from entry (was: from the BE trigger bar).
+- 120-bar time stop removed. Trades still open at the end of the data are not recorded (not new, but with no time stop it can touch more trades).
+- Shorts now pay the fixed spread on exit (they paid none before). Short stop/target triggers still use bid highs/lows.
+- `limits.max_trades_per_day: 5` (0 = off): portfolio post-filter, dropped entries listed in `params.json`.
+- Tests: 96 passed. Baseline numbers from run `20261017_100407` are not comparable to the next run.
+
+## 2026-10-17 — Parallel backtest batch
+
+- `--jobs N` (default 10, capped at pair count; 1 = linear; 0 = all cores). One process per pair via `ProcessPoolExecutor`; workers pin BLAS/OpenMP to 1 thread. A failing pair is recorded (`failed` in `params.json`, `FAILED:` line) and does not lose the others. Output files are written in input order, so they do not depend on finish order.
+- Acceptance still open: run `--jobs 1` and `--jobs 10` and diff the two result folders (must match). Check peak memory on the first parallel run.
+- `run-backtest.bat` passes args through (`run-backtest.bat --jobs 4`).
+
+## 2026-10-17 — Profit-based trail (T1 revised)
+
+- `trail_atr` (ATR chandelier) replaced by `trail_r` (default 1.0): after the +1R BE trigger, the stop trails the best price by `trail_r` x initial risk. ATR no longer used in exits. Spec §7 updated.
+- Baseline to compare against: run `20261017_002605` (ATR trail, 296 trades, -0.167R, PF 0.70, 4 target exits).
+
+## 2026-10-17 — EURGBP data + general converter feeds
+
+- `data/EURGBP/` zips were present after all; H1 built (~67.6k bars).
+- Sizing now converts any quote currency through auto-loaded feeds (JPY via USDJPY, GBP via GBPUSD, AUD/NZD/CAD/CHF likewise); pairs without a path still SKIP with notice. EURGBP enabled in scan (AUDNZD: no data, stays off).
+
+## 2026-10-17 — Scan list fixed to 10, NZDUSD parked
+
+- `scan-selection.yml` now lists exactly the candidate 10 (AUDJPY in, EURGBP off without data). `NZDUSD.yaml` renamed to `NZDUSD_untrade.yml`; the loader skips `*_untrade` stems. `EURGBP.yaml` created (symbol + pip_size, off).
+- Correction same day: AUDJPY out, NZDUSD in (`AUDJPY_untrade.yml` parked, `NZDUSD.yaml` restored). Final 10: EURUSD GBPUSD USDJPY USDCHF AUDUSD USDCAD EURJPY GBPJPY EURGBP NZDUSD.
 
 ## 2026-10-16 — Bias panel + trade record
 
@@ -233,48 +339,16 @@
 - Backtest defaults to fixed `--lot 0.01` (`--lot 0` restores USD3 sizing); cap-distance skip and cost filter stay, R divides by actual risk.
 - `docs/PIP_VALUES.md` records the broker pip table (1 pip = 10 points; USD-measured; crosses need a second feed). Engine math asserted against it in tests.
 
-## 2026-10-17 — Multi-pair intake (CSVs + zips)
+## 2026-10-15 — Bootstrap + MT5 handshake
 
-- All 10 present pairs have full 2015-2025 file coverage, zero missing years (2023 thin everywhere, vendor-wide). CSV: AUDUSD/EURUSD/GBPUSD/USDCAD/USDCHF/USDJPY. ZIP (HistData, same minute format inside): AUDJPY/EURJPY/GBPJPY/NZDUSD. EURGBP/AUDNZD have no data and no sizing path — stay off.
-- `quant/mkdata` reads zip members directly; H1 built for all 9 (~67.6k bars each).
-- JPY crosses (AUDJPY/EURJPY/GBPJPY) convert tick values through the USDJPY feed, auto-loaded by the batch (SKIP with notice when absent). True crosses (EURGBP/AUDNZD) still unsupported.
+- Created repo layout: `python/quant/`, `configs/` (10 pairs + `_base.yaml`), `data/` (gitignored), `tests/fixtures/`.
+- Locked cost model: spread 20 points, swap −0.08/0.01 lot/night both sides, triple Wed + weekend.
+- Python 3.12 pinned (MT5 wheel has no 3.14 build); deps installed: `MetaTrader5 5.0.6231`, pandas, pyyaml, dotenv, pytest.
+- `USE_DEMO`/`USE_REAL` independent flags in `config.py`; `smoke.py` checks every enabled account, sends no orders.
+- Smoke OK on Pepperstone-Demo (margin_mode=2 hedging, symbols need no suffix).
+- Wrote `docs/STRATEGY.md` (this session).
 
-## 2026-10-17 — v0.8: no time cap, one profit-trail rule, config reorg
+## 2026-10-15 — Spec v0.3 risk lock
 
-- `_base.yaml` strategy split into BIAS / ENTRY / RISK MANAGEMENT; `flatten_strategy` (monitor.py) reads nested and flat layouts. New toggles `use_trail`, `use_be`; `bias_flip_exit` / `weekend_flat` now live in config (CLI flags still force them on).
-- T1: initial stop holds until best profit >= `trail_r`, then stop = best-since-entry - `trail_r` x risk. BE is optional (`use_be`, off; redundant while `be_trigger_r == trail_r`). Peak now counts from entry (was: from the BE trigger bar).
-- 120-bar time stop removed. Trades still open at the end of the data are not recorded (not new, but with no time stop it can touch more trades).
-- Shorts now pay the fixed spread on exit (they paid none before). Short stop/target triggers still use bid highs/lows.
-- `limits.max_trades_per_day: 5` (0 = off): portfolio post-filter, dropped entries listed in `params.json`.
-- Tests: 96 passed. Baseline numbers from run `20261017_100407` are not comparable to the next run.
-
-## 2026-10-17 — Parallel backtest batch
-
-- `--jobs N` (default 10, capped at pair count; 1 = linear; 0 = all cores). One process per pair via `ProcessPoolExecutor`; workers pin BLAS/OpenMP to 1 thread. A failing pair is recorded (`failed` in `params.json`, `FAILED:` line) and does not lose the others. Output files are written in input order, so they do not depend on finish order.
-- Acceptance still open: run `--jobs 1` and `--jobs 10` and diff the two result folders (must match). Check peak memory on the first parallel run.
-- `run-backtest.bat` passes args through (`run-backtest.bat --jobs 4`).
-
-## 2026-10-17 — Profit-based trail (T1 revised)
-
-- `trail_atr` (ATR chandelier) replaced by `trail_r` (default 1.0): after the +1R BE trigger, the stop trails the best price by `trail_r` x initial risk. ATR no longer used in exits. Spec §7 updated.
-- Baseline to compare against: run `20261017_002605` (ATR trail, 296 trades, -0.167R, PF 0.70, 4 target exits).
-
-## 2026-10-17 — EURGBP data + general converter feeds
-
-- `data/EURGBP/` zips were present after all; H1 built (~67.6k bars).
-- Sizing now converts any quote currency through auto-loaded feeds (JPY via USDJPY, GBP via GBPUSD, AUD/NZD/CAD/CHF likewise); pairs without a path still SKIP with notice. EURGBP enabled in scan (AUDNZD: no data, stays off).
-
-## 2026-10-17 — Scan list fixed to 10, NZDUSD parked
-
-- `scan-selection.yml` now lists exactly the candidate 10 (AUDJPY in, EURGBP off without data). `NZDUSD.yaml` renamed to `NZDUSD_untrade.yml`; the loader skips `*_untrade` stems. `EURGBP.yaml` created (symbol + pip_size, off).
-- Correction same day: AUDJPY out, NZDUSD in (`AUDJPY_untrade.yml` parked, `NZDUSD.yaml` restored). Final 10: EURUSD GBPUSD USDJPY USDCHF AUDUSD USDCAD EURJPY GBPJPY EURGBP NZDUSD.
-
-## Next
-
-1. Define regime + entry rule (close `TODO_define` in STRATEGY.md and `_base.yaml`).
-2. Build `quant.backtest` CLI (closed-bar execution, cost overrides, metrics report).
-3. Export broker-aligned H1+H4 history CSVs into `data/`.
-4. Backtest all 10 pairs, calibrate stops/sizing per pair.
-5. Build `quant.live` loop (new-H1-bar wake, `order_check`, magic + idempotency, `--dry-run` default).
-6. Demo 0.01 lots: EURUSD + one JPY pair, then all 10. Compare fills vs backtest.
-7. Rotate demo password (appeared in chat).
+- Locked risk rules in STRATEGY.md section 8: USD 3/trade, 1 open/pair, 1 entry/pair/day (server date), 5 open max.
+- Parked body-EMA agreement to section 15 (not an active rule).

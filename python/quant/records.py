@@ -101,8 +101,9 @@ def position_row(position_id, deals, entry_condition: str, account: str) -> dict
         "entry_price": entry_price,
         "close_price": round(_vwap(outs), 5),
         "profit": round(sum(float(getattr(d, "profit", 0) or 0) for d in outs), 2),
-        "commission": round(sum(float(getattr(d, "commission", 0) or 0) for d in outs), 2),
-        "swap": round(sum(float(getattr(d, "swap", 0) or 0) for d in outs), 2),
+        # commission is billed on IN and OUT deals alike, so sum the whole group
+        "commission": round(sum(float(getattr(d, "commission", 0) or 0) for d in deals), 2),
+        "swap": round(sum(float(getattr(d, "swap", 0) or 0) for d in deals), 2),
         "magic": getattr(outs[0], "magic", ""),
         "ticket": out_ticket,
         "entry_condition": entry_condition,
@@ -113,25 +114,33 @@ def position_row(position_id, deals, entry_condition: str, account: str) -> dict
 def sync_closed_positions(mt5, path: str | Path, magic: int, conditions: dict[str, str],
                           account: str, lookback_days: int = LOOKBACK_DAYS,
                           deals=None) -> int:
-    """Append newly closed positions of our magic. Returns rows appended."""
+    """Append newly closed positions of our magic. Returns rows appended.
+
+    Grouping uses the FULL history, not the watermark-filtered deals: a position
+    opened before the last watermark still belongs to the group its OUT deal
+    closes now (its entry deal would otherwise be lost below the watermark).
+    A position is fresh iff its OUT ticket is above the watermark.
+    """
     path = Path(path)
     seen = read_watermark(path)
     if deals is None:
         now = datetime.now(timezone.utc)
         deals = mt5.history_deals_get(now - timedelta(days=lookback_days), now) or ()
-    fresh = [d for d in deals
-             if getattr(d, "magic", None) == magic and int(getattr(d, "ticket", 0) or 0) > seen]
     groups: dict = {}
-    for d in fresh:
+    for d in deals:  # full history, then per-position groups
+        if getattr(d, "magic", None) != magic:
+            continue
         groups.setdefault(getattr(d, "position_id", 0), []).append(d)
     rows = []
     for pid, ds in groups.items():
         outs = [d for d in ds if getattr(d, "entry", -1) == ENTRY_OUT]
         if not outs:
             continue
+        out_ticket = max(int(getattr(d, "ticket", 0) or 0) for d in outs)
+        if out_ticket <= seen:  # closed before the last sync: already recorded
+            continue
         in_ticket = min((int(getattr(d, "ticket", 0) or 0) for d in ds
                          if getattr(d, "entry", -1) == ENTRY_IN), default=0)
-        out_ticket = max(int(getattr(d, "ticket", 0) or 0) for d in outs)
         cond = conditions.get(str(in_ticket)) or conditions.get(str(out_ticket)) or ""
         row = position_row(pid, ds, cond, account)
         if row is not None:

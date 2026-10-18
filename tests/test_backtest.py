@@ -2,8 +2,34 @@
 import pandas as pd
 
 from quant.backtest import (bias_frames, build_h4, grade_benchmarks, map_bias,
-                            metrics, scan_pair, simulate, total_row)
+                            metrics, portfolio_filter, scan_pair, simulate,
+                            total_row, yaml_notes)
 from quant.bias import h4_bias
+
+
+def test_yaml_notes_decls_inline_comments(tmp_path):
+    yml = tmp_path / "_base.yaml"
+    yml.write_text(
+        "# full header lines and gate tables must be ignored\n"
+        "   # (indented comment too)\n"
+        "costs:\n"
+        "  spread_points: 20               # spread assumption for the BACKTEST\n"
+        "  miss: 1\n"                       # no comment -> not in notes
+        "strategy:\n"
+        "  use_hr2: true       # HR2 ON/OFF (candle color + body quality)\n"
+        "  min_body_ratio: 0.5   # HR2: body as share of range\n"
+        "limits:\n"
+        "  max_cost_ratio: 0.10   # share of stop (0 = off)\n",
+        encoding="utf-8")
+    notes = yaml_notes(yml)
+    assert notes["spread_points"] == "spread assumption for the BACKTEST"
+    assert notes["use_hr2"] == "HR2 ON/OFF (candle color + body quality)"
+    assert notes["min_body_ratio"] == "HR2: body as share of range"
+    assert notes["max_cost_ratio"] == "share of stop (0 = off)"
+    assert "miss" not in notes and "costs" not in notes
+    assert "use_x" not in notes  # comment-only lines never become keys
+    # missing file: empty, no crash
+    assert yaml_notes(tmp_path / "none.yaml") == {}
 
 
 def _h1(closes, t0="2020-01-06 00:00", body=0.0004):
@@ -21,6 +47,59 @@ def _costs(**kw):
             "swap_short_per_0_01": 0.0, "commission_per_lot": 0.0}
     base.update(kw)
     return base
+
+
+def _pt(sym: str, entry: str, exit_: str, direction: str = "LONG",
+        pnl: float = 1.0) -> pd.DataFrame:
+    return pd.DataFrame([{"symbol": sym, "direction": direction, "entry_time": entry,
+                          "exit_time": exit_, "pnl_usd": pnl, "pnl_R": pnl}])
+
+
+def test_portfolio_filter_open_cap_drops_fifth():
+    trades = {"EURUSD": _pt("EURUSD", "2026-01-05 10:00", "2026-01-05 20:00"),
+              "AUDUSD": _pt("AUDUSD", "2026-01-05 10:30", "2026-01-05 20:30"),
+              "GBPUSD": _pt("GBPUSD", "2026-01-05 11:00", "2026-01-05 21:00"),
+              "NZDUSD": _pt("NZDUSD", "2026-01-05 11:30", "2026-01-05 21:30"),
+              "USDCAD": _pt("USDCAD", "2026-01-05 12:00", "2026-01-05 22:00")}
+    kept, dropped = portfolio_filter(trades, 4, 0, 0.0, 100.0)
+    assert [len(kept[s]) for s in trades] == [1, 1, 1, 1, 0]
+    assert dropped == [{"symbol": "USDCAD", "entry_time": "2026-01-05 12:00",
+                        "reason": "open_max"}]
+
+
+def test_portfolio_filter_ccy_cap_blocks_one_sided_stack():
+    trades = {"EURUSD": _pt("EURUSD", "2026-01-05 10:00", "2026-01-05 22:00", "LONG"),
+              "AUDUSD": _pt("AUDUSD", "2026-01-05 10:30", "2026-01-05 22:30", "LONG"),
+              "NZDUSD": _pt("NZDUSD", "2026-01-05 11:00", "2026-01-05 23:00", "LONG")}
+    kept, dropped = portfolio_filter(trades, 0, 2, 0.0, 100.0)
+    # two longs already make the USD side -2; the third long breaches max_ccy_net
+    assert [len(kept[s]) for s in trades] == [1, 1, 0]
+    assert dropped == [{"symbol": "NZDUSD", "entry_time": "2026-01-05 11:00",
+                        "reason": "ccy"}]
+
+
+def test_portfolio_filter_weekly_halt_frees_next_week():
+    trades = {"EURUSD": _pt("EURUSD", "2026-01-05 10:00", "2026-01-05 20:00", "LONG", -20.0),
+              "AUDUSD": _pt("AUDUSD", "2026-01-07 10:00", "2026-01-07 20:00", "LONG", 1.0),
+              "GBPUSD": _pt("GBPUSD", "2026-01-12 10:00", "2026-01-12 20:00", "LONG", 1.0)}
+    kept, dropped = portfolio_filter(trades, 0, 0, 15.0, 100.0)
+    # -20 closed same Monday = 20% of the 100 USD start -> halted; next Monday reset
+    assert [len(kept[s]) for s in trades] == [1, 0, 1]
+    assert dropped == [{"symbol": "AUDUSD", "entry_time": "2026-01-07 10:00",
+                        "reason": "weekly_halt"}]
+
+
+def test_portfolio_filter_exit_frees_the_slot_at_same_timestamp():
+    trades = {"EURUSD": _pt("EURUSD", "2026-01-05 10:00", "2026-01-05 12:00"),
+              "AUDUSD": _pt("AUDUSD", "2026-01-05 12:00", "2026-01-05 14:00")}
+    kept, dropped = portfolio_filter(trades, 1, 0, 0.0, 100.0)
+    assert dropped == [] and sum(len(k) for k in kept.values()) == 2
+
+
+def test_portfolio_filter_all_zero_is_a_noop():
+    trades = {"EURUSD": _pt("EURUSD", "2026-01-05 10:00", "2026-01-05 20:00")}
+    kept, dropped = portfolio_filter(trades, 0, 0, 0.0, 100.0)
+    assert len(kept["EURUSD"]) == 1 and dropped == []
 
 
 def test_build_h4_utc_blocks():
