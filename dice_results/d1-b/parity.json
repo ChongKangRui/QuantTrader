@@ -1,0 +1,31 @@
+{
+ "pass": true,
+ "diffs": [],
+ "total": {
+  "trades": 2064,
+  "net_usd": -54.84,
+  "swap_usd": -97.24,
+  "net_R": -26.12,
+  "expect_R": -0.013,
+  "win_rate": 0.255,
+  "profit_factor": 0.989,
+  "max_dd": 244.02
+ },
+ "reference": {
+  "trades": 2064,
+  "net_usd": -54.84,
+  "expect_R": -0.013
+ },
+ "targets": {
+  "AUDUSD": 771,
+  "EURGBP": 784,
+  "EURJPY": 658,
+  "EURUSD": 686,
+  "GBPJPY": 548,
+  "GBPUSD": 666,
+  "NZDUSD": 784,
+  "USDCAD": 809,
+  "USDCHF": 751,
+  "USDJPY": 741
+ }
+}

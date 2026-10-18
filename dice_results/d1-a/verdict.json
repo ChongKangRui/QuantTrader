@@ -1,0 +1,11 @@
+{
+ "d1": {
+  "real_expect_R": -0.013,
+  "dice_p95": -0.0088,
+  "percentile_of_real": 92.0,
+  "n_seeds": 300,
+  "confirmed": false
+ },
+ "money_bar_0_10R": false,
+ "rule": "D1-B CONFIRMED iff real pooled expect_R > dice P0.95"
+}

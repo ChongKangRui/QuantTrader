@@ -9,12 +9,12 @@
 
 ### Verdict track (timebox: 2-3 more experiments, then decide)
 
-- [ ] Pre-declare pass lines in `docs/TESTLOG.md` BEFORE running anything below:
+- [x] Pre-declare pass lines in `docs/TESTLOG.md` BEFORE running anything below — random-entry null pre-declared 2026-10-18 (D1 section in TESTLOG: CONFIRMED iff real pooled expectancy > dice P95; variant A info-only; §12 bar separate).
   - Random-entry null: entry rules "add value" only if the real result is above the 95th percentile of the random results, on pooled expectancy R.
   - Variance ratio: "trends" only if VR > 1 beyond 2 SE at 1-5 day horizons on most pairs.
-- [ ] Write the random-entry null script (waiting on user's "go ahead"). Same bias, stops, TP, sizing, costs, caps. Only the entry bar is random. Seeded, 200+ repetitions.
+- [x] Write the random-entry null script (done 2026-10-18: `quant/dice_probe.py`, variants A + B, 300 seeds, pre-run parity gate). Same bias, stops, TP, sizing, costs, caps. Only the entry bar is random. Seeded.
 - [ ] Write the variance-ratio / Hurst script (spec §11.3). Never done.
-- [ ] Run both. Record results in `docs/TESTLOG.md` (user runs them).
+- [ ] Run both. Record results in `docs/TESTLOG.md` (user runs them). — random-entry null RUN done 2026-10-18 (D1-A + D1-B in TESTLOG); variance-ratio still to run.
 - [ ] Decide from the results:
   - real result inside the random cloud AND variance ratio ≈ 1 → no edge from these entry rules / no trend to harvest on these pairs at H1/H4 → change market, timeframe or edge type — or stop.
   - real result clearly above the cloud, or gross > 0 but costs kill it → structural (spread/swap is a big share of 15-20 pip stops) → wider stops via a longer timeframe, or a cent account.
@@ -35,6 +35,23 @@
 
 
 ## 2026-10-18
+
+- **D1 dice probe (random-entry null) — verdict: WITHIN DICE NOISE.** New module
+  `quant/dice_probe.py` + tests. Parity gate passed exactly against reference
+  `20261018_173936` (2064 trades / −54.84 / −0.013R) before any dice. 300 seeds
+  per variant, base 42; B's run split across 3 fragments, merged deterministically
+  (overlapping seeds byte-identical). Verdict metric as pre-declared: pooled
+  post-cap+portfolio-pass mean R per trade.
+  - D1-B (random bias-ON bar + H4-bias direction): real −0.013R = **P90.3**;
+    dice mean −0.045R, P95 −0.0079R — bar missed by ~0.005R; 6/300 dice seeds positive.
+  - D1-A (random bar + random direction, placebo): real = **P92.0**; dice mean −0.0513R.
+  - A ≈ B (Δ mean 0.006R) → the H4 bias direction adds almost nothing on top of
+    entry timing — consistent with R1b, now confirmed through the full trade
+    machinery (same exits, costs, caps, filter order).
+  - The rules lose ~3x less per trade than dice (−0.013R vs −0.045/−0.051R) but
+    neither pre-declared P95 bar is cleared; §12 money bar (≥ +0.10R) NOT MET.
+  - Per the decision tree: real inside the random cloud → next check is the
+    variance-ratio / Hurst script (still to run), then decide.
 
 - **yaml comments travel into params.json.** `_base.yaml` now has one short
   comment per knob (gate codes explained: HR1/HR2/HR3/HR4, EXT, E1-setup,
