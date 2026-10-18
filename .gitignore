@@ -3,6 +3,7 @@
 data/
 trades/
 memory/
+dice_results/
 backtest_results/
 __pycache__/
 .venv/
