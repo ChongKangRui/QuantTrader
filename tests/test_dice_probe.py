@@ -41,7 +41,7 @@ def _setup(**over) -> dict:
                       "tp_mult": 3.0, "use_trail": False, "use_be": False},
          "converters": {}, "risk_usd": 3.0, "max_cost_ratio": 0.10,
          "scope_low": 0.0, "scope_high": 0.0, "max_day": 0, "max_open": 0,
-         "max_ccy_net": 0, "weekly_pct": 0.0, "account_usd": 0.0,
+         "max_ccy_net": 0, "weekly_r": 0.0,
          "position_checks": "H1", "no_trade_ranges": ()}
     s.update(over)
     return s
@@ -139,8 +139,7 @@ def test_verdict_line():
 
 
 def test_apply_filters_and_pooled_stats():
-    setup = _setup(max_day=20, max_open=1, max_ccy_net=2, weekly_pct=15.0,
-                   account_usd=100.0)
+    setup = _setup(max_day=20, max_open=1, max_ccy_net=2, weekly_r=15.0)
 
     def tr(sym, entry, pnl):
         return pd.DataFrame([{"symbol": sym, "entry_time": entry,

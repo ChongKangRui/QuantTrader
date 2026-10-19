@@ -718,7 +718,7 @@ def mtm_equity(trades_by_sym: dict[str, pd.DataFrame],
 
 
 def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
-                     max_ccy_net: int, weekly_pct: float, account_usd: float = 0.0
+                     max_ccy_net: int, weekly_r: float
                      ) -> tuple[dict[str, pd.DataFrame], list[dict]]:
     """Portfolio pass over the per-pair trade lists (time-ordered, all pairs).
 
@@ -726,14 +726,17 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
       - max_open: max concurrent open trades portfolio-wide (0 = off)
       - max_ccy_net: |net currency count| per currency (long EURUSD = +EUR/-USD;
         short = mirror; keeps one-sided currency stacks thin) (0 = off)
-      - weekly_pct: once a week's CLOSED P&L is a loss of that % of week-start
-        equity, no new entries until the next Monday 00:00 UTC (0 = off)
+      - weekly_r: once a week's CLOSED R total is a loss of that many R, no new
+        entries until the next Monday 00:00 UTC (0 = off). Units are each
+        trade's own risk multiple (pnl_R in the trades frames), per STRATEGY
+        8A weekly_loss_r — R, NOT % of equity: the %-equity form flips sign
+        once closed equity hits zero (the threshold turns positive), so the
+        account state can never reach this rule.
     Deterministic: candidates by (entry_time, symbol); an exit at the same
-    timestamp is applied BEFORE entries (frees the slot). Week-start equity =
-    account_usd + all closed P&L before that Monday (closed-only, floating ignored).
+    timestamp is applied BEFORE entries (frees the slot).
     Returns (kept frames by symbol, dropped records).
     """
-    if max_open <= 0 and max_ccy_net <= 0 and weekly_pct <= 0:
+    if max_open <= 0 and max_ccy_net <= 0 and weekly_r <= 0:
         return dict(trades_by_sym), []
     cands = []
     for sym, df in trades_by_sym.items():
@@ -741,29 +744,27 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
             continue
         for idx, t in df.iterrows():
             cands.append((sym, int(idx), str(t["entry_time"]), str(t["exit_time"]),
-                          str(t.get("direction", "")), float(t["pnl_usd"])))
+                          str(t.get("direction", "")), float(t["pnl_R"])))
     # one event per trade: exits (0) sort before entries (1) at equal timestamps
     evs = []
-    for sym, idx, tin, tout, direction, pnl in cands:
-        evs.append((pd.Timestamp(tin), 1, sym, idx, direction, pnl))
-        evs.append((pd.Timestamp(tout), 0, sym, idx, direction, pnl))
+    for sym, idx, tin, tout, direction, pnl_r in cands:
+        evs.append((pd.Timestamp(tin), 1, sym, idx, direction, pnl_r))
+        evs.append((pd.Timestamp(tout), 0, sym, idx, direction, pnl_r))
     evs.sort(key=lambda e: (e[0], e[1], e[2], e[3]))
 
     active: dict = {}          # (sym, idx) -> direction
     kept: dict[str, list[int]] = {}
     dropped: list[dict] = []
     ccy: dict = {}
-    realized = 0.0
     week_key = None
-    week_realized = 0.0
-    wk_eq = float(account_usd)
+    week_r = 0.0                # CLOSED R booked this week (exits only)
     halted = False
 
     def _drop(sym, idx, tin, reason):
         dropped.append({"symbol": sym, "entry_time": tin[:16], "reason": reason})
 
-    for t, kind, sym, idx, direction, pnl in evs:
-        if kind == 0:  # exit: free the slot, book the P&L, run the halt check
+    for t, kind, sym, idx, direction, pnl_r in evs:
+        if kind == 0:  # exit: free the slot, book the R, run the halt check
             direction = active.pop((sym, idx), None)
             if direction is None:
                 continue  # was dropped at entry — it never held currency exposure
@@ -771,9 +772,8 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
             sgn = 1 if direction == "LONG" else -1
             ccy[base] = ccy.get(base, 0) - sgn
             ccy[quote] = ccy.get(quote, 0) + sgn
-            realized += pnl
-            week_realized += pnl
-            if weekly_pct > 0 and week_realized <= -weekly_pct / 100.0 * wk_eq:
+            week_r += pnl_r
+            if weekly_r > 0 and week_r <= -weekly_r:
                 halted = True
             continue
         # entry decision (exits at the same timestamp have already run)
@@ -781,8 +781,7 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
         wk = t_utc.normalize() - pd.Timedelta(days=t_utc.weekday())  # Monday 00:00 UTC
         if wk != week_key:
             week_key = wk
-            wk_eq = float(account_usd) + realized
-            week_realized = 0.0
+            week_r = 0.0
             halted = False
         hh_mm = t.strftime("%Y-%m-%d %H:%M")
         if halted:
@@ -878,8 +877,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="override risk.max_total_positions (portfolio pass; 0 = off)")
     ap.add_argument("--max-ccy-net", type=int, default=None,
                     help="override risk.max_ccy_net (currency exposure cap; 0 = off)")
-    ap.add_argument("--weekly-loss-pct", type=float, default=None,
-                    help="override limits.weekly_loss_pct (backtest weekly halt; 0 = off)")
+    ap.add_argument("--weekly-loss-r", type=float, default=None,
+                    help="override limits.weekly_loss_r (backtest weekly halt in R, "
+                         "STRATEGY 8A; 0 = off)")
     ap.add_argument("--atr-n", type=int, default=None)
     ap.add_argument("--sep-atr", type=float, default=None)
     ap.add_argument("--ma-only", action="store_true")
@@ -905,9 +905,9 @@ def main(argv: list[str] | None = None) -> int:
         args.max_total_positions = int(risk_cfg.get("max_total_positions") or 0)
     if args.max_ccy_net is None:
         args.max_ccy_net = int(risk_cfg.get("max_ccy_net") or 0)
-    if args.weekly_loss_pct is None:
-        args.weekly_loss_pct = float((base.get("limits") or {}).get(
-            "weekly_loss_pct", 0.0) or 0.0)
+    if args.weekly_loss_r is None:
+        args.weekly_loss_r = float((base.get("limits") or {}).get(
+            "weekly_loss_r", 0.0) or 0.0)
     # the cost gate lives in _base.yaml limits (visible config), CLI overrides it
     if args.max_cost_ratio is None:
         args.max_cost_ratio = float(
@@ -1049,12 +1049,11 @@ def main(argv: list[str] | None = None) -> int:
     params["portfolio"] = {
         "max_total_positions": max(args.max_total_positions, 0),
         "max_ccy_net": max(args.max_ccy_net, 0),
-        "weekly_loss_pct": max(args.weekly_loss_pct, 0.0)}
-    account_base = float(bench.get("account_usd") or 0) or 0.0
+        "weekly_loss_r": max(args.weekly_loss_r, 0.0)}
     kept_pf, pf_dropped = portfolio_filter(
         {s: r["trades"] for s, r in results.items()},
         params["portfolio"]["max_total_positions"], params["portfolio"]["max_ccy_net"],
-        params["portfolio"]["weekly_loss_pct"], account_base)
+        params["portfolio"]["weekly_loss_r"])
     changed: set[str] = set()
     if pf_dropped:
         params["portfolio"]["dropped"] = pf_dropped
@@ -1073,7 +1072,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"portfolio pass: dropped {len(pf_dropped)} entries "
               f"({', '.join(f'{k}={v}' for k, v in sorted(reasons.items()))}); "
               f"affected pairs: {', '.join(sorted(changed))}", flush=True)
-    elif params["portfolio"]["weekly_loss_pct"] or params["portfolio"]["max_ccy_net"] \
+    elif params["portfolio"]["weekly_loss_r"] or params["portfolio"]["max_ccy_net"] \
             or params["portfolio"]["max_total_positions"]:
         print("portfolio pass: no entries dropped", flush=True)
     if failures or dropped or pf_dropped:

@@ -61,7 +61,7 @@ def test_portfolio_filter_open_cap_drops_fifth():
               "GBPUSD": _pt("GBPUSD", "2026-01-05 11:00", "2026-01-05 21:00"),
               "NZDUSD": _pt("NZDUSD", "2026-01-05 11:30", "2026-01-05 21:30"),
               "USDCAD": _pt("USDCAD", "2026-01-05 12:00", "2026-01-05 22:00")}
-    kept, dropped = portfolio_filter(trades, 4, 0, 0.0, 100.0)
+    kept, dropped = portfolio_filter(trades, 4, 0, 0.0)
     assert [len(kept[s]) for s in trades] == [1, 1, 1, 1, 0]
     assert dropped == [{"symbol": "USDCAD", "entry_time": "2026-01-05 12:00",
                         "reason": "open_max"}]
@@ -71,7 +71,7 @@ def test_portfolio_filter_ccy_cap_blocks_one_sided_stack():
     trades = {"EURUSD": _pt("EURUSD", "2026-01-05 10:00", "2026-01-05 22:00", "LONG"),
               "AUDUSD": _pt("AUDUSD", "2026-01-05 10:30", "2026-01-05 22:30", "LONG"),
               "NZDUSD": _pt("NZDUSD", "2026-01-05 11:00", "2026-01-05 23:00", "LONG")}
-    kept, dropped = portfolio_filter(trades, 0, 2, 0.0, 100.0)
+    kept, dropped = portfolio_filter(trades, 0, 2, 0.0)
     # two longs already make the USD side -2; the third long breaches max_ccy_net
     assert [len(kept[s]) for s in trades] == [1, 1, 0]
     assert dropped == [{"symbol": "NZDUSD", "entry_time": "2026-01-05 11:00",
@@ -82,23 +82,34 @@ def test_portfolio_filter_weekly_halt_frees_next_week():
     trades = {"EURUSD": _pt("EURUSD", "2026-01-05 10:00", "2026-01-05 20:00", "LONG", -20.0),
               "AUDUSD": _pt("AUDUSD", "2026-01-07 10:00", "2026-01-07 20:00", "LONG", 1.0),
               "GBPUSD": _pt("GBPUSD", "2026-01-12 10:00", "2026-01-12 20:00", "LONG", 1.0)}
-    kept, dropped = portfolio_filter(trades, 0, 0, 15.0, 100.0)
-    # -20 closed same Monday = 20% of the 100 USD start -> halted; next Monday reset
+    kept, dropped = portfolio_filter(trades, 0, 0, 15.0)
+    # -20 R closed same Monday (pnl_R units) => week total <= -15 R -> halted; next Monday reset
     assert [len(kept[s]) for s in trades] == [1, 0, 1]
     assert dropped == [{"symbol": "AUDUSD", "entry_time": "2026-01-07 10:00",
                         "reason": "weekly_halt"}]
 
 
+def test_portfolio_filter_week_of_winners_never_halts():
+    # regression: the old %-equity halt tripped on a WINNING week once week-start
+    # equity was <= 0 (threshold flipped positive). R-based units have no equity
+    # path: a week of +1R wins stays halted-free at any account state.
+    trades = {"X": _pt("X", "2015-11-16 02:00", "2015-11-16 04:00", "LONG", 1.0),
+              "Y": _pt("Y", "2015-11-17 02:00", "2015-11-17 04:00", "LONG", 1.0),
+              "Z": _pt("Z", "2015-11-18 02:00", "2015-11-18 04:00", "LONG", 1.0)}
+    kept, dropped = portfolio_filter(trades, 0, 0, 5.0)
+    assert all(len(kept[s]) == 1 for s in trades) and dropped == []
+
+
 def test_portfolio_filter_exit_frees_the_slot_at_same_timestamp():
     trades = {"EURUSD": _pt("EURUSD", "2026-01-05 10:00", "2026-01-05 12:00"),
               "AUDUSD": _pt("AUDUSD", "2026-01-05 12:00", "2026-01-05 14:00")}
-    kept, dropped = portfolio_filter(trades, 1, 0, 0.0, 100.0)
+    kept, dropped = portfolio_filter(trades, 1, 0, 0.0)
     assert dropped == [] and sum(len(k) for k in kept.values()) == 2
 
 
 def test_portfolio_filter_all_zero_is_a_noop():
     trades = {"EURUSD": _pt("EURUSD", "2026-01-05 10:00", "2026-01-05 20:00")}
-    kept, dropped = portfolio_filter(trades, 0, 0, 0.0, 100.0)
+    kept, dropped = portfolio_filter(trades, 0, 0, 0.0)
     assert len(kept["EURUSD"]) == 1 and dropped == []
 
 

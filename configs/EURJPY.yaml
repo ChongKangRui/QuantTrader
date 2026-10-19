@@ -4,6 +4,8 @@ symbol: EURJPY
 pip_size: 0.01
 risk: { risk_pct: 0.4 }
 # Note: risk-sentiment regime filter helps
-# Live costs from quant.spreadcheck 2026-10-17 (Friday close): spread = 1.4 pips,
-# swaps per 0.01 lot. Re-sample in a live session - demo spreads move.
-costs: { spread_points: 14, swap_long_per_0_01: -0.0364, swap_short_per_0_01: -0.1092 }
+# Swaps re-sampled 2026-10-19 09:19 UTC (London session) with the fixed
+# points-mode math: the 2026-10-17 Friday numbers used the old /100 math and
+# were ~1.5x too big. Spread stays on the wider Friday-close sample (backtest
+# conservatism; Monday London read was only 5 pt = 0.5 pips; off-peak pending).
+costs: { spread_points: 14, swap_long_per_0_01: -0.0230, swap_short_per_0_01: -0.0690 }

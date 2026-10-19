@@ -15,7 +15,7 @@ comment lines are informational only.
 2. `_base.yaml risk:` / `limits:` — engine portfolio pass + live enforce the same keys
 3. pair yaml `costs:` — sampled live-cost values
 4. backtest CLI flags (`--spread-pips`, `--flat-swaps`, `--scope-low/--scope-high`,
-   `--weekly-loss-pct`, `--max-cost-ratio`, `--ma-only`, ...) — sensitivity sweeps
+   `--weekly-loss-r`, `--max-cost-ratio`, `--ma-only`, ...) — sensitivity sweeps
 
 ## Gate codes
 
@@ -58,7 +58,8 @@ values (`use_ext/use_hr3/use_hr4 = True`, `use_trail = True`,
 | `swap_long_per_0_01`, `swap_short_per_0_01` | account-ccy per 0.01 lot per night |
 | `commission_per_lot` | USD per 1.0 lot |
 | `sizing_scope_usd.low/high` | USD — every trade's 1R must land inside |
-| `weekly_loss_pct` | % of week-start equity |
+| `weekly_loss_r` | R — backtest weekly halt (week's CLOSED R total) |
+| `weekly_loss_pct` | % of week-start equity (live/panel halt only) |
 | `max_cost_ratio` | round-trip cost as a share of the stop distance |
 | `max_total_positions`, `max_ccy_net`, `max_trades_per_day` | counts |
 | `lookback`, `pivot_n`, `warmup_bars` | bars |

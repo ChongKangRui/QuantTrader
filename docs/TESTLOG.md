@@ -23,6 +23,15 @@ Question: do the entry rules beat dice, or does the reference result sit inside 
 - **D1-B verdict (pre-decided): entry timing CONFIRMED iff the real run's pooled expectancy > the 95th percentile of the dice-B distribution. Otherwise: "within dice noise".**
 - The §12 money bar (expectancy ≥ +0.10R) stays a SEPARATE condition — beating dice ≠ making money.
 - Parity gate: `--real` must reproduce the reference exactly (per-pair trade counts + TOTAL 2064 / −54.84). If it fails, suspect the reference run first (older code) and re-run it with current code before assuming a probe bug.
+- **PROVISIONAL (2026-10-19, added after the runs):** every D1 number above ran
+  through the broken %-equity weekly halt (see DEVLOG 2026-10-19): once closed
+  equity hit 0 (2015-11-16 in the reference), the halt tripped on FIRST-exited
+  weeks regardless of direction — 4,430 of 5,134 portfolio drops were
+  `weekly_halt`, and the dice trades (spread evenly through time) hit that
+  state differently than the real trades do, distorting the comparison in
+  both directions. The engine halt is now R-based (`limits.weekly_loss_r` =
+  5.0). Re-run needed (user): reference batch + `--real` parity + D1-A/D1-B
+  with the new halt; verdict stays PROVISIONAL until then.
 
 ## Errata / corrections
 

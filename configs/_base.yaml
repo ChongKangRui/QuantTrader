@@ -134,7 +134,8 @@ account:
 # (0 on any limit = that rule off)
 # ────────────────────────────────────────────────────────────────────────
 limits:
-  weekly_loss_pct: 15.0       # halt new entries at this % of week-start equity
+  weekly_loss_r: 5.0          # BACKTEST weekly halt: week's CLOSED R total <= -this (8A; 0 = off)
+  weekly_loss_pct: 15.0       # LIVE/panel weekly halt: % of week-start equity (live only)
   max_trades_per_day: 20      # portfolio-wide, per day
   max_cost_ratio: 0.10        # round-trip cost < this share of stop distance
   no_trade_ranges:            # {start,end} = MM-DD UTC; wraps the New Year

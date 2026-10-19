@@ -56,7 +56,6 @@ def resolve_setup(config_dir: str = "configs") -> dict:
     limits = dict(base.get("limits") or {})
     risk = dict(base.get("risk") or {})
     scope = dict(risk.get("sizing_scope_usd") or {})
-    bench = dict(base.get("benchmarks") or {})
     selection = read_selection(config_dir)
     jobs: list[tuple[str, Path, dict]] = []
     for pr in load_pairs(config_dir):
@@ -96,8 +95,7 @@ def resolve_setup(config_dir: str = "configs") -> dict:
         "max_day": int(limits.get("max_trades_per_day", 0) or 0),
         "max_open": int(risk.get("max_total_positions", 0) or 0),
         "max_ccy_net": int(risk.get("max_ccy_net", 0) or 0),
-        "weekly_pct": float(limits.get("weekly_loss_pct", 0.0) or 0.0),
-        "account_usd": float(bench.get("account_usd") or 0) or 0.0,
+        "weekly_r": float(limits.get("weekly_loss_r", 0.0) or 0.0),
         "position_checks": str((base.get("timeframes") or {}).get(
             "position_checks", "M1")).upper(),
         "no_trade_ranges": tuple(parse_no_trade_ranges(base)),
@@ -239,8 +237,7 @@ def apply_filters(trades_by_sym: dict[str, pd.DataFrame], setup: dict
                   ) -> tuple[dict[str, pd.DataFrame], list[dict], list[dict]]:
     capped, cap_drops = apply_daily_cap(trades_by_sym, setup["max_day"])
     kept, pf_drops = portfolio_filter(
-        capped, setup["max_open"], setup["max_ccy_net"], setup["weekly_pct"],
-        setup["account_usd"])
+        capped, setup["max_open"], setup["max_ccy_net"], setup["weekly_r"])
     return kept, cap_drops, pf_drops
 
 

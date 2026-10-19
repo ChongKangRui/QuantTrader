@@ -5,7 +5,13 @@
 ### Now (housekeeping, no backtest needed)
 
 - [x] Fixed the `max_total_positions` mismatch (2026-10-18): `_base.yaml` (= 5) is the single source; STRATEGY.md sections 8 + 8A and this log now say 5. RUNBOOK and TESTLOG never carried a number — nothing to align there.
-- [ ] Monday spreadcheck re-sample (peak + off-peak), then recalibrate the 3 JPY-pair yamls (USDJPY/EURJPY/GBPJPY swaps were ~1.5x wrong under the old /100 math).
+- [x] Monday spreadcheck re-sample (2026-10-19): London-session peek done 09:19
+  UTC — JPY swap recalibration landed in the 3 yamls (old numbers were ~1.6x
+  too big under the old /100 math; new reads 0.63x the old, all 3 consistent).
+  Spread kept on the wider Friday-close sample. Off-peak sample still to do:
+  run `quant.spreadcheck` once in a quiet session (late Malaysia night /
+  ~17-23 UTC) and refine `spread_points` in the 3 JPY yamls if the honest
+  pick changes.
 
 ### Verdict track (timebox: 2-3 more experiments, then decide)
 
@@ -33,6 +39,33 @@
 - [x] Build the live trading loop (`quant.monitor --trade`; demo only, dry-run default; `start-trader.bat`).
 
 
+
+## 2026-10-19
+
+- **Weekly-halt equity bug fixed (user found it; engine only — live untouched).**
+  `backtest.py::portfolio_filter` halted a week when closed P&L reached
+  `-weekly_pct/100 * week-start equity`; at week-start equity <= 0 the
+  threshold turned POSITIVE so the first exit of any week (even a win) tripped
+  it. Verified from saved runs + direct function test: reference `20261018_173936`
+  had 4,430/5,134 portfolio drops = `weekly_halt`; closed equity crossed <= 0 on
+  2015-11-16 ( −1.30 USD) and 1,732/2,064 trades sat after that; weeks starting
+  at <= 0 equity averaged 2.5 entries vs 4.8. Live `limits.assess` guards
+  (`start_equity <= 0` -> never halts), so backtest and live DISAGREED.
+  - Fix: the halt is R-based per spec 8A — `_base.yaml` gains
+    `limits.weekly_loss_r: 5.0` (0 = off), `--weekly-loss-r` CLI replaces
+    `--weekly-loss-pct`; the filter sums `pnl_R` per week (trades frames
+    already carry `risk_usd`/`pnl_R`) and no longer sees ANY equity path —
+    account state cannot reach the rule. `weekly_loss_pct` stays for the
+    live/panel halt (its >= 0 guard is already correct there); moving live to
+    R is a parked change-set.
+  - Consequence for recorded verdicts: every prior backtest and BOTH dice
+    variants (D1-A/D1-B) ran through the broken filter (`dice_probe.py` same
+    call), so the D1 "WITHIN DICE NOISE" verdict compares through a distorted
+    funnel — PROVISIONAL. Re-run the reference batch + dice with `weekly_loss_r`
+    (user runs); treat re-run numbers as the declared change-set.
+  - Tests 169 → 178, all pass (focused weekly-halt set + existing dice/base tests
+    untouched by the swap); new regression `test_portfolio_filter_week_of_winners_never_halts`
+    locks the winners-week case at any week-start state.
 
 ## 2026-10-18
 

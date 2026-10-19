@@ -25,8 +25,8 @@ Prints each enabled symbol's live spread and swaps from the terminal.
 Sample it at different hours — demos spread out massively in dead sessions,
 and the backtest cost model needs calibrated numbers.
 
-Numbers land in each pair yaml as a `costs:` override (spread + swaps,
-2026-10-17 Friday-close sample). CLI sweep flags (`--spread-points`,
+Numbers land in each pair yaml as a `costs:` override (spread + swaps; sample
+date and session are noted in each pair file). CLI sweep flags (`--spread-points`,
 `--flat-swaps`, ...) beat pair yaml values, so sensitivity sweeps stay global.
 Zero spreads in the output mean the market is closed or the quote is stale.
 
