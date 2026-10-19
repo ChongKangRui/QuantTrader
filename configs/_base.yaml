@@ -119,8 +119,10 @@ costs:
   spread_points: 20           # BACKTEST spread (points; 20 pts = 2.0 pips)
   swap_long_per_0_01: -0.08   # nightly carry, long (ccy per 0.01 lot/night)
   swap_short_per_0_01: -0.08  # nightly carry, short (ccy per 0.01 lot/night)
-  commission_per_lot: 0.0     # commission per 1.0 lot (USD)
-  slippage_pips: 0.0          # assumed fill slip (pips; backtest and live)
+  commission_per_lot: 0.0     # commission per 1.0 lot per SIDE (USD); Standard account
+                              # = 0 by decision 2026-10-19 (spread covers it); Razor ~3.5/side
+  slippage_pips: 0.0          # assumed fill slip (pips; backtest and live); 0 by decision
+                              # 2026-10-19 — charged on exits only in the engine
 
 # Triple swap = broker charges 3x on the Wednesday rollover; the engine
 # approximates it as the first bar after Wed 21:xx UTC (hardcoded, STRATEGY 10).

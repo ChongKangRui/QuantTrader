@@ -100,6 +100,30 @@ def test_portfolio_filter_week_of_winners_never_halts():
     assert all(len(kept[s]) == 1 for s in trades) and dropped == []
 
 
+def test_portfolio_filter_exit_books_its_own_week():
+    # regression (user repro): the losing trade opened the PREVIOUS Friday and
+    # closed Tue 13 Jan at -6R (past the -5R halt); the Thu 15 Jan entry must
+    # be blocked BY THAT LOSS. The entry-only rollover once booked the exit
+    # into the dead Friday week and reset it away at the Thu entry.
+    trades = {"EURUSD": _pt("EURUSD", "2026-01-09 02:00", "2026-01-13 14:00", "LONG", -6.0),
+              "GBPUSD": _pt("GBPUSD", "2026-01-15 02:00", "2026-01-15 16:00", "LONG", 1.0)}
+    kept, dropped = portfolio_filter(trades, 0, 0, 5.0)
+    assert [len(kept[s]) for s in trades] == [1, 0]
+    assert dropped == [{"symbol": "GBPUSD", "entry_time": "2026-01-15 02:00",
+                        "reason": "weekly_halt"}]
+
+
+def test_portfolio_filter_friday_entry_monday_exit_blocks_the_new_week():
+    # an exit that crosses into the new week books into THAT week (deal time,
+    # like live): Monday 05:00 exit -6R halts the rest of Monday.
+    trades = {"EURUSD": _pt("EURUSD", "2026-01-09 02:00", "2026-01-12 05:00", "LONG", -6.0),
+              "GBPUSD": _pt("GBPUSD", "2026-01-12 06:00", "2026-01-12 16:00", "LONG", 1.0)}
+    kept, dropped = portfolio_filter(trades, 0, 0, 5.0)
+    assert [len(kept[s]) for s in trades] == [1, 0]
+    assert dropped == [{"symbol": "GBPUSD", "entry_time": "2026-01-12 06:00",
+                        "reason": "weekly_halt"}]
+
+
 def test_portfolio_filter_exit_frees_the_slot_at_same_timestamp():
     trades = {"EURUSD": _pt("EURUSD", "2026-01-05 10:00", "2026-01-05 12:00"),
               "AUDUSD": _pt("AUDUSD", "2026-01-05 12:00", "2026-01-05 14:00")}

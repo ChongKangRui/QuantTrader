@@ -733,7 +733,10 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
         once closed equity hits zero (the threshold turns positive), so the
         account state can never reach this rule.
     Deterministic: candidates by (entry_time, symbol); an exit at the same
-    timestamp is applied BEFORE entries (frees the slot).
+    timestamp is applied BEFORE entries (frees the slot). Exits book R to the
+    week of their own timestamp (deal-time booking, like live counts deals
+    >= monday_ts); an entry-only rollover once let an early-week exit vanish
+    into the discarded previous week.
     Returns (kept frames by symbol, dropped records).
     """
     if max_open <= 0 and max_ccy_net <= 0 and weekly_r <= 0:
@@ -746,10 +749,14 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
             cands.append((sym, int(idx), str(t["entry_time"]), str(t["exit_time"]),
                           str(t.get("direction", "")), float(t["pnl_R"])))
     # one event per trade: exits (0) sort before entries (1) at equal timestamps
+    def _ts(s: str) -> pd.Timestamp:
+        v = pd.Timestamp(s)
+        return v.tz_localize("UTC") if v.tzinfo is None else v
+
     evs = []
     for sym, idx, tin, tout, direction, pnl_r in cands:
-        evs.append((pd.Timestamp(tin), 1, sym, idx, direction, pnl_r))
-        evs.append((pd.Timestamp(tout), 0, sym, idx, direction, pnl_r))
+        evs.append((_ts(tin), 1, sym, idx, direction, pnl_r))
+        evs.append((_ts(tout), 0, sym, idx, direction, pnl_r))
     evs.sort(key=lambda e: (e[0], e[1], e[2], e[3]))
 
     active: dict = {}          # (sym, idx) -> direction
@@ -764,6 +771,15 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
         dropped.append({"symbol": sym, "entry_time": tin[:16], "reason": reason})
 
     for t, kind, sym, idx, direction, pnl_r in evs:
+        # week rolls on EVERY event, by that event's own timestamp: exits book
+        # to their own week, deal-time, like live counts deals >= monday_ts.
+        # (Rollover on entries only let a Monday/early-week exit land in the
+        # dead previous-week bucket — the next entry reset the loss away.)
+        wk = t.normalize() - pd.Timedelta(days=t.weekday())  # Monday 00:00 UTC
+        if wk != week_key:
+            week_key = wk
+            week_r = 0.0
+            halted = False
         if kind == 0:  # exit: free the slot, book the R, run the halt check
             direction = active.pop((sym, idx), None)
             if direction is None:
@@ -777,12 +793,6 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
                 halted = True
             continue
         # entry decision (exits at the same timestamp have already run)
-        t_utc = t.tz_localize("UTC") if t.tzinfo is None else t
-        wk = t_utc.normalize() - pd.Timedelta(days=t_utc.weekday())  # Monday 00:00 UTC
-        if wk != week_key:
-            week_key = wk
-            week_r = 0.0
-            halted = False
         hh_mm = t.strftime("%Y-%m-%d %H:%M")
         if halted:
             _drop(sym, idx, hh_mm, "weekly_halt")

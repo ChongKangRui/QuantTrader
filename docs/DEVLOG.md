@@ -4,23 +4,18 @@
 
 ### Now (housekeeping, no backtest needed)
 
-- [x] Fixed the `max_total_positions` mismatch (2026-10-18): `_base.yaml` (= 5) is the single source; STRATEGY.md sections 8 + 8A and this log now say 5. RUNBOOK and TESTLOG never carried a number — nothing to align there.
-- [x] Monday spreadcheck re-sample (2026-10-19): London-session peek done 09:19
-  UTC — JPY swap recalibration landed in the 3 yamls (old numbers were ~1.6x
-  too big under the old /100 math; new reads 0.63x the old, all 3 consistent).
-  Spread kept on the wider Friday-close sample. Off-peak sample still to do:
-  run `quant.spreadcheck` once in a quiet session (late Malaysia night /
-  ~17-23 UTC) and refine `spread_points` in the 3 JPY yamls if the honest
-  pick changes.
+- [ ] Monday off-peak spreadcheck re-sample: run `quant.spreadcheck` once in a
+  quiet session (late Malaysia night / ~17-23 UTC), then refine `spread_points`
+  in the 3 JPY yamls if the honest pick changes (swaps already corrected).
+- [ ] After the post-fix batch re-run: point the dice `--reference` default and
+  the TESTLOG "Reference (pinned)" line at the new run id.
 
 ### Verdict track (timebox: 2-3 more experiments, then decide)
 
-- [x] Pre-declare pass lines in `docs/TESTLOG.md` BEFORE running anything below — random-entry null pre-declared 2026-10-18 (D1 section in TESTLOG: CONFIRMED iff real pooled expectancy > dice P95; variant A info-only; §12 bar separate).
-  - Random-entry null: entry rules "add value" only if the real result is above the 95th percentile of the random results, on pooled expectancy R.
-  - Variance ratio: "trends" only if VR > 1 beyond 2 SE at 1-5 day horizons on most pairs.
-- [x] Write the random-entry null script (done 2026-10-18: `quant/dice_probe.py`, variants A + B, 300 seeds, pre-run parity gate). Same bias, stops, TP, sizing, costs, caps. Only the entry bar is random. Seeded.
 - [ ] Write the variance-ratio / Hurst script (spec §11.3). Never done.
-- [ ] Run both. Record results in `docs/TESTLOG.md` (user runs them). — random-entry null RUN done 2026-10-18 (D1-A + D1-B in TESTLOG); variance-ratio still to run.
+- [ ] Run both, record results in `docs/TESTLOG.md` (user runs them). Remaining
+  after 2026-10-19: variance-ratio never run; reference batch + dice
+  (`--real` parity, then D1-B) re-run pending the weekly-halt fix.
 - [ ] Decide from the results:
   - real result inside the random cloud AND variance ratio ≈ 1 → no edge from these entry rules / no trend to harvest on these pairs at H1/H4 → change market, timeframe or edge type — or stop.
   - real result clearly above the cloud, or gross > 0 but costs kill it → structural (spread/swap is a big share of 15-20 pip stops) → wider stops via a longer timeframe, or a cent account.
@@ -36,12 +31,18 @@
 - [ ] Swap timing check (low priority): engine charges swap at UTC midnight, broker rolls at ~21-22 UTC. Triple day is approximated.
 - [ ] Strategy-core redesign (open track): design the next change-set with pass lines pre-declared.
 - [ ] Go-live demo smoke: 0.01 lots EURUSD + one JPY pair → all 10; compare fills vs backtest. Rotate the demo password (it appeared in chat).
-- [x] Build the live trading loop (`quant.monitor --trade`; demo only, dry-run default; `start-trader.bat`).
 
 
 
 ## 2026-10-19
 
+- **Monday spreadcheck re-sample + JPY swap recalibration.** London-session
+  sample 09:19 UTC with the fixed points-mode math; all three JPY yamls
+  re-calibrated (old numbers were ~1.6x too big under the old /100 math —
+  fresh reads 0.63x: USDJPY +0.0191/−0.0998, EURJPY −0.0230/−0.0690,
+  GBPJPY −0.0017/−0.1261). `spread_points` kept on the wider 2026-10-17
+  Friday-close sample (conservative); Monday London reads were 0.3/0.5/0.4
+  pips. Off-peak sample still open (see TODO).
 - **Weekly-halt equity bug fixed (user found it; engine only — live untouched).**
   `backtest.py::portfolio_filter` halted a week when closed P&L reached
   `-weekly_pct/100 * week-start equity`; at week-start equity <= 0 the
@@ -66,6 +67,24 @@
   - Tests 169 → 178, all pass (focused weekly-halt set + existing dice/base tests
     untouched by the swap); new regression `test_portfolio_filter_week_of_winners_never_halts`
     locks the winners-week case at any week-start state.
+- **Week-booking flaw fixed, same day (second review pass; user repro).** The
+  week rolled over on ENTRIES only: an exit closing early in a NEW week was
+  booked into the discarded previous-week bucket and erased by the next
+  entry — an exit that should halt a week never did (user's case: previous-
+  Friday trade, Tue-13 exit −6R, Thursday entry let in). Fix: the rollover
+  moved to the top of the event loop and fires on EVERY event by its own
+  timestamp — deal-time booking, same as live counting deals >= monday_ts.
+ Tests 178 → 180 (`..._exit_books_its_own_week` = user repro,
+  `..._friday_entry_monday_exit_blocks_the_new_week` = cross-week case).
+- **Reference labelled pre-fix.** Batch folder `20261018_173936` renamed to
+  `20261018_173936_prefix` (ledger rebuild re-keyed, 12 runs). Dice
+  `--reference` default follows the new name — parity against it fails BY
+  DESIGN until a post-fix batch run becomes the new pin.
+- **Cost-model decisions (2026-10-19, user):** `commission_per_lot` stays 0.0
+  (Standard account — the spread compensates; Razor would be ~3.5 USD/lot/side,
+  each side charged by the engine) and `slippage_pips` stays 0.0. Noted gap:
+  the engine charges slip on exits only (entries fill at the observed
+  open) — harmless at 0, revisit only if slip is ever raised.
 
 ## 2026-10-18
 
@@ -166,6 +185,9 @@
   CLI-overridable, 0 = rule off; any run with the pass ON is a NEW declared
   change-set vs R2. Dead yaml keys removed (regime_rule, risk_pct,
   max_positions_per_pair, triple_swap_days, contract_size). Tests 131 → 142.
+- **`max_total_positions` mismatch fixed:** `_base.yaml` (= 5) confirmed the
+  single source; STRATEGY.md sections 8 + 8A and this log now say 5. RUNBOOK
+  and TESTLOG never carried a number — nothing to align there.
 
 ## 2026-10-17 — v0.9.4: honest costs, scope sizing, R1b probe, MTM drawdown
 

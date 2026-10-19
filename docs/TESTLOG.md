@@ -13,7 +13,8 @@ Full numbers live in each `backtest_results/<run-id>/` (params.json is the truth
 
 Question: do the entry rules beat dice, or does the reference result sit inside dice luck?
 
-- Reference (pinned): `20261018_173936` (identical to 174249/174651) — batch, **no cost flags** (params.json: slippage 0, per-pair spreads+swaps, scope 2.5–3.6, max_total_positions **5**, ccy net 2, weekly halt 15%, M1 checks, cap 20/day). Reference figures: 2064 trades, −54.84 USD, −0.013R pooled.
+- Reference (pinned): `20261018_173936_prefix` (renamed 2026-10-19 to label it
+  pre-fix — originally `20261018_173936`, identical to 174249/174651) — batch, **no cost flags** (params.json: slippage 0, per-pair spreads+swaps, scope 2.5–3.6, max_total_positions **5**, ccy net 2, weekly halt 15%, M1 checks, cap 20/day). Reference figures: 2064 trades, −54.84 USD, −0.013R pooled. **This pin is stale until the post-fix batch re-run replaces it** (dice parity intentionally fails against it now).
 - Everything of the system stays (exits, costs, sizing scope, caps, windows, M1 checks); only the entry moment is dice.
 - **D1-A** = random bar + random direction (placebo, machinery sanity — never verdict material). **D1-B** = random bar among bias-ON H1 bars, direction = the mapped H4 bias (tests entry timing only).
 - Target counts per pair = the **pre-cap, pre-portfolio-pass recorded trade counts of the `--real` parity run** (not funnel `sized`, which counts trades that start and never record the one open at data end).
@@ -29,9 +30,14 @@ Question: do the entry rules beat dice, or does the reference result sit inside 
   weeks regardless of direction — 4,430 of 5,134 portfolio drops were
   `weekly_halt`, and the dice trades (spread evenly through time) hit that
   state differently than the real trades do, distorting the comparison in
-  both directions. The engine halt is now R-based (`limits.weekly_loss_r` =
-  5.0). Re-run needed (user): reference batch + `--real` parity + D1-A/D1-B
-  with the new halt; verdict stays PROVISIONAL until then.
+  both directions. Second flaw same day: the week rolled over on ENTRIES
+  only, so early-week exits (Monday-morning closes, or a previous-week entry
+  closing in the new week) were booked into the discarded bucket — an
+  exit that should halt a week never did; fixed to deal-time booking.
+  The engine halt is now R-based (`limits.weekly_loss_r` = 5.0) with
+  exit-time week buckets. Re-run needed (user): reference batch + `--real`
+  parity + D1-A/D1-B with `--reference <new run>`; the old D1-A/D1-B rows
+  above are SUPERSEDED by the re-run row once it lands.
 
 ## Errata / corrections
 
