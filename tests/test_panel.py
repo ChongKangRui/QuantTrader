@@ -1,7 +1,8 @@
 """Panel tests. No terminal, no real MT5 import."""
 import numpy as np
 
-from quant.monitor import PairRow, load_pairs, poll, read_limits, read_selection, render_panel, should_rewrite
+from quant.monitor import (PairRow, load_pairs, poll, read_limits, read_selection,
+                           read_timeframes, render_panel, should_rewrite)
 
 
 def _rows():
@@ -139,6 +140,59 @@ def test_read_limits_from_base_with_default(tmp_path):
     (d / "_base.yaml").write_text("limits: {weekly_loss_pct: 20}\n", encoding="utf-8")
     assert read_limits(d) == 20.0
     assert read_limits(d / "nodir") == 15.0
+
+
+def test_read_timeframes_default_and_upscale(tmp_path):
+    d = tmp_path / "configs"
+    d.mkdir()
+    (d / "_base.yaml").write_text("timeframes: {position_checks: M1}\n", encoding="utf-8")
+    assert read_timeframes(d) == ("H1", "H4")          # missing keys = default pair
+    (d / "_base.yaml").write_text(
+        "timeframes: {execution: H4, regime: D1}\n", encoding="utf-8")
+    assert read_timeframes(d) == ("H4", "D1")           # the allowed upscale
+    assert read_timeframes(d / "nodir") == ("H1", "H4")  # no file = default pair
+
+
+def test_read_timeframes_rejects_unknown_and_unlocked(tmp_path):
+    import pytest
+
+    d = tmp_path / "configs"
+    d.mkdir()
+    for yml in ("timeframes: {execution: H1, regime: D1}\n",   # un-locked combo
+                "timeframes: {execution: H4, regime: H4}\n",   # regime == execution
+                "timeframes: {execution: W1, regime: D1}\n"):  # unknown TF
+        (d / "_base.yaml").write_text(yml, encoding="utf-8")
+        with pytest.raises(ValueError):
+            read_timeframes(d)
+
+
+def test_poll_resolves_tf_names_via_getattr():
+    # exec/reg TFs are mt5 ATTRIBUTE names, resolved on the (mock) mt5 module
+    class _Rec:
+        TIMEFRAME_H1 = 11
+        TIMEFRAME_H4 = 12
+        TIMEFRAME_D1 = 13
+
+        def __init__(self):
+            self.used = []
+
+        def symbol_info(self, symbol):
+            return object()
+
+        def symbol_select(self, symbol, flag):
+            return True
+
+        def positions_get(self, symbol=None):
+            return []
+
+        def copy_rates_from_pos(self, symbol, tf, start, n):
+            self.used.append(tf)
+            return None  # poll reports "no closed-bar data"; the codes are the point
+
+    mt5 = _Rec()
+    poll(mt5, [{"name": "EURUSD", "symbol": "EURUSD"}],
+         exec_tf="TIMEFRAME_H1", reg_tf="TIMEFRAME_D1")
+    assert mt5.used == [11, 13]
 
 
 def test_render_shows_ma_only_mode():

@@ -368,6 +368,7 @@ def test_read_trade_cfg_same_yaml_paths_as_engine(tmp_path):
     (d / "_base.yaml").write_text(yaml.safe_dump({
         "live": {"magic": 777, "dry_run_default": True},
         "risk": {"max_total_positions": 4, "max_ccy_net": 2,
+                 "scale_lot_with_balance": True, "balance_risk_pct": 2.5,
                  "sizing_scope_usd": {"low": 12, "high": 30}},
         "limits": {"max_trades_per_day": 20, "max_cost_ratio": 0.15,
                    "weekly_loss_pct": 15, "no_trade_ranges": []},
@@ -376,6 +377,7 @@ def test_read_trade_cfg_same_yaml_paths_as_engine(tmp_path):
     cfg = read_trade_cfg(d)
     assert cfg["magic"] == 777 and cfg["dry_run_default"] is True
     assert cfg["max_total_positions"] == 4 and cfg["max_ccy_net"] == 2
+    assert cfg["scale_lot_with_balance"] is True and cfg["balance_risk_pct"] == 2.5
     assert (cfg["scope_low"], cfg["scope_high"]) == (12.0, 30.0)
     assert cfg["max_trades_per_day"] == 20 and cfg["max_cost_ratio"] == 0.15
     assert cfg["ranges"] == () and cfg["costs"]["spread_pips"] == 1.5
@@ -383,3 +385,21 @@ def test_read_trade_cfg_same_yaml_paths_as_engine(tmp_path):
     cfg2 = read_trade_cfg(tmp_path / "nope")
     assert cfg2["magic"] == 100001 and cfg2["dry_run_default"] is True
     assert cfg2["max_total_positions"] == 0 and cfg2["scope_high"] == 0.0
+    assert cfg2["scale_lot_with_balance"] is False and cfg2["balance_risk_pct"] == 3.0
+
+
+def test_plan_entry_scaled_aim_uses_scope_fence():
+    """risk_target > 0 = balance-scaled aim (same fence, taps rules.scaled_lots)."""
+    params = {"stop_atr": 1.5, "tp_mult": 3.0}
+    info = SimpleNamespace(symbol="EURUSD", point=0.00001, trade_tick_size=0.00001,
+                           trade_tick_value=1.0, digits=5, spread=0,
+                           volume_min=0.01, volume_max=100.0, volume_step=0.01)
+    fixed = tr.plan_entry("LONG", 1.1050, 0.0010, "EURUSD", info, params, {},
+                          2.5, 3.6, 0.10)
+    assert fixed[0]["lots"] == 0.02 and fixed[0]["risk_usd"] == 3.0  # scope floor path
+    snap_in = tr.plan_entry("LONG", 1.1050, 0.0010, "EURUSD", info, params, {},
+                            2.5, 3.6, 0.10, risk_target=2.7)
+    assert snap_in[0]["lots"] == 0.02 and snap_in[0]["risk_usd"] == 3.0  # snapped up
+    busting = tr.plan_entry("LONG", 1.1050, 0.0010, "EURUSD", info, params, {},
+                            2.5, 3.6, 0.10, risk_target=10.0)
+    assert busting == (None, "scope")  # 10 -> 7 steps x 1.5 = 10.5 busts the ceiling

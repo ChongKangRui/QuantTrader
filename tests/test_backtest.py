@@ -1,9 +1,9 @@
 ﻿"""Backtest tests. Synthetic H1 only, never data/, never a terminal."""
 import pandas as pd
 
-from quant.backtest import (bias_frames, build_h4, grade_benchmarks, map_bias,
-                            metrics, portfolio_filter, scan_pair, simulate,
-                            total_row, yaml_notes)
+from quant.backtest import (bias_frames, build_h4, build_htf, grade_benchmarks,
+                            map_bias, metrics, portfolio_filter, scan_pair,
+                            simulate, total_row, yaml_notes)
 from quant.bias import h4_bias
 
 
@@ -146,6 +146,34 @@ def test_build_h4_utc_blocks():
     assert h4["close"].iloc[1] == h1["close"].iloc[7]
 
 
+def test_build_htf_d1_blocks_anchor_utc():
+    # 60 hourly bars from Mon 00:00 -> two full D1 blocks + a partial third
+    h1 = _h1([1.1 + i * 0.0001 for i in range(60)])
+    d1 = build_htf(h1, 24)
+    assert len(d1) == 3
+    assert list(d1["time"].dt.strftime("%m-%d %H:%M")) == \
+        ["01-06 00:00", "01-07 00:00", "01-08 00:00"]
+    assert d1["open"].iloc[1] == h1["open"].iloc[24]
+    assert d1["close"].iloc[1] == h1["close"].iloc[47]
+    assert d1["close"].iloc[2] == h1["close"].iloc[59]  # partial block included
+    assert d1["high"].iloc[0] == h1["high"].iloc[:24].max()
+
+
+def test_map_bias_d1_completed_bar_only():
+    # exec grid H4, regime D1: a D1 bar only feeds H4 bars from its close onwards
+    h1 = _h1([1.1 + i * 0.0005 for i in range(24 * 3)])
+    h4 = build_htf(h1, 4)
+    d1 = build_htf(h1, 24)
+    p = {"sep_atr": 0.3, "hr1": "a", "use_atr_sep": False,
+         "warmup_bars": 0, "h4_atr_n": 1}
+    bf = bias_frames(d1, p)
+    m = map_bias(h4, d1, bf, reg_hours=24)
+    assert (m["direction"].iloc[:6] == "NEUTRAL").all()      # day-1: no D1 closed
+    assert m["direction"].iloc[6] == bf["direction"].iloc[0]  # day-2 00:00 sees D1 #1
+    assert m["direction"].iloc[11] == bf["direction"].iloc[0]
+    assert m["direction"].iloc[12] == bf["direction"].iloc[1]  # day-3 sees D1 #2
+
+
 def test_bias_frames_match_core_and_map_uses_completed_bar():
     h4 = build_h4(_h1([1.1 + i * 0.001 for i in range(1300)]))
     p = {"sep_atr": 0.3, "hr1": "a", "use_atr_sep": True, "warmup_bars": 300}
@@ -194,6 +222,27 @@ def test_stop_before_target_inside_one_bar():
     assert trades["exit_type"].iloc[0] == "stop" and trades["pnl_R"].iloc[0] == -1.0
 
 
+def test_m1_checks_span_whole_h4_bar():
+    # H4 execution grid (bar_hours=4): the stop is hit at 10:30, in the THIRD
+    # hour of the 08:00 H4 bar -> the M1 slice must cover all 4 hours, and the
+    # exit books the M1 row's timestamp (deal-time semantics kept)
+    idx = pd.date_range("2020-01-06", periods=6, freq="4h", tz="UTC")
+    h4 = pd.DataFrame([{"time": t, "open": 1.1000, "high": 1.1005, "low": 1.0995,
+                        "close": 1.1000, "tick_volume": 5} for t in idx])
+    cands = [{"t": 1, "direction": "LONG", "atr": 0.0010,
+              "time": h4["time"].iloc[1]}]  # fills on the 08:00 bar
+    m1_idx = pd.date_range("2020-01-06 08:00", periods=181, freq="min", tz="UTC")
+    m1 = pd.DataFrame([{"time": t, "open": 1.0999, "high": 1.1000,
+                        "low": 1.0998 if t < m1_idx[150] else 1.0984,  # stop at 10:30
+                        "close": 1.0999} for t in m1_idx])
+    trades, _ = simulate(h4, "EURUSD", cands, {"stop_atr": 1.5, "tp_mult": 3.0,
+                                               "be_trigger_r": 1.0, "be_buffer": 0,
+                                               "trail_r": 100.0, "atr_n": 7},
+                         _costs(), 3.0, 0.10, m1=m1, bar_hours=4)
+    assert len(trades) == 1 and trades["exit_type"].iloc[0] == "stop"
+    assert trades["exit_time"].iloc[0].startswith("2020-01-06 10:30")
+
+
 def test_breakeven_caps_a_reversal():
     h1 = _trade_frame([1.1005, 1.1010, 1.1045, 1.1005, 1.0995])
     cands = [{"t": 11, "direction": "LONG", "atr": 0.0020,
@@ -234,6 +283,87 @@ def test_metrics_on_empty_and_wheel():
     h1 = _h1([1.1] * 10)
     m = metrics(h1.iloc[0:0].copy(), 30, len(h1))
     assert m["trades"] == 0 and m["net_usd"] == 0.0
+
+
+def test_scaled_lots_rule():
+    import pytest
+
+    from quant.rules import scaled_lots
+
+    assert scaled_lots(1.5, 3.0, 2.5, 3.6) == (0.02, 3.0, None)   # aim reached exactly
+    assert scaled_lots(1.5, 1.6, 2.5, 3.6) == (0.02, 3.0, None)   # snapped up, in band
+    assert scaled_lots(1.5, 3.1, 2.5, 3.6) == (0.0, 0.0, "high")  # snap busts the ceiling
+    assert scaled_lots(1.5, 1.1, 2.5, 3.6) == (0.0, 0.0, "low")   # snap below the floor
+    free = scaled_lots(1.5, 9.0, 0.0, 0.0)                        # fence off: free growth
+    assert free[0] == pytest.approx(0.06) and free[1] == pytest.approx(9.0)
+    assert free[2] is None
+    assert scaled_lots(1.5, 0.0, 2.5, 3.6) == (0.0, 0.0, "empty")  # nothing to aim with
+
+
+def _scale_rows():
+    # step 0.30 USD per 0.01 lot: engine sized t1 at 0.10 lot = 3.0 USD 1R
+    return [
+        {"entry_time": "2026-01-05 10:00", "exit_time": "2026-01-05 12:00",
+         "lot": 0.10, "pnl_usd": -3.0, "pnl_R": -1.0, "swap": 0.0},
+        {"entry_time": "2026-01-05 13:00", "exit_time": "2026-01-05 14:00",
+         "lot": 0.10, "pnl_usd": -1.5, "pnl_R": -0.5, "swap": 0.0},
+    ]
+
+
+def test_scale_lots_to_balance_shrinks_then_fences():
+    import pytest
+
+    from quant.backtest import scale_lots_to_balance
+
+    trades = {"EURUSD": pd.DataFrame(_scale_rows())}
+    kept, dropped = scale_lots_to_balance(dict(trades), 3.0, 2.5, 3.6, 90.0)
+    k = kept["EURUSD"]
+    assert dropped == []
+    # balance 90 -> aim 2.70 -> 9 x 0.01 lots at 0.30 = 2.7 (was 0.10): shrink
+    assert k["lot"].iloc[0] == pytest.approx(0.09)
+    assert k["pnl_usd"].iloc[0] == pytest.approx(-2.7)   # 1R preserved, USD rescaled
+    assert k["pnl_R"].iloc[0] == -1.0                    # R never moves
+    # balance 87.3 -> aim 2.619 -> still 9 steps; compounded into the next trade
+    assert k["lot"].iloc[1] == pytest.approx(0.09)
+    assert k["pnl_usd"].iloc[1] == pytest.approx(-1.35)
+
+
+def test_scale_lots_to_balance_fence_refuses_high():
+    import pytest
+
+    from quant.backtest import scale_lots_to_balance
+
+    # coarse step: 1.0 USD per 0.01 lot (t1 sized 0.03 lot = 3.0 USD 1R)
+    rows = [{"entry_time": "2026-01-05 10:00", "exit_time": "2026-01-05 12:00",
+             "lot": 0.03, "pnl_usd": 3.0, "pnl_R": 1.0, "swap": 0.0},
+            {"entry_time": "2026-01-05 13:00", "exit_time": "2026-01-05 14:00",
+             "lot": 0.03, "pnl_usd": 3.0, "pnl_R": 1.0, "swap": 0.0}]
+    trades = {"EURUSD": pd.DataFrame(rows)}
+    kept, dropped = scale_lots_to_balance(dict(trades), 3.0, 2.5, 3.6, 100.0)
+    k = kept["EURUSD"]  # kept: trade 2 kept
+    assert len(k) == 1
+    assert k["pnl_usd"].iloc[0] == pytest.approx(3.0)
+    # win pushed the balance to 103: aim 3.09 -> 4 steps x 1.0 = 4.0 > 3.6 -> refused
+    assert dropped == [{"symbol": "EURUSD", "entry_time": "2026-01-05 13:00",
+                        "reason": "scale-high"}]
+
+
+def test_scale_lots_to_balance_inherits_scratch_rows():
+    import pytest
+
+    from quant.backtest import scale_lots_to_balance
+
+    rows = [{"entry_time": "2026-01-05 10:00", "exit_time": "2026-01-05 12:00",
+             "lot": 0.02, "pnl_usd": 3.0, "pnl_R": 1.0, "swap": 0.0},  # step 1.5
+            {"entry_time": "2026-01-05 13:00", "exit_time": "2026-01-05 14:00",
+             "lot": 0.02, "pnl_usd": 0.0, "pnl_R": 0.0, "swap": 0.0}]  # scratch
+    trades = {"EURUSD": pd.DataFrame(rows)}
+    kept, dropped = scale_lots_to_balance(dict(trades), 3.0, 2.5, 3.6, 80.0)
+    k = kept["EURUSD"]
+    assert dropped == []
+    # balance 80 -> aim 2.4 -> snap 2 x 1.5 = 3.0 in band; scratch inherits the step
+    assert k["pnl_usd"].iloc[1] == pytest.approx(0.0)
+    assert k["lot"].iloc[1] == pytest.approx(0.02)
 
 
 def test_yearly_and_total_rows():

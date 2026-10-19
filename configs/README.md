@@ -36,6 +36,13 @@ reason). The yaml lists gates in reading order, not funnel order.
 
 `timeframes.position_checks: M1` selects the feed for open-trade checks.
 
+`timeframes.execution` / `timeframes.regime` choose the timeframe pair.
+Two locked combos only: `H1->H4` (default) and the upscale `H4->D1` —
+same gates, same numbers, bigger bars (bar counts count bars, so
+`lookback: 5` means 5 execution bars whatever the grid). The backtest
+derives both grids from `data/<SYM>_H1.csv` (00:00 UTC anchor); live
+fetches both from the broker. Anything else fails the config check.
+
 ## The OFF-gate rule
 
 Every `use_x: false` = that gate auto-passes and its knobs are ignored.
@@ -58,6 +65,8 @@ values (`use_ext/use_hr3/use_hr4 = True`, `use_trail = True`,
 | `swap_long_per_0_01`, `swap_short_per_0_01` | account-ccy per 0.01 lot per night |
 | `commission_per_lot` | USD per 1.0 lot |
 | `sizing_scope_usd.low/high` | USD — every trade's 1R must land inside |
+| `scale_lot_with_balance` | OFF = fixed sizing (rents the scope floor as the aim). ON = compounding: 1R aims at `balance_risk_pct` % of the account balance at entry, then the SAME scope fence checks it. Wins grow the lot, drawdown shrinks it — never doubles after a loss (not martingale) |
+| `balance_risk_pct` | % of the account balance per trade; read only when `scale_lot_with_balance: true` (must be > 0 then) |
 | `weekly_loss_r` | R — backtest weekly halt (week's CLOSED R total) |
 | `weekly_loss_pct` | % of week-start equity (live/panel halt only) |
 | `max_cost_ratio` | round-trip cost as a share of the stop distance |

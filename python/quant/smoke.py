@@ -49,8 +49,10 @@ def check_one(acct: Account) -> int:
             mt5.symbol_select(real, True)
             h1 = mt5.copy_rates_from_pos(real, mt5.TIMEFRAME_H1, 1, 1)
             h4 = mt5.copy_rates_from_pos(real, mt5.TIMEFRAME_H4, 1, 1)
+            d1 = mt5.copy_rates_from_pos(real, mt5.TIMEFRAME_D1, 1, 1)
             print(f"[{tag}] {sym} -> {real}: H1_closed={len(h1) if h1 is not None else 0} "
-                  f"H4_closed={len(h4) if h4 is not None else 0}")
+                  f"H4_closed={len(h4) if h4 is not None else 0} "
+                  f"D1_closed={len(d1) if d1 is not None else 0}")
         return 0
     finally:
         mt5.shutdown()

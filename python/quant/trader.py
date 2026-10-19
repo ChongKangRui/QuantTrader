@@ -4,7 +4,8 @@ All thresholds live in `_base.yaml`; this module is only mechanics:
 bar dedupe, position adoption/sync, portfolio caps, entry planning (the SAME
 math as the backtest via quant/rules), entry send with broker-side SL/TP,
 and trail/BE management. MetaTrader5 is mocked in tests; MT5 integer literals
-(16397 H1 timeframe, 24 SLTP action, 10009 DONE) keep tests import-free.
+(16385 H1, 16388 H4, 16408 D1 timeframe, 24 SLTP action, 10009 DONE; values
+verified against the installed wheel) keep tests import-free.
 
 Safety: nothing sends unless the caller passes dry=False; `--no-dry-run`
 additionally needs exactly one enabled account (enforced in monitor.py).
@@ -26,7 +27,9 @@ from quant.signals import check_entry
 
 ENTRY_IN = 0        # mt5.DEAL_ENTRY_IN
 POSITION_BUY = 0    # mt5.POSITION_TYPE_BUY
-TIMEFRAME_H1 = 16397   # mt5.TIMEFRAME_H1 literal (tests run without the wheel)
+TIMEFRAME_H1 = 16385   # mt5.TIMEFRAME_H1 literal (tests run without the wheel)
+TIMEFRAME_H4 = 16388   # mt5.TIMEFRAME_H4 literal
+TIMEFRAME_D1 = 16408   # mt5.TIMEFRAME_D1 literal
 ACTION_SLTP = 24       # mt5.TRADE_ACTION_SLTP literal
 RETCODE_DONE = 10009   # mt5.TRADE_RETCODE_DONE literal
 
@@ -236,11 +239,15 @@ def sync_book(mt5, magic: int, symbol: str, info, params: dict,
 
 def plan_entry(direction: str, fill: float, atr: float, symbol: str, info,
                params: dict, costs: dict, scope_low: float, scope_high: float,
-               max_cost_ratio: float) -> tuple[dict | None, str]:
+               max_cost_ratio: float, risk_target: float = 0.0
+               ) -> tuple[dict | None, str]:
     """Shared-math entry plan. Returns (plan|None, gate-fail reason).
 
     Longs buy the ask, shorts sell the bid; stop/tp attach broker-side so they
     outlive restarts. All thresholds via params/costs/scope args (=_base.yaml).
+    risk_target > 0 = scaled sizing aim (balance_risk_pct x live balance,
+    rules.scaled_lots); 0 = the fixed scope-floor path, identical to the
+    backtest engine.
     """
     long = direction == "LONG"
     stop_dist = float(params.get("stop_atr", 1.5)) * float(atr)
@@ -248,10 +255,15 @@ def plan_entry(direction: str, fill: float, atr: float, symbol: str, info,
     if not rules.cost_ok(stop_dist, spread_px, slip_px, max_cost_ratio):
         return None, "cost"
     size, value = tick_pair(info)
-    lots, risk, why = rules.scope_lots(rules.step_risk(stop_dist, size, value),
-                                       scope_low, scope_high)
-    if why is not None:
-        return None, why
+    step = rules.step_risk(stop_dist, size, value)
+    if risk_target > 0:
+        lots, risk, why = rules.scaled_lots(step, risk_target, scope_low, scope_high)
+        if why is not None:
+            return None, "scope"  # fence refused the scaled aim (high/low/empty)
+    else:
+        lots, risk, why = rules.scope_lots(step, scope_low, scope_high)
+        if why is not None:
+            return None, why
     tp_dist = rules.target_dist(stop_dist, float(params.get("tp_mult", 3.0)))
     digits = int(getattr(info, "digits", 5))
     sl = fill - stop_dist if long else fill + stop_dist
@@ -282,9 +294,13 @@ def send_entry(mt5, broker: str, direction: str, plan: dict, magic: int,
     return ok, res, fill
 
 
-def _gate_check(mt5, broker: str, direction: str, params: dict) -> tuple[bool, str, float]:
-    """E1 gate on closed bars (fresh fetch; only when bias points somewhere)."""
-    rows = mt5.copy_rates_from_pos(broker, TIMEFRAME_H1, 1, 400)
+def _gate_check(mt5, broker: str, direction: str, params: dict,
+                exec_tf: str = "TIMEFRAME_H1") -> tuple[bool, str, float]:
+    """E1 gate on closed execution-timeframe bars (fresh fetch; only when the
+    bias points somewhere). exec_tf is the mt5 ATTRIBUTE NAME the panel
+    resolved from timeframes.execution; getattr keeps mock mt5s working."""
+    tf = getattr(mt5, exec_tf, TIMEFRAME_H1)
+    rows = mt5.copy_rates_from_pos(broker, tf, 1, 400)
     if rows is None or len(rows) < 3:
         return False, "warmup", 0.0
     h1 = pd.DataFrame(rows)
@@ -296,7 +312,7 @@ def _gate_check(mt5, broker: str, direction: str, params: dict) -> tuple[bool, s
 def trade_on_bar(mt5, broker: str, symbol: str, direction: str, bar_secs: int,
                  now: datetime, *, magic: int, dry: bool, params: dict,
                  journal_path, mem: dict, cfg: dict, deals, ranges: list) -> str:
-    """Full decision for one closed H1 bar. Returns a short tag to print.
+    """Full decision for one closed execution-timeframe bar. Returns a short tag to print.
 
     params = the pair's flat strategy (stop_atr, tp_mult, trail_r...). cfg:
     max_total_positions, max_ccy_net, max_trades_per_day, scope_low,
@@ -337,7 +353,9 @@ def trade_on_bar(mt5, broker: str, symbol: str, direction: str, bar_secs: int,
         if breach:
             reason = breach
         else:
-            ok, fail, sig_atr = _gate_check(mt5, broker, direction, params)
+            ok, fail, sig_atr = _gate_check(
+                mt5, broker, direction, params,
+                exec_tf=str(cfg.get("exec_tf") or "TIMEFRAME_H1"))
             if not ok:
                 reason = f"gate {fail}"
     if not reason:
@@ -345,11 +363,22 @@ def trade_on_bar(mt5, broker: str, symbol: str, direction: str, bar_secs: int,
         tick = mt5.symbol_info_tick(broker)
         if tick is None:
             return "DATA ERROR - no tick"  # unstamped: retried next cycle
+        risk_target = 0.0
+        if bool(cfg.get("scale_lot_with_balance") or False):
+            # compounding aim: balance_risk_pct % of the live account balance
+            pct = float(cfg.get("balance_risk_pct") or 0.0)
+            acc = mt5.account_info()
+            equity = float(getattr(acc, "equity", 0) or 0) if acc is not None else 0.0
+            if not (pct > 0 and equity > 0):
+                return (f"DATA ERROR - scaled sizing unusable: equity={equity} "
+                        f"pct={pct}")  # unstamped: retried next cycle
+            risk_target = round(pct / 100.0 * equity, 2)
         plan, why = plan_entry(direction, float(tick.ask if long else tick.bid),
                                sig_atr, symbol, info, params, cfg.get("costs") or {},
                                float(cfg.get("scope_low", 0.0) or 0.0),
                                float(cfg.get("scope_high", 0.0) or 0.0),
-                               float(cfg.get("max_cost_ratio", 0) or 0))
+                               float(cfg.get("max_cost_ratio", 0) or 0),
+                               risk_target=risk_target)
         if plan is None:
             reason = why or "plan"
         else:

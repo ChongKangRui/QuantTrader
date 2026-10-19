@@ -7,15 +7,22 @@
 - [ ] Monday off-peak spreadcheck re-sample: run `quant.spreadcheck` once in a
   quiet session (late Malaysia night / ~17-23 UTC), then refine `spread_points`
   in the 3 JPY yamls if the honest pick changes (swaps already corrected).
-- [ ] After the post-fix batch re-run: point the dice `--reference` default and
-  the TESTLOG "Reference (pinned)" line at the new run id.
+- [ ] Lot-scale sweep (user runs): `--scale-lots` with `--balance-risk-pct` 1 / 3
+  / 5 vs the fixed reference, one at a time. Headroom first: compounding
+  crosses the 3.6 ceiling once the balance grows ~20%, so the sweep also needs
+  a widened `sizing_scope_usd.high` variant or it will refuse half the entries.
+- [x] After the post-fix batch re-run: point the dice `--reference` default and
+  the TESTLOG "Reference (pinned)" line at the new run id (`20261019_192501`).
+- [ ] H4->D1 variant (code done 2026-10-19): flip `_base.yaml` timeframes,
+  run its own batch + TESTLOG row, re-tune knob expectations — user runs
+  backtests. Probes stay H1/H4-only until a D1 dice null is designed.
 
 ### Verdict track (timebox: 2-3 more experiments, then decide)
 
 - [ ] Write the variance-ratio / Hurst script (spec §11.3). Never done.
 - [ ] Run both, record results in `docs/TESTLOG.md` (user runs them). Remaining
-  after 2026-10-19: variance-ratio never run; reference batch + dice
-  (`--real` parity, then D1-B) re-run pending the weekly-halt fix.
+  after 2026-10-19: variance-ratio never run; dice re-run (`--real` parity,
+  then D1-B 300 seeds) against the new pin `20261019_192501`.
 - [ ] Decide from the results:
   - real result inside the random cloud AND variance ratio ≈ 1 → no edge from these entry rules / no trend to harvest on these pairs at H1/H4 → change market, timeframe or edge type — or stop.
   - real result clearly above the cloud, or gross > 0 but costs kill it → structural (spread/swap is a big share of 15-20 pip stops) → wider stops via a longer timeframe, or a cent account.
@@ -36,6 +43,47 @@
 
 ## 2026-10-19
 
+- **Lot scaling switch (`scale_lot_with_balance`) — compounding sizing, OFF
+  by default.** OFF is byte-identical to before (1R aims at the scope floor).
+  ON = each entry re-aims its 1R at `balance_risk_pct` % of the account
+  balance at entry (account-global, backtest + live use ONE rule:
+  `rules.scaled_lots`), snapped UP to 0.01 lots, then the SAME
+  `sizing_scope_usd` fence checks the snapped 1R (in-band kept; refused as
+  `scale-low` / `scale-high` / `scale-empty` on aim <= 0, i.e. account gone).
+  Compounding only — wins grow it, drawdown shrinks it, never doubles after a
+  loss (not martingale). Backtest: one forward walk over all pairs by
+  timestamp AFTER daily cap + portfolio pass (`scale_lots_to_balance`) so the
+  balance timeline sees only trades that happened; exits book realized pnl,
+  kept trades keep their `pnl_R` exactly, USD rescales (pnl_usd = R x new 1R,
+  swap x lot ratio); drops recorded in params.json. Live: aim = pct x
+  `account_info().equity` in the sizing path (`plan_entry(..., risk_target=)`);
+  no equity/pct <= 0 -> unstamped DATA ERROR, retried next cycle. CLI:
+  `--scale-lots` force ON + `--balance-risk-pct` override; mode + pct into
+  params.json (`dice_probe`/parity compare summary+trades, params extras safe).
+- Tests: 191 passed (was 186; +5: scaled_lots snap/fence table, shrink walk,
+  fence refusal after growth, scratch-row inheritance, live plan_entry scaled
+  aim + cfg keys). Defaults verified on configs: scale False, pct 3.0.
+- Gaps (accepted): backtest aim uses REALIZED balance, live aim uses equity
+  incl. floating PnL — documented divergence; when ON, a wiped account refuses
+  further trades (fixed sizing today would keep trading the floor); 0.01-step
+  snapping makes the corridor hysteretic, not smooth.
+- **Timeframe upscale switch (`H4->D1`) — same logic, one TF up.** `timeframes.execution`
+  and `timeframes.regime` in `_base.yaml` are now real keys: locked combos
+  `H1->H4` (default, unchanged) and `H4->D1` (new); anything else fails the
+  config check (`monitor.read_timeframes`, used by backtest + panel). Backtest
+  derives both grids from the H1 CSV at 00:00 UTC (`build_htf`, `map_bias`
+  reg_hours, `simulate(bar_hours=)` so M1 checks span the whole 4h bar);
+  combo recorded in params.json. Panel/trader fetch the configured pair from
+  the broker (poll accepts TF attribute names); smoke prints H1/H4/D1 counts.
+- **Bug fix found on the way (live, latent):** `trader.py` hardcoded
+  `TIMEFRAME_H1 = 16397` — not a valid MT5 timeframe (wheel: H1=16385, H4=16388,
+  D1=16408). Live `_gate_check` would fetch garbage/None every bar (masked by
+  dry-run default + mocked tests). Fixed; `_gate_check` now reads the execution
+  TF from config.
+- Tests: 186 passed (was 180; +6: D1 blocks, D1 completed-bar mapping, M1 span
+  on the H4 grid, TF config validation, poll TF name resolution).
+- Gaps (known): report.html chart windows stay H1/H4-shaped; dice_probe and
+  edge_probe are H1/H4-only — the H4->D1 variant has no random-entry null yet.
 - **Monday spreadcheck re-sample + JPY swap recalibration.** London-session
   sample 09:19 UTC with the fixed points-mode math; all three JPY yamls
   re-calibrated (old numbers were ~1.6x too big under the old /100 math —

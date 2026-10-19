@@ -382,7 +382,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-waves", type=int, default=20)
     ap.add_argument("--pct", type=float, default=0.95,
                     help="verdict percentile (pre-declared: 0.95)")
-    ap.add_argument("--reference", default="backtest_results/20261018_173936_prefix")
+    ap.add_argument("--reference", default="backtest_results/20261019_192501")
     ap.add_argument("--real-only", action="store_true",
                     help="parity + target counts only, no dice")
     ap.add_argument("--config-dir", default="configs")

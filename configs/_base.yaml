@@ -7,8 +7,11 @@
 # TIMEFRAMES · when the system runs
 # ────────────────────────────────────────────────────────────────────────
 timeframes:
-  execution: H1          # chart that fires entries and manages open trades
-  regime: H4             # chart that only decides the bias direction
+  execution: H1          # entry bar grid: H1 (default) or H4 (then regime must be D1)
+  regime: H4             # bias chart: H4 (default) or D1 (then execution must be H4)
+                         # the two allowed combos: H1->H4 and H4->D1 ("same logic,
+                         # higher TF"). Backtest derives both grids from the H1 CSV
+                         # (00:00 UTC anchor); live fetches both from the broker.
   position_checks: M1    # stop/TP/trail checked on M1 feed, H1 when M1 missing
 
 # ────────────────────────────────────────────────────────────────────────
@@ -83,7 +86,7 @@ strategy:
   # ════════════════════════════════════════════════════════════════════
   open_trade:
     stop_atr: 1.5           # stop distance at fill (H1 ATR; S1 style)
-    tp_mult: 3.0            # TP distance = tp_mult x the stop distance (R)
+    tp_mult: 2.0            # TP distance = tp_mult x the stop distance (R)
     use_trail: false        # trail the stop behind price (false = initial only)
     trail_r: 1.5            # trail keeps this share of initial risk behind (R)
     use_be: false           # breakeven lift: stop -> entry (+buffer) when armed
@@ -108,6 +111,14 @@ risk:
                               # basically determine how many same direction of trade to pair
                               # like EURUSD and GBPUSD both bet for buy, but not USDCHF for sell
                               # if example is 2
+  scale_lot_with_balance: false  # OFF = fixed sizing like today (1R aims at the scope floor)
+                                 # ON = compounding: 1R aims at balance_risk_pct % of the
+                                 # account balance at entry. Wins grow the lot, drawdown
+                                 # shrinks it — compounding, NOT martingale (no doubling
+                                 # after a loss). The sizing_scope_usd fence still applies:
+                                 # the snapped 1R must land inside low/high, else refused.
+  balance_risk_pct: 3.0          # % of the account balance each trade risks (read only
+                                 # when the switch above is ON; 0 there is a config error)
   sizing_scope_usd:           # every trade's 1R must land inside (USD)
     low: 2.5                  # minimum 1R (USD; 0 = no minimum)
     high: 3.6                 # maximum 1R (USD; 0 = no maximum)
@@ -136,7 +147,7 @@ account:
 # (0 on any limit = that rule off)
 # ────────────────────────────────────────────────────────────────────────
 limits:
-  weekly_loss_r: 5.0          # BACKTEST weekly halt: week's CLOSED R total <= -this (8A; 0 = off)
+  weekly_loss_r: 3.0          # BACKTEST weekly halt: week's CLOSED R total <= -this (8A; 0 = off)
   weekly_loss_pct: 15.0       # LIVE/panel weekly halt: % of week-start equity (live only)
   max_trades_per_day: 20      # portfolio-wide, per day
   max_cost_ratio: 0.10        # round-trip cost < this share of stop distance

@@ -1,13 +1,15 @@
 """Offline backtester on the shared signal core (bias.py + signals.py). No MT5 needed.
 
-Pipeline per pair: load H1 -> build H4 -> bias map -> entry scan (funnel) ->
-sizing/cost/risk -> lifecycle simulation -> metrics. Batch mode loops the
-universe scan file; results land in backtest_results/<local-time>/ with params.json.
+Pipeline per pair: load H1 -> build the two grids (timeframes.execution and
+timeframes.regime: H1->H4 default, or the H4->D1 upscale) -> bias map ->
+entry scan (funnel) -> sizing/cost/risk -> lifecycle simulation -> metrics.
+Batch mode loops the universe scan file; results land in
+backtest_results/<local-time>/ with params.json.
 
-Deviations from live, all documented: H4 blocks anchor at 00:00 UTC (broker
-H4 follows server midnight; user accepted the phase shift for variant-vs-
-variant testing). Spread is the configured assumption (no per-bar field in
-M1 data). Tick specs assume 5/3-digit quotes. Week = UTC.
+Deviations from live, all documented: H4/D1 blocks anchor at 00:00 UTC
+(broker bars follow server midnight; user accepted the phase shift for
+variant-vs-variant testing). Spread is the configured assumption (no
+per-bar field in M1 data). Tick specs assume 5/3-digit quotes. Week = UTC.
 """
 from __future__ import annotations
 
@@ -24,7 +26,7 @@ import pandas as pd
 
 from quant.bias import ATR_PERIOD, EMA_FAST, EMA_SLOW, SEP_MIN_DEFAULT, h4_bias
 from quant.limits import md_in_ranges, parse_no_trade_ranges
-from quant.rules import combine_stop, cost_ok, scope_lots, step_risk as _step_risk
+from quant.rules import combine_stop, cost_ok, scaled_lots, scope_lots, step_risk as _step_risk
 from quant.signals import check_entry
 
 _YAML_COMMENT = re.compile(r"^\s*([A-Za-z_][\w]*)\s*:.*#\s*(.+?)\s*$")
@@ -72,20 +74,26 @@ def load_h1(path: str | Path) -> pd.DataFrame:
     return df
 
 
-def build_h4(h1: pd.DataFrame) -> pd.DataFrame:
-    """Aggregate H1 to 4H blocks anchored at 00:00 UTC (see module docstring)."""
-    h = h1.copy()
-    h["bar"] = h["time"].dt.floor("4h")
+def build_htf(df: pd.DataFrame, hours: int) -> pd.DataFrame:
+    """Aggregate base bars into `hours` blocks anchored at 00:00 UTC (module
+    docstring). H4 = build_htf(h1, 4); D1 = build_htf(h1, 24)."""
+    h = df.copy()
+    h["bar"] = h["time"].dt.floor(f"{hours}h")
     g = h.groupby("bar")
-    h4 = pd.DataFrame({
+    out = pd.DataFrame({
         "time": g["time"].apply(lambda s: s.iloc[0]).values,
         "open": g["open"].first().values,
         "high": g["high"].max().values,
         "low": g["low"].min().values,
         "close": g["close"].last().values,
     })
-    h4["time"] = pd.to_datetime(h4["time"], utc=True)
-    return h4.sort_values("time").reset_index(drop=True)
+    out["time"] = pd.to_datetime(out["time"], utc=True)
+    return out.sort_values("time").reset_index(drop=True)
+
+
+def build_h4(h1: pd.DataFrame) -> pd.DataFrame:
+    """4H blocks — the default regime grid (H4->D1 variant builds via build_htf)."""
+    return build_htf(h1, 4)
 
 
 def _ema(s: pd.Series, period: int) -> pd.Series:
@@ -146,11 +154,13 @@ def bias_frames(h4: pd.DataFrame, p: dict) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["direction", "stacksep", "hr1"])
 
 
-def map_bias(h1: pd.DataFrame, h4: pd.DataFrame, bf: pd.DataFrame) -> pd.DataFrame:
-    """Last fully completed H4 bar per H1 bar (H4 open + 4h <= H1 time)."""
+def map_bias(h1: pd.DataFrame, h4: pd.DataFrame, bf: pd.DataFrame,
+             reg_hours: int = 4) -> pd.DataFrame:
+    """Last fully completed regime bar per execution bar (regime open +
+    reg_hours <= execution time). Default reg_hours=4 reproduces H1->H4."""
     h4t = h4["time"].values.astype("datetime64[s]").astype("int64")
     h1t = h1["time"].values.astype("datetime64[s]").astype("int64")
-    idx = h4t.searchsorted(h1t - 4 * 3600, side="right") - 1
+    idx = h4t.searchsorted(h1t - reg_hours * 3600, side="right") - 1
     out = pd.DataFrame({"direction": "NEUTRAL", "stacksep": False, "hr1": False},
                        index=h1.index)
     ok = idx >= 0
@@ -252,7 +262,8 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
              converters: dict[str, pd.Series] | None = None,
              m1: pd.DataFrame | None = None,
              no_trade_ranges: tuple = (), *,
-             scope_low: float = 0.0, scope_high: float = 0.0
+             scope_low: float = 0.0, scope_high: float = 0.0,
+             bar_hours: int = 1
              ) -> tuple[pd.DataFrame, dict]:
     """Walk candidates in time order; 1 open/pair and 1 entry/day enforced here.
 
@@ -264,7 +275,8 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
     legacy risk_usd target sizing applies. R uses actual risk in either mode.
     jpy carries USDJPY closes for JPY-cross USD conversion (None = unconvertible).
     m1, when given, is the minute feed: stop/target/BE/trail are checked row by
-    row on it (tick-like); an hour with no M1 rows falls back to the H1 row.
+    row on it (tick-like); an execution bar with no M1 rows falls back to that
+    bar's own OHLC row. bar_hours is the execution grid's bar size (H4->D1 = 4).
     no_trade_ranges blocks entries whose fill day falls inside a MM-DD range.
     """
     pip_size = 0.01 if "JPY" in symbol else 0.0001
@@ -356,16 +368,17 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
                 mult = 3.0 if cur_day.weekday() == 3 else 1.0
                 swap += (swap_l if long else swap_s) * (lots / 0.01) * mult
                 day_open = cur_day
-            # Position checks walk the minute feed (tick-like trail); an hour
-            # with no M1 rows falls back to the single H1 row. Inside one row
-            # the rule is unchanged: the row's extreme feeds the trail, stop
-            # wins ties against target, and stop changes take effect next row.
+            # Position checks walk the minute feed (tick-like trail); an
+            # execution bar with no M1 rows falls back to its own OHLC row.
+            # Inside one row the rule is unchanged: the row's extreme feeds
+            # the trail, stop wins ties against target, and stop changes
+            # take effect next row.
             rows = [(None, op, hi, lo, cl)]
             if m1_times is not None:
                 bt = int(h1_secs[b])
-                bt -= bt % 3600  # vendor H1 stamps can be :01 (:00 minute missing); anchor at the hour edge
+                bt -= bt % 3600  # vendor stamps can be :01 (:00 minute missing); anchor at the hour edge
                 i0 = int(np.searchsorted(m1_times, bt, side="left"))
-                i1 = int(np.searchsorted(m1_times, bt + 3600, side="left"))
+                i1 = int(np.searchsorted(m1_times, bt + bar_hours * 3600, side="left"))
                 if i1 > i0:
                     rows = [(m1_times[r], m1_open[r], m1_high[r], m1_low[r], m1_close[r])
                             for r in range(i0, i1)]
@@ -571,32 +584,37 @@ def _load_m1(h1_path: str | Path, symbol: str) -> pd.DataFrame | None:
 
 def run_pair(symbol: str, h1_path: str | Path, p: dict, costs: dict, args,
              converters: dict[str, pd.Series] | None = None) -> dict:
+    # timeframes: H1->H4 default, or the H4->D1 upscale; hours ride on args
+    exec_hours = int(getattr(args, "exec_hours", 1) or 1)
+    reg_hours = int(getattr(args, "reg_hours", 4) or 4)
     h1 = load_h1(h1_path)
-    h4 = build_h4(h1)
-    funnel, cands = scan_pair(h1, h4, symbol, p)
-    mapped = map_bias(h1, h4, bias_frames(h4, p))
+    exec_df = h1 if exec_hours == 1 else build_htf(h1, exec_hours)
+    reg_df = build_htf(h1, reg_hours)   # both grids anchor at 00:00 UTC
+    funnel, cands = scan_pair(exec_df, reg_df, symbol, p)
+    mapped = map_bias(exec_df, reg_df, bias_frames(reg_df, p), reg_hours=reg_hours)
     m1 = None
     if str(getattr(args, "position_checks", "M1")).upper() == "M1":
         m1 = _load_m1(h1_path, symbol)
     ranges = tuple(getattr(args, "no_trade_ranges", ()) or ())
-    trades, extra = simulate(h1, symbol, cands, p, costs, args.risk_usd,
+    trades, extra = simulate(exec_df, symbol, cands, p, costs, args.risk_usd,
                              args.max_cost_ratio,
                              bias_flip_exit=bool(p.get("bias_flip_exit", False)),
                              weekend_flat=bool(p.get("weekend_flat", False)),
                              mapped=mapped, lot=args.lot, converters=converters,
                              m1=m1, no_trade_ranges=ranges,
                              scope_low=getattr(args, "scope_low", 0.0),
-                             scope_high=getattr(args, "scope_high", 0.0))
+                             scope_high=getattr(args, "scope_high", 0.0),
+                             bar_hours=exec_hours)
     funnel["sized"] = extra["sized"]
     funnel["window"] = extra.get("window", 0)
     for key in ("open", "day", "tick", "scope", "cost", "lot"):
         funnel[key] = extra.get(key, 0)  # every named gate lands in funnel.csv
     funnel["taken"] = len(trades)
     days = (h1["time"].iloc[-1] - h1["time"].iloc[0]).days
-    m = metrics(trades, days, len(h1))
+    m = metrics(trades, days, len(exec_df))
     m["symbol"] = symbol
     m["signals"] = len(cands)
-    return {"funnel": funnel, "trades": trades, "metrics": m, "n_bars": len(h1),
+    return {"funnel": funnel, "trades": trades, "metrics": m, "n_bars": len(exec_df),
             "span_days": days,
             "span": (str(h1["time"].iloc[0]), str(h1["time"].iloc[-1]))}
 
@@ -749,14 +767,10 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
             cands.append((sym, int(idx), str(t["entry_time"]), str(t["exit_time"]),
                           str(t.get("direction", "")), float(t["pnl_R"])))
     # one event per trade: exits (0) sort before entries (1) at equal timestamps
-    def _ts(s: str) -> pd.Timestamp:
-        v = pd.Timestamp(s)
-        return v.tz_localize("UTC") if v.tzinfo is None else v
-
     evs = []
     for sym, idx, tin, tout, direction, pnl_r in cands:
-        evs.append((_ts(tin), 1, sym, idx, direction, pnl_r))
-        evs.append((_ts(tout), 0, sym, idx, direction, pnl_r))
+        evs.append((_ts_utc(tin), 1, sym, idx, direction, pnl_r))
+        evs.append((_ts_utc(tout), 0, sym, idx, direction, pnl_r))
     evs.sort(key=lambda e: (e[0], e[1], e[2], e[3]))
 
     active: dict = {}          # (sym, idx) -> direction
@@ -814,6 +828,81 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
         ids = kept.get(sym, [])
         out_frames[sym] = df[df.index.isin(ids)].reset_index(drop=True) if ids else df.iloc[0:0]
     return out_frames, dropped
+
+
+def _ts_utc(s: str) -> pd.Timestamp:
+    v = pd.Timestamp(s)
+    return v.tz_localize("UTC") if v.tzinfo is None else v
+
+
+def scale_lots_to_balance(trades_by_sym: dict[str, pd.DataFrame],
+                          pct: float, scope_low: float, scope_high: float,
+                          start_balance: float
+                          ) -> tuple[dict[str, pd.DataFrame], list[dict]]:
+    """Account-global lot scaling (risk.scale_lot_with_balance ON).
+
+    One forward walk over ALL pairs by timestamp: exits book before entries at
+    the same stamp; the balance starts at the account seed and changes only on
+    closed trades (realized). Each entry re-aims its 1R at pct% of that
+    balance through rules.scaled_lots (0.01 snapping + the SAME scope fence).
+    Every kept trade keeps its pnl_R exactly (R is lot-invariant); the USD
+    fields scale with the lot: pnl_usd = pnl_R x new 1R, swap x lot ratio
+    (commission is already inside pnl_usd, so it scales with it).
+    A trade's own per-0.01 risk is recovered from pnl/pnl_R when informative
+    (|pnl_R| >= 0.05), else inherited from the symbol's previous trade
+    (scratch rows); with nothing to inherit the row is left unscaled.
+    Returns (frames by symbol, dropped records like the portfolio pass).
+    """
+    out: dict[str, pd.DataFrame] = {s: df.copy() for s, df in trades_by_sym.items()}
+    evs = []
+    for sym, df in out.items():
+        if not len(df):
+            continue
+        for idx, t in df.iterrows():
+            evs.append((_ts_utc(str(t["entry_time"])), 1, sym, int(idx)))
+            evs.append((_ts_utc(str(t["exit_time"])), 0, sym, int(idx)))
+    evs.sort(key=lambda e: (e[0], e[1], e[2], e[3]))
+
+    balance = float(start_balance)
+    step_last: dict[str, float] = {}
+    dropped: list[dict] = []
+    unscaled = 0
+    for ts, kind, sym, idx in evs:  # noqa: F841 (ts read via ordering only)
+        if kind == 0:  # exit: book realized, deal-time like the weekly halt
+            if idx in out[sym].index:  # an entry refused mid-walk has no exit row
+                balance += float(out[sym].at[idx, "pnl_usd"])
+            continue
+        lot_old = float(out[sym].at[idx, "lot"])
+        pnl_r = float(out[sym].at[idx, "pnl_R"])
+        if lot_old <= 0:
+            continue
+        step0 = None
+        if abs(pnl_r) >= 0.05:
+            step0 = abs(float(out[sym].at[idx, "pnl_usd"]) / pnl_r) / (lot_old / 0.01)
+            if step0 <= 0:
+                step0 = None
+        if step0 is None:
+            step0 = step_last.get(sym)
+        if step0 is not None:
+            step_last[sym] = step0
+        else:  # no sizing info anywhere: leave the row as the engine sized it
+            unscaled += 1
+            continue
+        aim = pct / 100.0 * balance
+        lots_new, risk_new, why = scaled_lots(step0, aim, scope_low, scope_high)
+        if why is not None:
+            dropped.append({"symbol": sym, "entry_time": str(out[sym].at[idx, "entry_time"])[:16],
+                            "reason": f"scale-{why}"})
+            out[sym] = out[sym].drop(index=idx)
+            continue
+        factor = lots_new / lot_old
+        out[sym].at[idx, "lot"] = lots_new
+        out[sym].at[idx, "pnl_usd"] = round(pnl_r * risk_new, 2)
+        out[sym].at[idx, "swap"] = round(float(out[sym].at[idx, "swap"]) * factor, 2)
+    if unscaled:
+        print(f"scale pass: {unscaled} trade(s) left unscaled (no 0.01-risk info)",
+              flush=True)
+    return out, dropped
 
 
 def apply_daily_cap(trades_by_sym: dict[str, pd.DataFrame],
@@ -881,6 +970,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="override risk.sizing_scope_usd.low from _base.yaml")
     ap.add_argument("--scope-high", type=float, default=None,
                     help="override risk.sizing_scope_usd.high from _base.yaml")
+    ap.add_argument("--scale-lots", action="store_true",
+                    help="force risk.scale_lot_with_balance ON (compounding sizing)")
+    ap.add_argument("--balance-risk-pct", type=float, default=None,
+                    help="override risk.balance_risk_pct (%% of balance per trade when scaling)")
     ap.add_argument("--max-cost-ratio", type=float, default=None,
                     help="override limits.max_cost_ratio from _base.yaml")
     ap.add_argument("--max-total-positions", type=int, default=None,
@@ -901,7 +994,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.jobs < 0:
         ap.error("--jobs must be >= 0")
 
-    from quant.monitor import flatten_strategy, load_pairs, read_selection
+    from quant.monitor import (TF_HOURS, flatten_strategy, load_pairs,
+                               read_selection, read_timeframes)
 
     with open(Path(args.config_dir) / "_base.yaml", encoding="utf-8") as fh:
         base = yaml.safe_load(fh) or {}
@@ -928,6 +1022,16 @@ def main(argv: list[str] | None = None) -> int:
         args.scope_low = float(scope.get("low", 0.0) or 0.0)
     if args.scope_high is None:
         args.scope_high = float(scope.get("high", 0.0) or 0.0)
+    # scaled sizing: aim = balance_risk_pct % of the account balance; CLI forces ON
+    risk_all = dict(base.get("risk") or {})
+    if args.balance_risk_pct is None:
+        args.balance_risk_pct = float(risk_all.get("balance_risk_pct") or 0.0)
+    if bool(risk_all.get("scale_lot_with_balance") or False):
+        args.scale_lots = True
+    if args.scale_lots and args.balance_risk_pct <= 0:
+        print("config error: scale_lot_with_balance needs risk.balance_risk_pct > 0",
+              flush=True)
+        return 2
     try:
         args.no_trade_ranges = tuple(parse_no_trade_ranges(base))
     except ValueError as exc:
@@ -936,6 +1040,15 @@ def main(argv: list[str] | None = None) -> int:
     # Stop/target/BE/trail checks read the minute feed when the config says M1.
     args.position_checks = str((base.get("timeframes") or {}).get(
         "position_checks", "M1")).upper()
+    # timeframes: locked combos only (H1->H4 default, H4->D1 upscale); both
+    # grids derive from the same H1 CSV, anchored at 00:00 UTC
+    try:
+        args.exec_tf, args.reg_tf = read_timeframes(args.config_dir)
+    except ValueError as exc:
+        print(f"config error: {exc}", flush=True)
+        return 2
+    args.exec_hours = TF_HOURS[args.exec_tf]
+    args.reg_hours = TF_HOURS[args.reg_tf]
     if args.bias_flip_exit:
         strat["bias_flip_exit"] = True  # CLI flag forces on; config holds the default
     if args.weekend_flat:
@@ -1023,10 +1136,13 @@ def main(argv: list[str] | None = None) -> int:
         "strategy": strat, "costs": costs, "risk_usd": args.risk_usd,
         "max_cost_ratio": args.max_cost_ratio,
         "sizing_scope_usd": {"low": args.scope_low, "high": args.scope_high},
+        "scale_lot_with_balance": bool(args.scale_lots),
+        "balance_risk_pct": float(args.balance_risk_pct),
         "lot": args.lot,
         "max_trades_per_day": max_day, "workers": workers,
         "no_trade_ranges": args.no_trade_ranges,
         "position_checks": args.position_checks,
+        "timeframes": {"execution": args.exec_tf, "regime": args.reg_tf},
         "benchmarks": bench,
         "pair_costs": pair_costs_recorded,
         "jobs": [[s, str(path)] for s, path, _ in jobs]}
@@ -1089,6 +1205,37 @@ def main(argv: list[str] | None = None) -> int:
         params["failed"] = failures
         params["daily_cap_dropped"] = dropped
         params_path.write_text(json.dumps(params, indent=1), encoding="utf-8")
+
+    # scaled sizing pass (risk.scale_lot_with_balance ON): re-lot everything
+    # from the account equity timeline AFTER the daily cap + portfolio rules,
+    # so sizing sees only the trades that actually happened
+    if args.scale_lots and results:
+        kept_sc, sc_dropped = scale_lots_to_balance(
+            {s: r["trades"] for s, r in results.items()},
+            args.balance_risk_pct, args.scope_low, args.scope_high,
+            float(bench.get("account_usd") or 0) or 100.0)
+        params["scale_dropped"] = sc_dropped
+        changed_sc = sorted({s for s in results
+                             if len(kept_sc[s]) != len(results[s]["trades"])})
+        for sym in sorted(results):
+            res = results[sym]
+            res["trades"] = kept_sc[sym]
+            m = metrics(kept_sc[sym], res["span_days"], res["n_bars"])
+            m["symbol"], m["signals"] = sym, res["metrics"]["signals"]
+            res["metrics"] = m
+            res["funnel"]["taken"] = len(kept_sc[sym])
+        params_path.write_text(json.dumps(params, indent=1), encoding="utf-8")
+        if sc_dropped:
+            reasons: dict[str, int] = {}
+            for d in sc_dropped:
+                reasons[d["reason"]] = reasons.get(d["reason"], 0) + 1
+            print(f"scale pass: {args.balance_risk_pct:g}%/trade of balance - dropped "
+                  f"{len(sc_dropped)} entries "
+                  f"({', '.join(f'{k}={v}' for k, v in sorted(reasons.items()))}); "
+                  f"affected pairs: {', '.join(changed_sc)}", flush=True)
+        else:
+            print(f"scale pass: {args.balance_risk_pct:g}%/trade of balance - "
+                  f"no entries dropped", flush=True)
 
     # MTM account curve: hourly equity over open + closed positions, TOTAL only
     curve = None

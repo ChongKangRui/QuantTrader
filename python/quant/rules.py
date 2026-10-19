@@ -6,6 +6,8 @@ drift from what the backtest assumed. No MT5, no files — pure functions.
 """
 from __future__ import annotations
 
+import math
+
 
 def step_risk(stop_dist: float, tick_size: float, tick_value: float) -> float:
     """Money at risk for one trade at 0.01 lot (account currency)."""
@@ -61,6 +63,30 @@ def scope_lots(step_risk_usd: float, scope_low: float, scope_high: float,
     if lots < 0.01:
         return 0.0, 0.0, "lot"
     return lots, step_risk_usd * lots / 0.01, None
+
+
+def scaled_lots(step_risk_usd: float, aim_usd: float, scope_low: float,
+                scope_high: float) -> tuple[float, float, str | None]:
+    """Compounding sizing (lot_scale). aim_usd = pct x account balance.
+
+    Same 0.01 snapping and the SAME scope fence as scope_lots, but the aim
+    follows the balance instead of sitting on the fence floor: snap UP to the
+    smallest 0.01 step reaching the aim, then refuse when the snapped 1R
+    falls outside [scope_low, scope_high] (0 disables a fence side).
+    reason: None sized; 'high'/'low' fence breach; 'empty' = nothing to aim
+    with (aim <= 0, i.e. the account is gone). Compounding only grows/shrinks
+    with the account — never doubles after a loss (not martingale).
+    """
+    if step_risk_usd <= 0 or aim_usd <= 0:
+        return 0.0, 0.0, "empty"
+    # ceil(aim/step), rounded first: 9.000000000000002 must stay 9 steps
+    n = max(1, math.ceil(round(aim_usd / step_risk_usd, 9)))
+    risk = step_risk_usd * n
+    if scope_high > 0 and risk > scope_high + 1e-9:
+        return 0.0, 0.0, "high"
+    if scope_low > 0 and risk < scope_low - 1e-9:
+        return 0.0, 0.0, "low"
+    return float(n) * 0.01, risk, None
 
 
 def target_dist(stop_dist: float, tp_mult: float) -> float:

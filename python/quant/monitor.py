@@ -1,17 +1,19 @@
-"""H4 bias console + optional trading supervisor.
+"""Regime-bias console + optional trading supervisor.
 
 Default (no --trade): read-only, sends no orders.
-`--trade` adds a trading loop on top of the panel: entries on closed H1 bars,
-position adoption, portfolio caps, weekly halt, trail/BE. Dry-run is the
-default state of that loop (plans + journal rows, nothing sent); real orders
-require `--no-dry-run` AND exactly one enabled account AND only the user
-launches it.
+`--trade` adds a trading loop on top of the panel: entries on closed
+`timeframes.execution` bars, position adoption, portfolio caps, weekly halt,
+trail/BE. Dry-run is the default state of that loop (plans + journal rows,
+nothing sent); real orders require `--no-dry-run` AND exactly one enabled
+account AND only the user launches it.
 
-Repaint rule: the screen only redraws when a new H1 bar closes. All bars are
-closed bars fetched via copy_rates_from_pos(..., start_pos=1); the H4 bias uses
-the last fully completed H4 bar. Empty state: NONE DETECTED when no pair holds
-UP/DOWN H4 bias. ENTRY column shows GO or the first failing section-5 rule.
-Each cycle also syncs closed positions and the weekly loss halt per account.
+Repaint rule: the screen only redraws when a new execution-timeframe bar
+closes. All bars are closed bars fetched via copy_rates_from_pos(...,
+start_pos=1); the bias uses the last fully completed `timeframes.regime` bar
+(allowed pairs: H1->H4, H4->D1). Empty state: NONE DETECTED when no pair
+holds UP/DOWN bias. ENTRY column shows GO or the first failing section-5
+rule. Each cycle also syncs closed positions and the weekly loss halt per
+account.
 """
 from __future__ import annotations
 
@@ -108,6 +110,36 @@ def read_limits(config_dir: str | Path) -> float:
         return 15.0
 
 
+# timeframes.execution / timeframes.regime -> bar hours; locked combos only
+TF_HOURS = {"H1": 1, "H4": 4, "D1": 24}
+TF_COMBOS = ((1, 4), (4, 24))  # H1->H4 default, H4->D1 upscale
+
+
+def read_timeframes(config_dir: str | Path) -> tuple[str, str]:
+    """(execution, regime) names from _base.yaml timeframes. Defaults H1/H4.
+
+    Raises ValueError on an unknown or un-locked combo so every entry point
+    (backtest, panel, trader) fails loud instead of silently resampling.
+    """
+    import yaml
+
+    try:
+        cfg = yaml.safe_load(_read_yaml_text(Path(config_dir) / "_base.yaml")) or {}
+    except Exception:
+        cfg = {}
+    tf = dict(cfg.get("timeframes") or {})
+    exec_tf = str(tf.get("execution") or "H1").upper()
+    reg_tf = str(tf.get("regime") or "H4").upper()
+    eh, rh = TF_HOURS.get(exec_tf), TF_HOURS.get(reg_tf)
+    if eh is None or rh is None:
+        raise ValueError(f"timeframes: unknown TF in execution={exec_tf} "
+                         f"regime={reg_tf} (known: {sorted(TF_HOURS)})")
+    if (eh, rh) not in TF_COMBOS:
+        raise ValueError(f"timeframes: unsupported combo {exec_tf}->{reg_tf} "
+                         f"(allowed: H1->H4 or H4->D1)")
+    return exec_tf, reg_tf
+
+
 def read_trade_cfg(config_dir: str | Path) -> dict:
     """`--trade` knobs: the SAME _base.yaml keys the backtest engine reads.
 
@@ -138,6 +170,8 @@ def read_trade_cfg(config_dir: str | Path) -> dict:
         "dry_run_default": bool(live.get("dry_run_default", True)),
         "max_total_positions": int(risk.get("max_total_positions", 0) or 0),
         "max_ccy_net": int(risk.get("max_ccy_net", 0) or 0),
+        "scale_lot_with_balance": _as_bool(risk.get("scale_lot_with_balance"), False),
+        "balance_risk_pct": float(risk.get("balance_risk_pct", 3.0) or 0.0),
         "max_trades_per_day": int(lim.get("max_trades_per_day", 0) or 0),
         "max_cost_ratio": float(lim.get("max_cost_ratio", 0.10) or 0.0),
         "scope_low": float(scope.get("low", 0.0) or 0.0),
@@ -237,8 +271,13 @@ def _utc(ts: int) -> str:
 
 
 def poll(mt5, pairs: list[dict], h4_bars: int = H4_BARS,
-         h1_bars: int = H1_BARS) -> tuple[list[PairRow], dict]:
-    """Fetch closed bars per pair. Returns (rows, {symbol: last_closed_H1_time})."""
+         h1_bars: int = H1_BARS, exec_tf: str = "TIMEFRAME_H1",
+         reg_tf: str = "TIMEFRAME_H4") -> tuple[list[PairRow], dict]:
+    """Fetch closed bars per pair. Returns (rows, {symbol: last_closed_exec_time}).
+
+    exec_tf/reg_tf are mt5 module ATTRIBUTE NAMES (resolved via getattr so
+    mock mt5 doubles keep their own fake constants).
+    """
     rows: list[PairRow] = []
     times: dict[str, int] = {}
     for p in pairs:
@@ -252,8 +291,8 @@ def poll(mt5, pairs: list[dict], h4_bars: int = H4_BARS,
                 rows.append(PairRow(symbol=symbol, ok=False, note="symbol not found"))
                 continue
             mt5.symbol_select(broker, True)
-            h1 = mt5.copy_rates_from_pos(broker, mt5.TIMEFRAME_H1, 1, h1_bars)
-            h4 = mt5.copy_rates_from_pos(broker, mt5.TIMEFRAME_H4, 1, h4_bars)
+            h1 = mt5.copy_rates_from_pos(broker, getattr(mt5, exec_tf), 1, h1_bars)
+            h4 = mt5.copy_rates_from_pos(broker, getattr(mt5, reg_tf), 1, h4_bars)
             if h1 is None or len(h1) == 0 or h4 is None or len(h4) == 0:
                 rows.append(PairRow(symbol=symbol, ok=False, note="no closed-bar data"))
                 continue
@@ -284,12 +323,13 @@ def poll(mt5, pairs: list[dict], h4_bars: int = H4_BARS,
 
 def render_panel(rows: list[PairRow], local_time: str, broker_time: str,
                  account: str, mode: str = "B1", weeks: dict | None = None,
-                 loss_pct: float = 15.0, banner: str | None = None) -> str:
+                 loss_pct: float = 15.0, banner: str | None = None,
+                 regime: str = "H4", exec_tf: str = "H1") -> str:
     lines = [
-        f"QuantTrader H4 bias panel (H4 {mode}, bias only)",
+        f"QuantTrader {regime} bias panel ({regime} {mode}, bias only)",
         f"local time : {local_time} (Malaysia, UTC+8)",
-        f"broker time: {broker_time} (last H1 close, UTC)",
-        f"account={account}  rule=repaint-on-new-H1-close-only",
+        f"broker time: {broker_time} (last {exec_tf} close, UTC)",
+        f"account={account}  rule=repaint-on-new-{exec_tf}-close-only",
     ]
     if banner:
         lines.append(banner)
@@ -416,7 +456,9 @@ def _cycle(mt5, accounts, pairs, args, conditions: dict[str, str],
                 print(f"DATA ERROR - {atag} initialize failed: {mt5.last_error()}", flush=True)
                 continue
             try:
-                rows, times = poll(mt5, pairs, args.bars)
+                rows, times = poll(mt5, pairs, args.bars,
+                                   exec_tf=getattr(args, "exec_tf", "TIMEFRAME_H1"),
+                                   reg_tf=getattr(args, "reg_tf", "TIMEFRAME_H4"))
                 now = datetime.now(timezone.utc)
                 deals = mt5.history_deals_get(now - timedelta(days=365), now) or ()
                 try:
@@ -451,7 +493,7 @@ def _cycle(mt5, accounts, pairs, args, conditions: dict[str, str],
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
-        description="H4 bias console panel; add --trade for the trading loop (dry-run default).")
+        description="Regime-bias console panel; add --trade for the trading loop (dry-run default).")
     ap.add_argument("--config-dir", default="configs")
     ap.add_argument("--journal", default=JOURNAL_DEFAULT)
     ap.add_argument("--records-dir", default=RECORDS_DEFAULT)
@@ -484,6 +526,12 @@ def main(argv: list[str] | None = None) -> int:
         print(f"DATA ERROR - no pair configs found in {args.config_dir}", flush=True)
         return 1
     loss_pct = read_limits(args.config_dir)
+    # timeframes: locked combos only; every fetch/gate below reads these
+    try:
+        args.exec_tf, args.reg_tf = read_timeframes(args.config_dir)
+    except ValueError as exc:
+        print(f"config error: {exc}", flush=True)
+        return 2
 
     from quant.journal import ensure_header
 
@@ -530,8 +578,11 @@ def main(argv: list[str] | None = None) -> int:
                 "max_ccy_net": tradecfg["max_ccy_net"],
                 "max_trades_per_day": tradecfg["max_trades_per_day"],
                 "max_cost_ratio": tradecfg["max_cost_ratio"],
+                "scale_lot_with_balance": tradecfg["scale_lot_with_balance"],
+                "balance_risk_pct": tradecfg["balance_risk_pct"],
                 "scope_low": tradecfg["scope_low"],
                 "scope_high": tradecfg["scope_high"],
+                "exec_tf": args.exec_tf,  # execution TF name for _gate_check
             },
         }
         banner = (f"TRADER: ON ({'DRY-RUN - plans only, nothing sent' if dry
@@ -549,7 +600,8 @@ def main(argv: list[str] | None = None) -> int:
                                         tcfg)
             broker = _utc(max(times.values())) if times else "-"
             print(render_panel(rows, local_now(), broker, tag, _mode(pairs),
-                               weeks, loss_pct, banner), flush=True)
+                               weeks, loss_pct, banner,
+                               regime=args.reg_tf, exec_tf=args.exec_tf), flush=True)
             if banner:
                 print(banner, flush=True)
             return 0
@@ -563,7 +615,8 @@ def main(argv: list[str] | None = None) -> int:
                 _clear()
                 broker = _utc(max(times.values())) if times else "-"
                 print(render_panel(rows, local_now(), broker, tag, _mode(pairs),
-                                   weeks, loss_pct, banner), flush=True)
+                                   weeks, loss_pct, banner,
+                                   regime=args.reg_tf, exec_tf=args.exec_tf), flush=True)
                 last = dict(times)
                 first = False
             time.sleep(args.interval)

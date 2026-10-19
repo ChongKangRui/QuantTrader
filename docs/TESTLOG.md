@@ -13,8 +13,7 @@ Full numbers live in each `backtest_results/<run-id>/` (params.json is the truth
 
 Question: do the entry rules beat dice, or does the reference result sit inside dice luck?
 
-- Reference (pinned): `20261018_173936_prefix` (renamed 2026-10-19 to label it
-  pre-fix — originally `20261018_173936`, identical to 174249/174651) — batch, **no cost flags** (params.json: slippage 0, per-pair spreads+swaps, scope 2.5–3.6, max_total_positions **5**, ccy net 2, weekly halt 15%, M1 checks, cap 20/day). Reference figures: 2064 trades, −54.84 USD, −0.013R pooled. **This pin is stale until the post-fix batch re-run replaces it** (dice parity intentionally fails against it now).
+- Reference (pinned): `20261019_192501` (post-fix, 2026-10-19) — batch, **no cost flags** (params.json: slippage 0, per-pair spreads+swaps, scope 2.5–3.6, max_total_positions **5**, ccy net 2, weekly halt **5R closed** (R-based, was 15%), M1 checks, cap 20/day). Reference figures: 4509 trades, −577.99 USD, **−0.043R pooled**. The pre-fix pin `20261018_173936_prefix` (2064 trades, −0.013R) is superseded — all D1 dice verdicts against it are provisional until the re-run lands.
 - Everything of the system stays (exits, costs, sizing scope, caps, windows, M1 checks); only the entry moment is dice.
 - **D1-A** = random bar + random direction (placebo, machinery sanity — never verdict material). **D1-B** = random bar among bias-ON H1 bars, direction = the mapped H4 bias (tests entry timing only).
 - Target counts per pair = the **pre-cap, pre-portfolio-pass recorded trade counts of the `--real` parity run** (not funnel `sized`, which counts trades that start and never record the one open at data end).
