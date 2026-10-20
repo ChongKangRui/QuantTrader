@@ -173,10 +173,12 @@ def _run_config(run_dir: Path) -> dict:
             cfg["exec"] = str(tf.get("execution") or "H1").upper()
             cfg["reg"] = str(tf.get("regime") or "H4").upper()
             st = pp.get("strategy") or {}
-            cfg["entry"]["fast"] = int(st.get("h1_ema_fast", st.get("ema_fast")) or 20)
-            cfg["entry"]["slow"] = int(st.get("h1_ema_slow", st.get("ema_slow")) or 50)
-            cfg["regime"]["fast"] = int(st.get("h4_ema_fast") or 20)
-            cfg["regime"]["slow"] = int(st.get("h4_ema_slow") or 50)
+            cfg["entry"]["fast"] = int(st.get(
+                "entry_ema_fast_period", st.get("h1_ema_fast", st.get("ema_fast"))) or 20)
+            cfg["entry"]["slow"] = int(st.get(
+                "entry_ema_slow_period", st.get("h1_ema_slow", st.get("ema_slow"))) or 50)
+            cfg["regime"]["fast"] = int(st.get("bias_ema_fast_period", st.get("h4_ema_fast")) or 20)
+            cfg["regime"]["slow"] = int(st.get("bias_ema_slow_period", st.get("h4_ema_slow")) or 50)
         except Exception:
             pass  # broken params: keep chart defaults rather than fail the report
     return cfg

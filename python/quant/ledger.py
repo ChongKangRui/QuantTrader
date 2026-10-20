@@ -28,7 +28,8 @@ COLUMNS = (
     + _GATES
     + ("h1_ema_fast", "h1_ema_slow", "h4_ema_fast", "h4_ema_slow", "h4_atr_n",
        "atr_n", "warmup_bars", "lookback", "sep_atr", "stop_atr", "tp_mult",
-       "sizing_scope", "fixed_lot",
+        "sizing_scope", "fixed_lot", "widen_stop", "stop_lot", "stop_max_atr",
+        "increase_lots_if_widening_fails", "default_lot",
        "trades", "win_pct", "profit_factor", "expect_R", "verdict",
        "net_pnl_usd", "net_R", "max_dd_closed_usd", "max_dd_closed_pct",
        "max_dd_mtm_usd", "max_dd_mtm_pct",
@@ -73,11 +74,14 @@ def _row_for_run(run_dir: Path) -> dict | None:
 
     for g in _GATES:  # gates: Y or blank (never false)
         row[g] = "Y" if st.get(g) else ""
-    # H1 periods fall back to the pre-rename key names; H4 keys are new
-    row["h1_ema_fast"] = _s(st.get("h1_ema_fast", st.get("ema_fast")))
-    row["h1_ema_slow"] = _s(st.get("h1_ema_slow", st.get("ema_slow")))
-    for k in ("h4_ema_fast", "h4_ema_slow", "h4_atr_n", "atr_n", "warmup_bars",
-              "stop_atr", "tp_mult"):
+    # Keep historical CSV column names so appending to an existing ledger is safe.
+    row["h1_ema_fast"] = _s(st.get("entry_ema_fast_period", st.get("h1_ema_fast", st.get("ema_fast"))))
+    row["h1_ema_slow"] = _s(st.get("entry_ema_slow_period", st.get("h1_ema_slow", st.get("ema_slow"))))
+    row["h4_ema_fast"] = _s(st.get("bias_ema_fast_period", st.get("h4_ema_fast")))
+    row["h4_ema_slow"] = _s(st.get("bias_ema_slow_period", st.get("h4_ema_slow")))
+    row["h4_atr_n"] = _s(st.get("bias_atr_period", st.get("h4_atr_n")))
+    row["atr_n"] = _s(st.get("entry_atr_period", st.get("atr_n")))
+    for k in ("warmup_bars", "stop_atr", "tp_mult"):
         row[k] = _s(st.get(k))
     for gate, cols in _LINKED.items():
         if st.get(gate):
@@ -87,6 +91,14 @@ def _row_for_run(run_dir: Path) -> dict | None:
     if scope.get("low") is not None:
         row["sizing_scope"] = f"{_s(scope.get('low'))}-{_s(scope.get('high'))}"
     row["fixed_lot"] = _s(params.get("lot"))
+    row["default_lot"] = _s(params.get("default_lot"))
+    # stop sizing: the widened-stop branch (fixed lot instead of more lots)
+    stop_sizing = params.get("stop_sizing") or {}
+    row["widen_stop"] = "Y" if stop_sizing.get("widen_stop_to_scope") else ""
+    row["stop_lot"] = _s(stop_sizing.get("fixed_lot")) if row["widen_stop"] else ""
+    row["stop_max_atr"] = _s(stop_sizing.get("max_stop_atr")) if row["widen_stop"] else ""
+    row["increase_lots_if_widening_fails"] = (
+        "Y" if row["widen_stop"] and stop_sizing.get("increase_lots_if_widening_fails") else "")
 
     tot = summary[summary["symbol"] == "TOTAL"]  # one row per run = portfolio row
     if len(tot):

@@ -47,6 +47,19 @@ def _setup(**over) -> dict:
     return s
 
 
+def test_dice_passes_the_same_base_to_shared_simulation(monkeypatch):
+    setup = _setup(default_lot=0.02)
+    monkeypatch.setattr(dp, "_STATE", {"setup": setup})
+    captured = {}
+    def fake_simulate(*args, **kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame(), {}
+    monkeypatch.setattr(dp, "simulate", fake_simulate)
+    dp._simulate({"h1": _h1(), "symbol": "EURUSD", "costs": _zero_costs(),
+                  "mapped": None, "m1": None}, [])
+    assert captured["default_lot"] == 0.02
+
+
 def test_eligible_bars_variants():
     n = 800
     env = {"symbol": "EURUSD", "h1": _h1(n), "mapped": _mapped(n), "t0": 400,

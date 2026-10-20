@@ -26,7 +26,8 @@ from pathlib import Path
 
 import pandas as pd
 
-from quant.bias import ATR_PERIOD, EMA_FAST, EMA_SLOW, SEP_MIN_DEFAULT, h4_bias
+from quant.bias import SEP_MIN_DEFAULT, bias_periods, h4_bias
+from quant.rules import read_sizing, stop_sizing_conflict
 from quant.signals import check_entry
 
 JOURNAL_DEFAULT = "trades/journal.csv"
@@ -144,9 +145,9 @@ def read_trade_cfg(config_dir: str | Path) -> dict:
     """`--trade` knobs: the SAME _base.yaml keys the backtest engine reads.
 
     paths: live.magic/dry_run_default, risk.max_total_positions/max_ccy_net,
-    risk.sizing_scope_usd.low/high, limits.max_trades_per_day/max_cost_ratio,
-    limits.no_trade_ranges, costs (per-pair overrides merge on top later).
-    Missing file/keys fall back to the engine's defaults; 0 = off.
+    risk.sizing_scope_usd.low/high, risk.stop_sizing, limits.max_trades_per_day/
+    max_cost_ratio, limits.no_trade_ranges, costs (per-pair overrides merge on
+    top later). Missing file/keys fall back to the engine's defaults; 0 = off.
     """
     import yaml
 
@@ -161,6 +162,7 @@ def read_trade_cfg(config_dir: str | Path) -> dict:
     lim = dict(cfg.get("limits") or {})
     scope = dict(risk.get("sizing_scope_usd") or {})
     live = dict(cfg.get("live") or {})
+    default_lot, stop_sizing = read_sizing(risk)
     try:
         ranges = tuple(parse_no_trade_ranges(cfg))
     except ValueError:
@@ -176,6 +178,8 @@ def read_trade_cfg(config_dir: str | Path) -> dict:
         "max_cost_ratio": float(lim.get("max_cost_ratio", 0.10) or 0.0),
         "scope_low": float(scope.get("low", 0.0) or 0.0),
         "scope_high": float(scope.get("high", 0.0) or 0.0),
+        "stop_sizing": stop_sizing,
+        "default_lot": default_lot,
         "costs": dict(cfg.get("costs") or {}),
         "ranges": ranges,
     }
@@ -303,11 +307,10 @@ def poll(mt5, pairs: list[dict], h4_bars: int = H4_BARS,
             warmup = int(params.get("warmup_bars", 300))
             # bias periods come from the same flat params the backtest uses;
             # defaults mirror the locked B1 constants, never re-tuned here
+            bias_fast, bias_slow, bias_atr = bias_periods(params)
             b = h4_bias(h4df, p.get("sep", SEP_MIN_DEFAULT), p.get("hr1", "a"),
-                        p.get("use_atr_sep", True), min_bars=warmup,
-                        ema_fast=int(params.get("h4_ema_fast") or EMA_FAST),
-                        ema_slow=int(params.get("h4_ema_slow") or EMA_SLOW),
-                        atr_n=int(params.get("h4_atr_n") or ATR_PERIOD))
+                         p.get("use_atr_sep", True), min_bars=warmup,
+                         ema_fast=bias_fast, ema_slow=bias_slow, atr_n=bias_atr)
             bias = DISP[b.direction]
             entry = "-"
             if bias in ("UP", "DOWN"):
@@ -565,10 +568,20 @@ def main(argv: list[str] | None = None) -> int:
                   "(USE_DEMO / USE_REAL). Refusing to trade.", flush=True)
             return 2
         atag = "REAL" if accounts[0].live else "DEMO"
-        tradecfg = read_trade_cfg(args.config_dir)
+        try:
+            tradecfg = read_trade_cfg(args.config_dir)
+        except (TypeError, ValueError) as exc:
+            print(f"DATA ERROR - {exc}. Refusing to trade.", flush=True)
+            return 2
         magic = args.magic if args.magic is not None else tradecfg["magic"]
         dry = tradecfg["dry_run_default"] if args.dry_run is None else args.dry_run
         args.magic = magic  # records sync + weekly halt must see the same magic
+        # percent sizing and a fixed lot cannot run together
+        stop_sizing = dict(tradecfg["stop_sizing"] or {})
+        conflict = stop_sizing_conflict(stop_sizing, tradecfg["scale_lot_with_balance"])
+        if conflict:
+            print(f"DATA ERROR - {conflict}. Refusing to trade.", flush=True)
+            return 2
         tcfg = {
             "magic": magic, "dry": dry, "journal": args.journal,
             "mem_path": Path(args.memory_dir) / f"live_{atag.lower()}.json",
@@ -582,6 +595,8 @@ def main(argv: list[str] | None = None) -> int:
                 "balance_risk_pct": tradecfg["balance_risk_pct"],
                 "scope_low": tradecfg["scope_low"],
                 "scope_high": tradecfg["scope_high"],
+                 "stop_sizing": stop_sizing,
+                 "default_lot": tradecfg["default_lot"],
                 "exec_tf": args.exec_tf,  # execution TF name for _gate_check
             },
         }

@@ -140,6 +140,20 @@ def test_ema_periods_follow_params(tmp_path):
         and ctx["reg"]["eslow"] is not None
 
 
+def test_ema_periods_from_role_named_params(tmp_path):
+    from quant.report import _run_config
+
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "params.json").write_text(json.dumps({"strategy": {
+        "entry_ema_fast_period": 18, "entry_ema_slow_period": 80,
+        "bias_ema_fast_period": 24, "bias_ema_slow_period": 120,
+        "h1_ema_fast": 2, "h4_ema_fast": 2}}), encoding="utf-8")
+    cfg = _run_config(run)
+    assert cfg["entry"] == {"fast": 18, "slow": 80}
+    assert cfg["regime"] == {"fast": 24, "slow": 120}
+
+
 def test_ema_periods_fall_back_to_old_key_names(tmp_path):
     # runs recorded before the rename stored plain ema_fast/ema_slow
     run, data, _ = _run_dir(tmp_path)

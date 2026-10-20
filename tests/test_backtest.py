@@ -1,5 +1,6 @@
 ﻿"""Backtest tests. Synthetic H1 only, never data/, never a terminal."""
 import pandas as pd
+import pytest
 
 from quant.backtest import (bias_frames, build_h4, build_htf, grade_benchmarks,
                             map_bias, metrics, portfolio_filter, scan_pair,
@@ -174,6 +175,79 @@ def test_map_bias_d1_completed_bar_only():
     assert m["direction"].iloc[12] == bf["direction"].iloc[1]  # day-3 sees D1 #2
 
 
+def test_map_bias_broker_daily_uses_signal_close_not_future_day():
+    h4 = pd.DataFrame({"time": pd.to_datetime([
+        "2026-01-06 00:00Z", "2026-01-06 04:00Z",
+        "2026-01-06 20:00Z", "2026-01-07 00:00Z",
+        "2026-01-07 20:00Z"])})
+    # Broker Daily bars have a non-midnight boundary; next open marks completion.
+    d1 = pd.DataFrame({"time": pd.to_datetime([
+        "2026-01-05 22:00Z", "2026-01-06 22:00Z",
+        "2026-01-07 22:00Z"])})
+    bf = pd.DataFrame({"direction": ["LONG", "SHORT", "NEUTRAL"],
+                       "stacksep": [True] * 3, "hr1": [True] * 3})
+    mapped = map_bias(h4, d1, bf, reg_hours=24, exec_hours=4,
+                      broker_bars=True)
+    assert list(mapped["direction"]) == ["NEUTRAL", "NEUTRAL", "LONG", "LONG", "SHORT"]
+
+
+def test_map_bias_broker_short_sunday_day_closes_at_next_open():
+    execution = pd.DataFrame({"time": pd.to_datetime([
+        "2026-01-04 21:00Z", "2026-01-05 01:00Z"])})
+    daily = pd.DataFrame({"time": pd.to_datetime([
+        "2026-01-04 21:00Z", "2026-01-05 00:00Z"])})
+    bf = pd.DataFrame({"direction": ["LONG", "NEUTRAL"],
+                       "stacksep": [True, False], "hr1": [True, False]})
+    mapped = map_bias(execution, daily, bf, reg_hours=24, exec_hours=4,
+                      broker_bars=True)
+    assert list(mapped["direction"]) == ["LONG", "LONG"]
+
+
+def test_scan_pair_h4_d1_never_sees_current_unclosed_daily_bar(monkeypatch):
+    # 110 days supply enough Daily EMA warmup and >400 H4 execution bars.
+    h1 = _h1([1.1 + i * 0.000001 for i in range(24 * 110)])
+    exec_bars = build_htf(h1, 4)
+    daily = build_htf(h1, 24)
+    monkeypatch.setattr("quant.backtest.check_entry", lambda *_: {
+        "checks": {code: True for code in (
+            "HR2", "HR3", "HR4", "HR4-guard", "EXT", "W1", "E1-setup", "E1-trigger")},
+        "signal": True, "atr": 0.001})
+    _, candidates = scan_pair(exec_bars, daily, "EURUSD", {
+        "warmup_bars": 100, "use_atr_sep": False},
+        reg_hours=24, exec_hours=4, broker_bars=True)
+    assert candidates
+    # First tradable Daily bias (index 100) only exists from day 102 onwards.
+    assert candidates[0]["time"] >= daily["time"].iloc[101] - pd.Timedelta(hours=4)
+
+
+def test_h4_d1_loads_broker_csvs_instead_of_resampling_h1(tmp_path):
+    from types import SimpleNamespace
+
+    from quant.backtest import run_pair
+
+    symbol = "EURUSD"
+    h1_path = tmp_path / f"{symbol}_H1.csv"
+    _h1([1.1] * 48).to_csv(h1_path, index=False)
+    broker_h4 = _h1([1.1] * 3)
+    broker_h4["time"] = pd.to_datetime([
+        "2020-01-06 02:00Z", "2020-01-06 06:00Z", "2020-01-06 10:00Z"])
+    broker_daily = _h1([1.1] * 3)
+    broker_daily["time"] = pd.to_datetime([
+        "2020-01-06 22:00Z", "2020-01-07 22:00Z", "2020-01-08 22:00Z"])
+    broker_h4.to_csv(tmp_path / f"{symbol}_H4.csv", index=False)
+    daily_path = tmp_path / f"{symbol}_D1.csv"
+    broker_daily.to_csv(daily_path, index=False)
+    args = SimpleNamespace(exec_hours=4, reg_hours=24, position_checks="H4",
+                           risk_usd=3.0, max_cost_ratio=0.1, lot=None)
+    result = run_pair(symbol, h1_path, {"warmup_bars": 100}, {}, args)
+    assert result["n_bars"] == 3
+    assert result["reg_bias"][0][0].startswith("2020-01-06 22:00")
+    daily_path.unlink()
+    import pytest
+    with pytest.raises(FileNotFoundError):
+        run_pair(symbol, h1_path, {"warmup_bars": 100}, {}, args)
+
+
 def test_bias_frames_match_core_and_map_uses_completed_bar():
     h4 = build_h4(_h1([1.1 + i * 0.001 for i in range(1300)]))
     p = {"sep_atr": 0.3, "hr1": "a", "use_atr_sep": True, "warmup_bars": 300}
@@ -184,6 +258,15 @@ def test_bias_frames_match_core_and_map_uses_completed_bar():
     m = map_bias(h1, build_h4(h1), bias_frames(build_h4(h1), p))
     assert m["direction"].iloc[2] == "NEUTRAL"  # 02:00: first H4 still forming
     assert m["direction"].iloc[5] != "NEUTRAL" or True  # mapping ran without error
+
+
+def test_bias_frames_uses_role_named_periods_not_legacy():
+    h4 = build_h4(_h1([1.1 + i * 0.001 for i in range(1300)]))
+    p = {"warmup_bars": 100, "use_atr_sep": False,
+         "bias_ema_fast_period": 200, "bias_ema_slow_period": 10,
+         "bias_atr_period": 14, "h4_ema_fast": 10,
+         "h4_ema_slow": 200, "h4_atr_n": 7}
+    assert bias_frames(h4, p)["direction"].iloc[-1] == "SHORT"
 
 
 def test_completed_bar_uses_previous_h4():
@@ -277,6 +360,94 @@ def test_cost_filter_skips_expensive_setup():
                                                    "trail_r": 1.0, "atr_n": 7},
                              _costs(spread_points=20), 3.0, 0.10)
     assert len(trades) == 0 and extra["sized"] == 0
+
+
+# ------------------------------------------------------- widened stop (stop sizing)
+# 0.01 lot of EURUSD: 1 pip (0.0001) risks 0.10 USD -> a 10-pip stop risks 1 USD.
+
+def _tight_stop_frame(extra_bars):
+    closes = [1.1000] * 12
+    return _h1(closes + extra_bars)
+
+
+def test_simulate_widens_the_stop_instead_of_adding_lots():
+    h1 = _tight_stop_frame([1.1005, 1.1010, 1.1120])
+    cands = [{"t": 11, "direction": "LONG", "atr": 0.0010,
+              "time": h1["time"].iloc[11]}]  # 10-pip ATR stop
+    params = {"stop_atr": 1.0, "tp_mult": 3.0, "be_trigger_r": 1.0, "be_buffer": 0,
+              "trail_r": 1.0, "atr_n": 7}
+    stop_sizing = {"widen_stop_to_scope": True, "fixed_lot": 0.01, "max_stop_atr": 5.0}
+    trades, extra = simulate(h1, "EURUSD", cands, params, _costs(), 3.0, 0.10,
+                             scope_low=4.0, scope_high=5.5, stop_sizing=stop_sizing)
+    assert len(trades) == 1
+    assert trades["lot"].iloc[0] == 0.01            # the lot stays fixed
+    # the stop grew from 10 pips to the 40 pips that risk 4.00 USD
+    assert abs((trades["entry"].iloc[0] - trades["sl"].iloc[0]) - 0.0040) < 1e-6
+    # the target moved out with it: R:R stays 1:3
+    assert abs((trades["tp"].iloc[0] - trades["entry"].iloc[0]) - 0.0120) < 1e-6
+    assert trades["risk_usd"].iloc[0] == pytest.approx(4.0, rel=0.01)
+    assert extra["stopcap"] == 0
+
+
+def test_simulate_refuses_a_stop_beyond_the_atr_cap():
+    h1 = _tight_stop_frame([1.1005, 1.1010, 1.1120])
+    cands = [{"t": 11, "direction": "LONG", "atr": 0.0010,
+              "time": h1["time"].iloc[11]}]  # 10 pips -> would need 40 pips = 4x ATR
+    params = {"stop_atr": 1.0, "tp_mult": 3.0, "be_trigger_r": 1.0, "be_buffer": 0,
+              "trail_r": 1.0, "atr_n": 7}
+    stop_sizing = {"widen_stop_to_scope": True, "fixed_lot": 0.01, "max_stop_atr": 3.0}
+    trades, extra = simulate(h1, "EURUSD", cands, params, _costs(), 3.0, 0.10,
+                             scope_low=4.0, scope_high=5.5, stop_sizing=stop_sizing)
+    assert len(trades) == 0 and extra["stopcap"] == 1
+
+
+def test_simulate_stop_cap_falls_back_to_lots_at_original_stop():
+    h1 = _tight_stop_frame([1.1005, 1.1010, 1.1120])
+    cands = [{"t": 11, "direction": "LONG", "atr": 0.0010,
+              "time": h1["time"].iloc[11]}]
+    params = {"stop_atr": 1.0, "tp_mult": 3.0, "atr_n": 7}
+    sizing = {"widen_stop_to_scope": True, "fixed_lot": 0.01,
+              "max_stop_atr": 3.0, "increase_lots_if_widening_fails": True}
+    trades, extra = simulate(h1, "EURUSD", cands, params, _costs(), 3.0, 0.10,
+                             scope_low=4.0, scope_high=5.5, stop_sizing=sizing)
+    assert len(trades) == 1
+    row = trades.iloc[0]
+    assert row["lot"] == pytest.approx(0.04)
+    assert row["entry"] - row["sl"] == pytest.approx(0.0010)
+    assert row["tp"] - row["entry"] == pytest.approx(0.0030)
+    assert row["risk_usd"] == pytest.approx(4.0)
+    assert extra["lot_fallback"] == 1 and extra["stopcap"] == 0
+    # A tighter cost gate still blocks the shorter original stop.
+    trades, extra = simulate(h1, "EURUSD", cands, params, _costs(spread_points=20), 3.0, 0.001,
+                             scope_low=4.0, scope_high=5.5, stop_sizing=sizing)
+    assert trades.empty and extra["cost"] == 1 and extra["lot_fallback"] == 0
+
+
+@pytest.mark.parametrize("atr,expected_lot", [(0.0015, 0.03), (0.0010, 0.04), (0.003, None)])
+def test_simulate_stacks_above_configured_base(atr, expected_lot):
+    h1 = _tight_stop_frame([1.1005, 1.1010, 1.1120])
+    cands = [{"t": 11, "direction": "LONG", "atr": atr,
+              "time": h1["time"].iloc[11]}]
+    params = {"stop_atr": 1.0, "tp_mult": 3.0, "atr_n": 7}
+    trades, extra = simulate(h1, "EURUSD", cands, params, _costs(), 3.0, 0.10,
+                             scope_low=4.0, scope_high=5.5, default_lot=0.02)
+    if expected_lot is None:
+        assert trades.empty and extra["scope"] == 1
+    else:
+        assert trades.iloc[0]["lot"] == pytest.approx(expected_lot)
+
+
+def test_simulate_without_stop_sizing_still_sizes_the_lot_up():
+    h1 = _tight_stop_frame([1.1005, 1.1010, 1.1120])
+    cands = [{"t": 11, "direction": "LONG", "atr": 0.0010,
+              "time": h1["time"].iloc[11]}]
+    params = {"stop_atr": 1.0, "tp_mult": 3.0, "be_trigger_r": 1.0, "be_buffer": 0,
+              "trail_r": 1.0, "atr_n": 7}
+    trades, _ = simulate(h1, "EURUSD", cands, params, _costs(), 3.0, 0.10,
+                         scope_low=4.0, scope_high=5.5)
+    assert len(trades) == 1
+    assert trades["lot"].iloc[0] == 0.04            # 4 USD / 1 USD per 0.01 lot
+    assert abs((trades["entry"].iloc[0] - trades["sl"].iloc[0]) - 0.0010) < 1e-6
 
 
 def test_metrics_on_empty_and_wheel():

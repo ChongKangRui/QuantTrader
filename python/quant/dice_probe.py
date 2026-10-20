@@ -35,6 +35,7 @@ from quant.backtest import (WIN_BARS, _atr_wilder, _load_m1, apply_daily_cap,
                             total_row)
 from quant.limits import parse_no_trade_ranges
 from quant.monitor import flatten_strategy, load_pairs, read_selection
+from quant.rules import read_sizing
 
 CONV_MAP = {"JPY": "USDJPY", "GBP": "GBPUSD", "AUD": "AUDUSD",
             "NZD": "NZDUSD", "CAD": "USDCAD", "CHF": "USDCHF"}
@@ -84,6 +85,7 @@ def resolve_setup(config_dir: str = "configs") -> dict:
             raise FileNotFoundError(f"{fp}: converter feed missing for "
                                     f"{', '.join(syms)}")
         converters[feed] = load_h1(fp).set_index("time")["close"]
+    default_lot, stop_sizing = read_sizing(risk)
     return {
         "strategy": strat,
         "jobs": jobs,
@@ -92,6 +94,8 @@ def resolve_setup(config_dir: str = "configs") -> dict:
         "max_cost_ratio": float(limits.get("max_cost_ratio", 0.10) or 0.0),
         "scope_low": float(scope.get("low", 0.0) or 0.0),
         "scope_high": float(scope.get("high", 0.0) or 0.0),
+        "stop_sizing": stop_sizing,
+        "default_lot": default_lot,
         "max_day": int(limits.get("max_trades_per_day", 0) or 0),
         "max_open": int(risk.get("max_total_positions", 0) or 0),
         "max_ccy_net": int(risk.get("max_ccy_net", 0) or 0),
@@ -115,7 +119,7 @@ def env_from_frames(symbol: str, h1: pd.DataFrame, costs: dict, setup: dict,
     h4 = build_h4(h1)
     mapped = map_bias(h1, h4, bias_frames(h4, strat))
     atr = _atr_wilder(h1["high"], h1["low"], h1["close"],
-                      int(strat.get("atr_n") or 7)).to_numpy()
+                       int(strat.get("entry_atr_period", strat.get("atr_n", 7)))).to_numpy()
     t0 = max(WIN_BARS, int(strat.get("warmup_bars", 300)))
     return {"symbol": symbol, "h1": h1, "h4": h4, "mapped": mapped, "m1": m1,
             "atr": atr, "t0": t0, "costs": costs}
@@ -141,7 +145,9 @@ def _simulate(env: dict, cands: list[dict]) -> tuple[pd.DataFrame, dict]:
                     converters=setup["converters"], m1=env["m1"],
                     no_trade_ranges=setup["no_trade_ranges"],
                     scope_low=setup["scope_low"],
-                    scope_high=setup["scope_high"])
+                    scope_high=setup["scope_high"],
+                    stop_sizing=setup.get("stop_sizing"),
+                    default_lot=setup.get("default_lot"))
 
 
 def eligible_bars(env: dict, variant: str) -> np.ndarray:

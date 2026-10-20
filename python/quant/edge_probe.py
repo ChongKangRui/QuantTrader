@@ -100,7 +100,7 @@ def probe_pair(symbol: str, h1: pd.DataFrame, p: dict, costs: dict, rng: np.rand
 def _atr_series(h1: pd.DataFrame, p: dict) -> pd.Series:
     from quant.signals import _atr_wilder
 
-    period = int(p.get("atr_n", 7))
+    period = int(p.get("entry_atr_period", p.get("atr_n", 7)))
     return _atr_wilder(h1["high"], h1["low"], h1["close"], period)
 
 

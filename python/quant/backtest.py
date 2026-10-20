@@ -1,15 +1,14 @@
 """Offline backtester on the shared signal core (bias.py + signals.py). No MT5 needed.
 
-Pipeline per pair: load H1 -> build the two grids (timeframes.execution and
-timeframes.regime: H1->H4 default, or the H4->D1 upscale) -> bias map ->
+Pipeline per pair: load H1 -> build the H1/H4 grid or load broker H4/D1 bars
+for the H4/D1 variant -> bias map ->
 entry scan (funnel) -> sizing/cost/risk -> lifecycle simulation -> metrics.
 Batch mode loops the universe scan file; results land in
 backtest_results/<local-time>/ with params.json.
 
-Deviations from live, all documented: H4/D1 blocks anchor at 00:00 UTC
-(broker bars follow server midnight; user accepted the phase shift for
-variant-vs-variant testing). Spread is the configured assumption (no
-per-bar field in M1 data). Tick specs assume 5/3-digit quotes. Week = UTC.
+Deviations from live: the legacy H1/H4 grid anchors at 00:00 UTC;
+H4/D1 uses broker CSVs. Spread is the configured assumption (no per-bar
+field in M1 data). Tick specs assume 5/3-digit quotes. Week = UTC.
 """
 from __future__ import annotations
 
@@ -24,9 +23,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from quant.bias import ATR_PERIOD, EMA_FAST, EMA_SLOW, SEP_MIN_DEFAULT, h4_bias
+from quant.bias import SEP_MIN_DEFAULT, bias_periods, h4_bias
 from quant.limits import md_in_ranges, parse_no_trade_ranges
-from quant.rules import combine_stop, cost_ok, scaled_lots, scope_lots, step_risk as _step_risk
+from quant.rules import (combine_stop, cost_ok, size_stop_to_scope, scaled_lots,
+                         scope_lots, step_risk as _step_risk,
+                         stop_sizing_conflict, read_sizing)
 from quant.signals import check_entry
 
 _YAML_COMMENT = re.compile(r"^\s*([A-Za-z_][\w]*)\s*:.*#\s*(.+?)\s*$")
@@ -106,21 +107,13 @@ def _atr_wilder(high: pd.Series, low: pd.Series, close: pd.Series, period: int =
     return tr.ewm(alpha=1.0 / period, min_periods=period, adjust=False).mean()
 
 
-def _bias_periods(p: dict) -> tuple[int, int, int]:
-    """H4 bias MA/ATR periods from strategy keys (h4_ema_fast/h4_ema_slow/h4_atr_n);
-    defaults stay the locked B1 constants so old configs keep identical behavior."""
-    return (int(p.get("h4_ema_fast") or EMA_FAST),
-            int(p.get("h4_ema_slow") or EMA_SLOW),
-            int(p.get("h4_atr_n") or ATR_PERIOD))
-
-
 def bias_frames(h4: pd.DataFrame, p: dict) -> pd.DataFrame:
-    """Per-H4-bar bias direction plus funnel components (same math as h4_bias)."""
+    """Per-regime-bar bias direction plus funnel components (same math as h4_bias)."""
     warmup = int(p.get("warmup_bars", 300))
     sep_min = float(p.get("sep_atr", SEP_MIN_DEFAULT))
     hr1 = str(p.get("hr1", "a")).lower()
     use_sep = bool(p.get("use_atr_sep", True))
-    e_fast_n, e_slow_n, atr_n = _bias_periods(p)
+    e_fast_n, e_slow_n, atr_n = bias_periods(p)
     e_fast = _ema(h4["close"], e_fast_n)
     e_slow = _ema(h4["close"], e_slow_n)
     atr = _atr_wilder(h4["high"], h4["low"], h4["close"], atr_n)
@@ -155,16 +148,27 @@ def bias_frames(h4: pd.DataFrame, p: dict) -> pd.DataFrame:
 
 
 def map_bias(h1: pd.DataFrame, h4: pd.DataFrame, bf: pd.DataFrame,
-             reg_hours: int = 4) -> pd.DataFrame:
-    """Last fully completed regime bar per execution bar (regime open +
-    reg_hours <= execution time). Default reg_hours=4 reproduces H1->H4."""
+             reg_hours: int = 4, exec_hours: int = 0,
+             broker_bars: bool = False) -> pd.DataFrame:
+    """Last completed regime bar as of the execution bar's signal close.
+
+    For broker bars, the next regime bar's open proves the previous bar closed.
+    exec_hours=0 keeps the old start-of-bar mapping for direct callers.
+    """
     h4t = h4["time"].values.astype("datetime64[s]").astype("int64")
     h1t = h1["time"].values.astype("datetime64[s]").astype("int64")
-    idx = h4t.searchsorted(h1t - reg_hours * 3600, side="right") - 1
+    if broker_bars:
+        # Sunday and holiday broker bars may be shorter than 24 hours.
+        completed = h4t[1:]
+        idx = completed.searchsorted(h1t + exec_hours * 3600, side="right") - 1
+    else:
+        idx = h4t.searchsorted(h1t + (exec_hours - reg_hours) * 3600,
+                               side="right") - 1
     out = pd.DataFrame({"direction": "NEUTRAL", "stacksep": False, "hr1": False},
                        index=h1.index)
     ok = idx >= 0
-    out.loc[ok, ["direction", "stacksep", "hr1"]] = bf[["direction", "stacksep", "hr1"]].values[idx[ok]]
+    if ok.any():
+        out.loc[ok, ["direction", "stacksep", "hr1"]] = bf[["direction", "stacksep", "hr1"]].values[idx[ok]]
     return out
 
 
@@ -196,18 +200,21 @@ def tick_spec(symbol: str, price: float, rates: dict[str, float] | None = None,
     return tick, tick * 100000.0 * usd_per_quote
 
 
-def scan_pair(h1: pd.DataFrame, h4: pd.DataFrame, symbol: str, p: dict) -> tuple[pd.DataFrame, list[dict]]:
+def scan_pair(h1: pd.DataFrame, h4: pd.DataFrame, symbol: str, p: dict,
+              reg_hours: int = 4, exec_hours: int = 0,
+              broker_bars: bool = False) -> tuple[pd.DataFrame, list[dict]]:
     """Entry scan. Returns (funnel_counts, candidates). Candidates hold sizing inputs."""
     bf = bias_frames(h4, p)
     # shared-core guard: the frame math and the single-bar core must agree,
-    # including the same period set (h4_ema_fast/h4_ema_slow/h4_atr_n)
+    # including the same configured bias periods
+    bias_fast, bias_slow, bias_atr = bias_periods(p)
     assert bf["direction"].iloc[-1] == h4_bias(
         h4, float(p.get("sep_atr", SEP_MIN_DEFAULT)), str(p.get("hr1", "a")),
         bool(p.get("use_atr_sep", True)), min_bars=int(p.get("warmup_bars", 300)),
-        ema_fast=int(p.get("h4_ema_fast") or EMA_FAST),
-        ema_slow=int(p.get("h4_ema_slow") or EMA_SLOW),
-        atr_n=int(p.get("h4_atr_n") or ATR_PERIOD)).direction  # shared-core guard
-    mapped = map_bias(h1, h4, bf)
+        ema_fast=bias_fast, ema_slow=bias_slow,
+        atr_n=bias_atr).direction  # shared-core guard
+    mapped = map_bias(h1, h4, bf, reg_hours=reg_hours, exec_hours=exec_hours,
+                      broker_bars=broker_bars)
     funnel = {"scanned": 0, "stacksep": 0, "hr1": 0, "hr2": 0, "hr3": 0,
               "hr4": 0, "ext": 0, "w1": 0, "e1setup": 0, "e1trigger": 0}
     cands = []
@@ -263,16 +270,22 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
              m1: pd.DataFrame | None = None,
              no_trade_ranges: tuple = (), *,
              scope_low: float = 0.0, scope_high: float = 0.0,
-             bar_hours: int = 1
+             bar_hours: int = 1, stop_sizing: dict | None = None,
+             default_lot: float | None = None
              ) -> tuple[pd.DataFrame, dict]:
     """Walk candidates in time order; 1 open/pair and 1 entry/day enforced here.
 
-    Sizing: with the scope (default path) the lot is the smallest 0.01 multiple
-    whose actual 1R reaches scope_low; the trade is refused when that lot
-    overshoots scope_high or when even 0.01 lot already risks more than
+    Sizing: start at default_lot and add 0.01 lots until actual 1R reaches
+    scope_low; the trade is refused when that lot
+    overshoots scope_high or when the base lot already risks more than
     scope_high. A fixed `lot` is a diagnostic override and still must land
     inside [scope_low, scope_high]. With the scope off and no fixed lot, the
-    legacy risk_usd target sizing applies. R uses actual risk in either mode.
+    explicit base is used; old callers without one retain legacy risk_usd
+    target sizing. R uses actual risk in either mode.
+    stop_sizing (risk.stop_sizing in _base.yaml) swaps that: with
+    widen_stop_to_scope on, the lot is FIXED and the stop (and with it the
+    target) is widened until that lot risks scope_low, refused when the
+    widening needs more than max_stop_atr x ATR.
     jpy carries USDJPY closes for JPY-cross USD conversion (None = unconvertible).
     m1, when given, is the minute feed: stop/target/BE/trail are checked row by
     row on it (tick-like); an execution bar with no M1 rows falls back to that
@@ -310,6 +323,8 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
     window_skips = 0
     # named gates so the funnel never hides WHY candidates die (the old "sized" lump)
     open_skips = day_skips = tick_skips = scope_skips = cost_skips = lot_skips = 0
+    stop_cap_skips = 0
+    lot_fallbacks = 0
     open_until = -1
     last_day = None
     for cand in cands:
@@ -333,21 +348,43 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
         tick_size, tick_value = tick
         atr_f = float(cand["atr"])
         stop_dist = stop_mult * atr_f
+        lots = 0.0
+        lot_fallback = False
+        # Widen first; optional lot fallback keeps the original strategy stop.
+        widen = bool((stop_sizing or {}).get("widen_stop_to_scope"))
+        if widen:
+            fixed_lot = float(lot or (default_lot if default_lot is not None
+                                     else (stop_sizing or {}).get("fixed_lot", 0.01)))
+            stop_dist, lots, why, lot_fallback = size_stop_to_scope(
+                stop_dist, atr_f, tick_size, tick_value, scope_low, scope_high,
+                fixed_lot, float((stop_sizing or {}).get("max_stop_atr") or 0.0),
+                bool((stop_sizing or {}).get("increase_lots_if_widening_fails")))
+            if why == "stop-cap":
+                stop_cap_skips += 1  # the needed stop is too far from price
+                continue
+            if why == "scope":
+                scope_skips += 1
+                continue
+            if lots < 0.01:
+                lot_skips += 1  # below the broker minimum lot
+                continue
         # shared core: the live trader runs the identical math (quant/rules.py)
         if not cost_ok(stop_dist, spread_px, slip_px, max_cost_ratio):
             cost_skips += 1  # round-trip cost too large vs the stop distance
             continue
-        lots, _risk_fixed, why = scope_lots(
-            _step_risk(stop_dist, tick_size, tick_value),
-            scope_low, scope_high, fixed_lot=float(lot) if lot else 0.0,
-            risk_target_usd=risk_usd)
-        if why == "scope":
-            scope_skips += 1
-            continue
-        if why == "lot":
-            lot_skips += 1
-            continue
+        if not widen:
+            lots, _risk_fixed, why = scope_lots(
+                _step_risk(stop_dist, tick_size, tick_value),
+                scope_low, scope_high, fixed_lot=float(lot) if lot else 0.0,
+                risk_target_usd=risk_usd, default_lot=default_lot)
+            if why == "scope":
+                scope_skips += 1
+                continue
+            if why == "lot":
+                lot_skips += 1
+                continue
         funnel_sized += 1
+        lot_fallbacks += int(lot_fallback)
         last_day = day
         fill = float(h1["open"].iloc[t + 1])
         long = direction == "LONG"
@@ -442,7 +479,8 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
     return pd.DataFrame(trades, columns=cols), {
         "sized": funnel_sized, "window": window_skips, "open": open_skips,
         "day": day_skips, "tick": tick_skips, "scope": scope_skips,
-        "cost": cost_skips, "lot": lot_skips}
+        "cost": cost_skips, "lot": lot_skips, "stopcap": stop_cap_skips,
+        "lot_fallback": lot_fallbacks}
 
 
 def metrics(trades: pd.DataFrame, months_days: float, n_bars: int) -> dict:
@@ -582,17 +620,31 @@ def _load_m1(h1_path: str | Path, symbol: str) -> pd.DataFrame | None:
     return m1 if len(m1) else None
 
 
+def _broker_bar_path(h1_path: str | Path, symbol: str, tf: str) -> Path:
+    """Broker-exported higher-timeframe CSV beside the H1 input."""
+    return Path(h1_path).with_name(f"{symbol}_{tf}.csv")
+
+
 def run_pair(symbol: str, h1_path: str | Path, p: dict, costs: dict, args,
              converters: dict[str, pd.Series] | None = None) -> dict:
     # timeframes: H1->H4 default, or the H4->D1 upscale; hours ride on args
     exec_hours = int(getattr(args, "exec_hours", 1) or 1)
     reg_hours = int(getattr(args, "reg_hours", 4) or 4)
     h1 = load_h1(h1_path)
-    exec_df = h1 if exec_hours == 1 else build_htf(h1, exec_hours)
-    reg_df = build_htf(h1, reg_hours)   # both grids anchor at 00:00 UTC
-    funnel, cands = scan_pair(exec_df, reg_df, symbol, p)
+    broker_bars = exec_hours == 4 and reg_hours == 24
+    if broker_bars:
+        # UTC-resampled candles do not match the broker's Daily boundaries.
+        exec_df = load_h1(_broker_bar_path(h1_path, symbol, "H4"))
+        reg_df = load_h1(_broker_bar_path(h1_path, symbol, "D1"))
+    else:
+        exec_df = h1 if exec_hours == 1 else build_htf(h1, exec_hours)
+        reg_df = build_htf(h1, reg_hours)
+    funnel, cands = scan_pair(exec_df, reg_df, symbol, p,
+                              reg_hours=reg_hours, exec_hours=exec_hours,
+                              broker_bars=broker_bars)
     bframes = bias_frames(reg_df, p)
-    mapped = map_bias(exec_df, reg_df, bframes, reg_hours=reg_hours)
+    mapped = map_bias(exec_df, reg_df, bframes, reg_hours=reg_hours,
+                      exec_hours=exec_hours, broker_bars=broker_bars)
     m1 = None
     if str(getattr(args, "position_checks", "M1")).upper() == "M1":
         m1 = _load_m1(h1_path, symbol)
@@ -605,10 +657,12 @@ def run_pair(symbol: str, h1_path: str | Path, p: dict, costs: dict, args,
                              m1=m1, no_trade_ranges=ranges,
                              scope_low=getattr(args, "scope_low", 0.0),
                              scope_high=getattr(args, "scope_high", 0.0),
-                             bar_hours=exec_hours)
+                             bar_hours=exec_hours,
+                             stop_sizing=getattr(args, "stop_sizing", None),
+                             default_lot=getattr(args, "default_lot", None))
     funnel["sized"] = extra["sized"]
     funnel["window"] = extra.get("window", 0)
-    for key in ("open", "day", "tick", "scope", "cost", "lot"):
+    for key in ("open", "day", "tick", "scope", "cost", "lot", "stopcap", "lot_fallback"):
         funnel[key] = extra.get(key, 0)  # every named gate lands in funnel.csv
     funnel["taken"] = len(trades)
     days = (h1["time"].iloc[-1] - h1["time"].iloc[0]).days
@@ -858,7 +912,7 @@ def _ts_utc(s: str) -> pd.Timestamp:
 
 def scale_lots_to_balance(trades_by_sym: dict[str, pd.DataFrame],
                           pct: float, scope_low: float, scope_high: float,
-                          start_balance: float
+                          start_balance: float, default_lot: float = 0.01
                           ) -> tuple[dict[str, pd.DataFrame], list[dict]]:
     """Account-global lot scaling (risk.scale_lot_with_balance ON).
 
@@ -912,7 +966,8 @@ def scale_lots_to_balance(trades_by_sym: dict[str, pd.DataFrame],
             unscaled += 1
             continue
         aim = pct / 100.0 * balance
-        lots_new, risk_new, why = scaled_lots(step0, aim, scope_low, scope_high)
+        lots_new, risk_new, why = scaled_lots(
+            step0, aim, scope_low, scope_high, default_lot)
         if why is not None:
             dropped.append({"symbol": sym, "entry_time": str(out[sym].at[idx, "entry_time"])[:16],
                             "reason": f"scale-{why}"})
@@ -999,6 +1054,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="force risk.scale_lot_with_balance ON (compounding sizing)")
     ap.add_argument("--balance-risk-pct", type=float, default=None,
                     help="override risk.balance_risk_pct (%% of balance per trade when scaling)")
+    ap.add_argument("--widen-stop", action="store_true",
+                    help="force risk.stop_sizing.widen_stop_to_scope ON: fixed lot, "
+                         "stop widened until the lot reaches the scope floor")
+    ap.add_argument("--default-lot", "--stop-lot", dest="default_lot", type=float, default=None,
+                    help="override risk.default_lot (base size; --stop-lot is a legacy alias)")
+    ap.add_argument("--stop-max-atr", type=float, default=None,
+                    help="override risk.stop_sizing.max_stop_atr (widening cap, x ATR)")
     ap.add_argument("--max-cost-ratio", type=float, default=None,
                     help="override limits.max_cost_ratio from _base.yaml")
     ap.add_argument("--max-total-positions", type=int, default=None,
@@ -1057,6 +1119,24 @@ def main(argv: list[str] | None = None) -> int:
         print("config error: scale_lot_with_balance needs risk.balance_risk_pct > 0",
               flush=True)
         return 2
+    # stop sizing: widen the stop instead of trading more lots (off by default)
+    if args.default_lot is not None:
+        risk_all["default_lot"] = args.default_lot
+    try:
+        args.default_lot, stop_sizing = read_sizing(risk_all)
+    except (TypeError, ValueError) as exc:
+        print(f"config error: {exc}", flush=True)
+        return 2
+    if args.widen_stop:
+        stop_sizing["widen_stop_to_scope"] = True
+    if args.stop_max_atr is not None:
+        stop_sizing["max_stop_atr"] = args.stop_max_atr
+    if stop_sizing.get("widen_stop_to_scope"):
+        conflict = stop_sizing_conflict(stop_sizing, bool(args.scale_lots))
+        if conflict:
+            print(f"config error: {conflict}", flush=True)
+            return 2
+    args.stop_sizing = stop_sizing
     try:
         args.no_trade_ranges = tuple(parse_no_trade_ranges(base))
     except ValueError as exc:
@@ -1065,8 +1145,7 @@ def main(argv: list[str] | None = None) -> int:
     # Stop/target/BE/trail checks read the minute feed when the config says M1.
     args.position_checks = str((base.get("timeframes") or {}).get(
         "position_checks", "M1")).upper()
-    # timeframes: locked combos only (H1->H4 default, H4->D1 upscale); both
-    # grids derive from the same H1 CSV, anchored at 00:00 UTC
+    # H4->D1 requires broker H4 and Daily bars; H1->H4 retains its legacy grid.
     try:
         args.exec_tf, args.reg_tf = read_timeframes(args.config_dir)
     except ValueError as exc:
@@ -1079,7 +1158,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.weekend_flat:
         strat["weekend_flat"] = True
     if args.atr_n is not None:
-        strat["atr_n"] = args.atr_n
+        strat["entry_atr_period"] = args.atr_n
     if args.sep_atr is not None:
         strat["sep_atr"] = args.sep_atr
     if args.ma_only:
@@ -1126,6 +1205,15 @@ def main(argv: list[str] | None = None) -> int:
         print("Nothing to run.", flush=True)
         return 1
 
+    if args.exec_tf == "H4":
+        missing = [str(path) for sym, h1_path, _ in jobs
+                   for tf in ("H4", "D1")
+                   if not (path := _broker_bar_path(h1_path, sym, tf)).exists()]
+        if missing:
+            print("config error: H4/D1 needs broker-exported CSVs beside H1: "
+                  + ", ".join(missing), flush=True)
+            return 2
+
     # Quote-foreign pairs convert through a converter feed (JPY via USDJPY,
     # GBP via GBPUSD, ...). USD-quoted and USD-base pairs convert themselves.
     conv_map = {"JPY": "USDJPY", "GBP": "GBPUSD", "AUD": "AUDUSD",
@@ -1163,6 +1251,8 @@ def main(argv: list[str] | None = None) -> int:
         "sizing_scope_usd": {"low": args.scope_low, "high": args.scope_high},
         "scale_lot_with_balance": bool(args.scale_lots),
         "balance_risk_pct": float(args.balance_risk_pct),
+        "stop_sizing": stop_sizing,
+        "default_lot": args.default_lot,
         "lot": args.lot,
         "max_trades_per_day": max_day, "workers": workers,
         "no_trade_ranges": args.no_trade_ranges,
@@ -1239,7 +1329,7 @@ def main(argv: list[str] | None = None) -> int:
         kept_sc, sc_dropped = scale_lots_to_balance(
             {s: r["trades"] for s, r in results.items()},
             args.balance_risk_pct, args.scope_low, args.scope_high,
-            float(bench.get("account_usd") or 0) or 100.0)
+            float(bench.get("account_usd") or 0) or 100.0, args.default_lot)
         params["scale_dropped"] = sc_dropped
         changed_sc = sorted({s for s in results
                              if len(kept_sc[s]) != len(results[s]["trades"])})

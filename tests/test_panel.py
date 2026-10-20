@@ -100,6 +100,45 @@ def test_load_pairs_strategy_comes_only_from_base(tmp_path):
     assert p["params"]["hr1"] == "b"
 
 
+def test_role_based_periods_in_active_and_both_presets():
+    import yaml
+
+    from pathlib import Path
+    from quant.monitor import flatten_strategy
+
+    names = ("_base.yaml", "_base_h4d1.yaml", "_base_h1h4.yaml")
+    expected = (20, 100, 14, 20)
+    for name in names:
+        cfg = yaml.safe_load((Path("configs") / name).read_text(encoding="utf-8"))
+        p = flatten_strategy(cfg)
+        assert (p["bias_ema_fast_period"], p["bias_ema_slow_period"],
+                p["bias_atr_period"], p["entry_ema_fast_period"]) == expected
+        assert p["entry_atr_period"] == 7
+        assert p["entry_ema_slow_period"] == (50 if name == "_base_h1h4.yaml" else 100)
+        assert not {"h1_ema_fast", "h1_ema_slow", "h4_ema_fast",
+                    "h4_ema_slow", "h4_atr_n", "atr_n"} & p.keys()
+
+
+def test_stop_sizing_block_present_in_presets_and_read_by_the_trader():
+    import yaml
+
+    from pathlib import Path
+    from quant.monitor import read_trade_cfg
+
+    for name in ("_base.yaml", "_base_h4d1.yaml", "_base_h1h4.yaml"):
+        cfg = yaml.safe_load((Path("configs") / name).read_text(encoding="utf-8"))
+        ss = (cfg.get("risk") or {}).get("stop_sizing") or {}
+        assert ss.get("widen_stop_to_scope") is False   # the mode ships OFF
+        assert ss.get("increase_lots_if_widening_fails") is False
+        assert cfg["risk"]["default_lot"] == 0.01
+        assert "fixed_lot" not in ss  # only one editable base-size setting
+        assert float(ss.get("max_stop_atr")) > 0
+    live = read_trade_cfg("configs")
+    assert live["default_lot"] == 0.01
+    assert live["stop_sizing"]["fixed_lot"] == 0.01
+    assert live["stop_sizing"]["max_stop_atr"] == 3.0
+
+
 def test_load_pairs_carries_pair_costs(tmp_path):
     d = tmp_path / "configs"
     d.mkdir()
@@ -264,6 +303,16 @@ def test_poll_ma_only_never_flat_on_pullback():
     assert rows[0].bias == "FLAT"
     rows, _ = poll(mt5, [dict(base, use_atr_sep=False)])
     assert rows[0].bias == "UP"
+
+
+def test_poll_uses_role_named_bias_periods_not_conflicting_legacy():
+    mt5 = _FakeMT5([100.0 + i for i in range(400)])
+    p = {"name": "EURUSD", "symbol": "EURUSD", "use_atr_sep": False,
+         "params": {"bias_ema_fast_period": 200, "bias_ema_slow_period": 10,
+                    "bias_atr_period": 14, "h4_ema_fast": 10,
+                    "h4_ema_slow": 200, "h4_atr_n": 7}}
+    rows, _ = poll(mt5, [p])
+    assert rows[0].ok and rows[0].bias == "DOWN"
 
 
 def test_flatten_strategy_reads_sections_and_flat():

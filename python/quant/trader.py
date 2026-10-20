@@ -239,7 +239,8 @@ def sync_book(mt5, magic: int, symbol: str, info, params: dict,
 
 def plan_entry(direction: str, fill: float, atr: float, symbol: str, info,
                params: dict, costs: dict, scope_low: float, scope_high: float,
-               max_cost_ratio: float, risk_target: float = 0.0
+               max_cost_ratio: float, risk_target: float = 0.0,
+               stop_sizing: dict | None = None, default_lot: float | None = None
                ) -> tuple[dict | None, str]:
     """Shared-math entry plan. Returns (plan|None, gate-fail reason).
 
@@ -248,30 +249,70 @@ def plan_entry(direction: str, fill: float, atr: float, symbol: str, info,
     risk_target > 0 = scaled sizing aim (balance_risk_pct x live balance,
     rules.scaled_lots); 0 = the fixed scope-floor path, identical to the
     backtest engine.
+    stop_sizing (risk.stop_sizing) swaps the sizing branch: the lot is FIXED
+    and the stop is widened until that lot risks scope_low, refused when the
+    widening needs more than max_stop_atr x ATR. Same math as the engine
+    (rules.size_stop_to_scope). Optional lot fallback uses the original stop.
     """
     long = direction == "LONG"
     stop_dist = float(params.get("stop_atr", 1.5)) * float(atr)
     spread_px, slip_px = cost_bits(symbol, info, costs)
-    if not rules.cost_ok(stop_dist, spread_px, slip_px, max_cost_ratio):
-        return None, "cost"
     size, value = tick_pair(info)
-    step = rules.step_risk(stop_dist, size, value)
-    if risk_target > 0:
-        lots, risk, why = rules.scaled_lots(step, risk_target, scope_low, scope_high)
-        if why is not None:
-            return None, "scope"  # fence refused the scaled aim (high/low/empty)
-    else:
-        lots, risk, why = rules.scope_lots(step, scope_low, scope_high)
+    ss = stop_sizing or {}
+    widen = bool(ss.get("widen_stop_to_scope"))
+    lots = 0.0
+    lot_fallback = False
+    if widen:
+        if risk_target > 0:
+            return None, "config"  # percent sizing and a fixed lot cannot mix
+        fixed_lot = float(default_lot if default_lot is not None else ss.get("fixed_lot", 0.01))
+        if fixed_lot < 0.01:
+            return None, "lot"  # below the broker minimum lot
+        stop_dist, lots, why, lot_fallback = rules.size_stop_to_scope(
+            stop_dist, float(atr), size, value, scope_low, scope_high, fixed_lot,
+            float(ss.get("max_stop_atr") or 0.0),
+            bool(ss.get("increase_lots_if_widening_fails")))
         if why is not None:
             return None, why
+        # the broker refuses a stop closer than trade_stops_level: catch it here
+        min_dist = float(getattr(info, "trade_stops_level", 0) or 0) * (pip_point(symbol) / 10.0)
+        if stop_dist < min_dist:
+            return None, "stops-level"
+    if not rules.cost_ok(stop_dist, spread_px, slip_px, max_cost_ratio):
+        return None, "cost"
+    if not widen:
+        step = rules.step_risk(stop_dist, size, value)
+        if risk_target > 0:
+            lots, risk, why = rules.scaled_lots(
+                step, risk_target, scope_low, scope_high,
+                default_lot if default_lot is not None else 0.01)
+            if why is not None:
+                return None, "scope"  # fence refused the scaled aim (high/low/empty)
+        else:
+            lots, risk, why = rules.scope_lots(
+                step, scope_low, scope_high, default_lot=default_lot)
+            if why is not None:
+                return None, why
+    else:
+        risk = rules.risk_usd(stop_dist, size, value, lots)
     tp_dist = rules.target_dist(stop_dist, float(params.get("tp_mult", 3.0)))
     digits = int(getattr(info, "digits", 5))
     sl = fill - stop_dist if long else fill + stop_dist
     tp = fill + tp_dist if long else fill - tp_dist
     lots = snap_volume(lots, float(info.volume_min), float(info.volume_max),
                        float(info.volume_step))
+    if widen or default_lot is not None:
+        # the broker may force a bigger minimum lot: re-check the risk band
+        risk = rules.risk_usd(stop_dist, size, value, lots)
+        if default_lot is not None and lots + 1e-9 < default_lot:
+            return None, "scope"
+        if scope_high > 0 and risk > scope_high + 1e-9:
+            return None, "scope"
+        if scope_low > 0 and risk + 1e-9 < scope_low:
+            return None, "scope"
     return {"lots": lots, "risk_usd": round(risk, 2), "stop_dist": stop_dist,
-            "tp_dist": tp_dist, "sl": round(sl, digits), "tp": round(tp, digits)}, ""
+            "tp_dist": tp_dist, "sl": round(sl, digits), "tp": round(tp, digits),
+            "lot_fallback": lot_fallback}, ""
 
 
 def send_entry(mt5, broker: str, direction: str, plan: dict, magic: int,
@@ -378,7 +419,9 @@ def trade_on_bar(mt5, broker: str, symbol: str, direction: str, bar_secs: int,
                                float(cfg.get("scope_low", 0.0) or 0.0),
                                float(cfg.get("scope_high", 0.0) or 0.0),
                                float(cfg.get("max_cost_ratio", 0) or 0),
-                               risk_target=risk_target)
+                               risk_target=risk_target,
+                               stop_sizing=cfg.get("stop_sizing") or None,
+                               default_lot=cfg.get("default_lot"))
         if plan is None:
             reason = why or "plan"
         else:

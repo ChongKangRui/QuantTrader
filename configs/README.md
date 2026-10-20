@@ -5,10 +5,11 @@
 `_base_*` filenames are skipped by the pair loader, so full copies can sit
 here safely. The engine reads `configs/_base.yaml` ONLY:
 
-- `configs/_base_h1h4.yaml` — the default system (H1->H4); identical to
-  `_base.yaml`. Use it to switch back.
-- `configs/_base_h4d1.yaml` — the "Daily bias / H4 sweep" strategy: W1 gate
-  on with `w1_open_side: true`, E1-setup/trigger + HR2 off, `tp_mult: 2.5`,
+- `configs/_base_h1h4.yaml` — the older H1->H4 preset; copy it to
+  `_base.yaml` to switch back.
+- `configs/_base_h4d1.yaml` — the "Daily bias / H4 entry" strategy: W1 gate
+  on with both `w1_touch_from_trend_side` and `w1_cross_from_other_side` on,
+  E1-setup/trigger + HR2 off, `tp_mult: 2.5`,
   trail off. NOTE inside: the spec's "max 2 per pair per week" and "a loss
   disables the pair for the day" are not built — no knobs exist yet.
 - Apply one: `Copy-Item configs/_base_h4d1.yaml configs/_base.yaml -Force`
@@ -39,24 +40,25 @@ reason). The yaml lists gates in reading order, not funnel order.
 
 | Code | In the yaml | Meaning |
 |---|---|---|
-| B1 | `strategy.bias` | the bias family: H4 fast EMA above/below slow + HR1 band. Baseline = B1 |
-| HR1 | `strategy.bias` (`hr1: a/b/c`) | H4 watchman: price flowing past the H4 slow EMA (a = close / b = body / c = whole candle) |
+| B1 | `strategy.bias` | bias chart fast EMA above/below slow EMA; HR1 and optional EMA separation can veto it |
+| HR1 | `strategy.bias` (`hr1: a/b/c`) | price on the trend side of the bias chart's slow EMA (a = close / b = body / c = whole candle) |
 | HR2 | `strategy.entry` | signal candle conviction: right color AND body >= `min_body_ratio` of the range |
 | HR3 | `strategy.entry` | signal candle not too big (never chase a giant bar) |
 | HR4 (+guard) | `strategy.entry` | swing structure intact: recent higher-low (LONG) / lower-high (SHORT); guard = no NEW lower-low since the swing |
-| EXT | `strategy.entry` | not stretched: close stays close to the H1 fast EMA |
-| E1-setup | `strategy.entry` | pullback happened: within `lookback` bars price touched the H1 slow EMA WITHOUT closing below it (zone held) |
+| EXT | `strategy.entry` | not stretched: close stays close to the entry chart's fast EMA |
+| E1-setup | `strategy.entry` | pullback happened: within `lookback` entry bars price touched the entry chart's slow EMA without breaking down |
 | E1-trigger | `strategy.entry` | the fire button: the bar closed beyond the fast EMA AND beyond the previous bar's high (LONG) / low (SHORT) |
-| W1 | `strategy.entry` | optional extra gate: the wick swept through the fast EMA AGAINST the trade (high above it for SHORT / low below it for LONG) while the entry-chart fast/slow EMA relation agrees with the regime bias. Knobs: `w1_open_side` (candle must OPEN on the trade side of the fast EMA), `w1_pen_atr` (min sweep depth beyond the fast EMA; 0 = any touch) |
+| W1 | `strategy.entry` | entry EMA20/EMA100 must agree with Daily bias. With the two H4/Daily switches present, require a close on the trend side of EMA20 plus either an open on the trend side with a touch (`w1_touch_from_trend_side`) or an open on the other side with a cross (`w1_cross_from_other_side`). Both work for longs and shorts; 0 on `w1_pen_atr` allows an exact touch. Older configs without those switches retain `w1_open_side`. |
 
 `timeframes.position_checks: M1` selects the feed for open-trade checks.
 
 `timeframes.execution` / `timeframes.regime` choose the timeframe pair.
-Two locked combos only: `H1->H4` (default) and the upscale `H4->D1` —
-same gates, same numbers, bigger bars (bar counts count bars, so
-`lookback: 5` means 5 execution bars whatever the grid). The backtest
-derives both grids from `data/<SYM>_H1.csv` (00:00 UTC anchor); live
-fetches both from the broker. Anything else fails the config check.
+Two locked combos only: `H1->H4` and `H4->D1` — same gates, same numbers,
+bigger bars. H4/D1 backtests require `data/<SYM>_H1.csv`, plus broker-exported
+`data/<SYM>_H4.csv` and `data/<SYM>_D1.csv` from the same broker, with UTC
+timestamps; missing files stop the run. H1/H4 backtests still derive their H4
+grid from H1 (legacy behavior; broker phase can differ). Live fetches broker
+bars directly. Anything else fails the config check.
 
 ## The OFF-gate rule
 
@@ -66,13 +68,53 @@ the engine's code defaults (`signals.py: DEFAULTS`) differ from the yaml
 values (`use_ext/use_hr3/use_hr4 = True`, `use_trail = True`,
 `lookback = 12`, `warmup_bars = 300`, `trail_r = 1.0`).
 
+The `bias_ema_*_period` / `bias_atr_period` values belong to the regime chart;
+`entry_ema_*_period` / `entry_atr_period` belong to the execution chart. These
+keys stay the same if you switch timeframes. `warmup_bars` applies to both.
+The `execution` section in `_base.yaml` describes timing; its keys are not
+runtime switches. The backtest's `--atr-n` overrides `entry_atr_period`.
+Old run reports still accept the older H1/H4-named keys. Existing ledger and
+journal CSV headers keep their old names; their values follow the configured
+entry and bias chart periods.
+
+## Stop sizing (widen the stop instead of adding lots)
+
+`risk.default_lot` is the base size for every trade (default 0.01). Normal
+sizing adds 0.01 lots at a time: a 0.02 base can become 0.03, then 0.04,
+until risk reaches the scope floor. If that size exceeds the ceiling, skip.
+Never reduce below the base to squeeze a trade into the band. With both scope
+sides disabled, use the base unchanged. Balance scaling also respects the base.
+
+`risk.stop_sizing` in `_base.yaml` decides how a trade reaches the minimum
+risk (`risk.sizing_scope_usd.low`):
+
+| Mode | What happens |
+|---|---|
+| `widen_stop_to_scope: false` (default) | trade MORE lots on the ATR stop until 1R reaches `low`; the stop stays `stop_atr x ATR` |
+| `widen_stop_to_scope: true` | use `risk.default_lot` and widen the stop until that lot risks `low`; the take profit moves out with it, so the R:R is unchanged |
+
+In the widened mode a trade is refused when the needed stop is more than
+`max_stop_atr` x ATR away from price (funnel gate `stopcap`) or when the fixed
+lot already risks more than `sizing_scope_usd.high` (gate `scope`). The mode
+cannot run together with `scale_lot_with_balance` (fixed lot vs compounding
+lot): both the backtest and the live loop refuse that combination.
+
+With `increase_lots_if_widening_fails: true`, a widening-cap refusal tries
+more lots at the original stop, starting at the same base. All risk and cost
+checks still apply.
+
+CLI overrides: `--default-lot` (base size in all modes), `--widen-stop`
+(force the mode on), `--stop-max-atr`. `--stop-lot` is a legacy alias for
+`--default-lot`; `--lot` remains an exact diagnostic override. Older configs
+without `risk.default_lot` may still use `stop_sizing.fixed_lot` as the base.
+
 ## Units cheat-sheet
 
 | Keys | Unit |
 |---|---|
-| `h4_atr_n`, `atr_n` | ATR periods (bars) |
-| `sep_atr` | H4 ATR multiples |
-| `touch_atr`, `breakdown_atr`, `ext_atr`, `max_body_atr`, `edge_atr`, `stop_atr` | H1 ATR multiples |
+| `bias_ema_*_period`, `entry_ema_*_period`, `bias_atr_period`, `entry_atr_period` | periods (bars on their own chart) |
+| `sep_atr` | bias chart ATR multiples |
+| `touch_atr`, `breakdown_atr`, `ext_atr`, `max_body_atr`, `edge_atr`, `stop_atr` | entry chart ATR multiples |
 | `tp_mult`, `trail_r`, `be_trigger_r` | R multiples (share of the stop distance) |
 | `min_body_ratio` | body / range share (0-1) |
 | `spread_points` | POINTS (20 pts = 2.0 pips) |
@@ -80,6 +122,7 @@ values (`use_ext/use_hr3/use_hr4 = True`, `use_trail = True`,
 | `swap_long_per_0_01`, `swap_short_per_0_01` | account-ccy per 0.01 lot per night |
 | `commission_per_lot` | USD per 1.0 lot |
 | `sizing_scope_usd.low/high` | USD — every trade's 1R must land inside |
+| `default_lot` | base lots, at least 0.01 and in 0.01-lot steps |
 | `scale_lot_with_balance` | OFF = fixed sizing (rents the scope floor as the aim). ON = compounding: 1R aims at `balance_risk_pct` % of the account balance at entry, then the SAME scope fence checks it. Wins grow the lot, drawdown shrinks it — never doubles after a loss (not martingale) |
 | `balance_risk_pct` | % of the account balance per trade; read only when `scale_lot_with_balance: true` (must be > 0 then) |
 | `weekly_loss_r` | R — backtest weekly halt (week's CLOSED R total) |

@@ -164,6 +164,8 @@ def test_fok_only_symbol_uses_fok(tmp_path):
 
 
 def test_snap_volume_rounds_down_to_step():
+    assert snap_volume(0.03, 0.01, 100.0, 0.01) == 0.03
+    assert snap_volume(0.029, 0.01, 100.0, 0.01) == 0.02
     assert snap_volume(0.015, 0.01, 100.0, 0.01) == 0.01
     assert snap_volume(0.005, 0.01, 100.0, 0.01) == 0.01  # clamped to minimum
     assert snap_volume(200.0, 0.01, 100.0, 0.01) == 100.0

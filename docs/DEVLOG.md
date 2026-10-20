@@ -4,33 +4,25 @@
 
 ### Now (housekeeping, no backtest needed)
 
-- [ ] Monday off-peak spreadcheck re-sample: run `quant.spreadcheck` once in a
-  quiet session (late Malaysia night / ~17-23 UTC), then refine `spread_points`
-  in the 3 JPY yamls if the honest pick changes (swaps already corrected).
 - [ ] Lot-scale sweep (user runs): `--scale-lots` with `--balance-risk-pct` 1 / 3
   / 5 vs the fixed reference, one at a time. Headroom first: compounding
-  crosses the 3.6 ceiling once the balance grows ~20%, so the sweep also needs
-  a widened `sizing_scope_usd.high` variant or it will refuse half the entries.
-- [x] After the post-fix batch re-run: point the dice `--reference` default and
-  the TESTLOG "Reference (pinned)" line at the new run id (`20261019_192501`).
-- [ ] H4->D1 variant (code done 2026-10-19): flip `_base.yaml` timeframes,
-  run its own batch + TESTLOG row, re-tune knob expectations — user runs
-  backtests. Probes stay H1/H4-only until a D1 dice null is designed.
-- [x] System check (2026-10-19 ~23:40, agent, read-only) RESOLVED same day:
-  the "Held (N bars)" report failures are gone — the report is now
-  combo-driven (`report.py` reads `timeframes` from params.json; the Held
-  header labels the execution TF by design, tests assert the JS template).
-  Full suite 2026-10-19: 198 passed, 0 failed. Still not verified against a
-  terminal (no smoke).
-- [ ] H4->D1 batch (latest new strategy) — report edits settled 2026-10-19
-  (combo-driven report + bias shading shipped). Still HELD on user's calls:
-  D1 fence ceiling ([4,5.5] = 5/9 pairs vs [4,8] = 9/9) and the two frequency
-  knobs (max 2/pair/week, pair-day disable after a loss — NOT BUILT). Then:
-  `Copy-Item configs/_base_h4d1.yaml
-  configs/_base.yaml -Force` -> write the TESTLOG pre-declaration ->
-  `$env:PYTHONPATH="python"; uv run python -m quant.backtest --batch` ->
-  revert `Copy-Item configs/_base_h1h4.yaml configs/_base.yaml -Force`
-  (live default stays H4->D1 only if user promotes it).
+  crosses the scope ceiling once the balance grows, so the sweep also needs a
+  widened `sizing_scope_usd.high` variant or it will refuse half the entries.
+- [ ] H4->D1 variant (code done 2026-10-19): the active `_base.yaml` is already
+  H4->D1. Still open on the user's calls: the D1 fence ceiling ([4,5.5] =
+  5/9 pairs vs [4,8] = 9/9) and the two frequency knobs (max 2/pair/week,
+  pair-day disable after a loss — NOT BUILT). Then: broker-exported
+  `data/<SYM>_H4.csv` and `data/<SYM>_D1.csv` for every pair (none exist
+  yet) -> write the TESTLOG pre-declaration ->
+  `$env:PYTHONPATH="python"; uv run python -m quant.backtest --batch`.
+  Probes stay H1/H4-only until a D1 dice null is designed.
+- [ ] Widened-stop mode (code done 2026-10-20, ships OFF): `risk.stop_sizing`
+  trades a FIXED lot and widens the stop (and the target) until that lot
+  reaches `sizing_scope_usd.low`, instead of trading more lots. Next: write
+  the TESTLOG pre-declaration, then run the batch with `--widen-stop` and
+  compare against the same run without it (one change per run).
+- [x] ~~Optional lot increase when stop widening hits its cap~~ — implemented under
+  `risk.stop_sizing.increase_lots_if_widening_fails` (default OFF).
 
 ### Verdict track (timebox: 2-3 more experiments, then decide)
 
@@ -49,12 +41,115 @@
 
 ### Parked until the verdict is in
 
-- [ ] Account size decision: 2.5-3.6 USD risk on a 100 USD account gave 254% MTM drawdown even at ~zero edge. Decide a bigger account, cent account, or smaller risk before any real money.
-- [ ] Swap timing check (low priority): engine charges swap at UTC midnight, broker rolls at ~21-22 UTC. Triple day is approximated.
-- [ ] Strategy-core redesign (open track): design the next change-set with pass lines pre-declared.
 - [ ] Go-live demo smoke: 0.01 lots EURUSD + one JPY pair → all 10; compare fills vs backtest. Rotate the demo password (it appeared in chat).
 
 
+
+## 2026-10-20
+
+- **One base lot for every sizing mode.** `risk.default_lot` (0.01 by default)
+  replaces the editable `stop_sizing.fixed_lot` in all three base configs.
+  Normal sizing starts at this base, adds individual 0.01 lots until the scope
+  floor is met, and skips if that size exceeds the ceiling. A 0.02 base can
+  become 0.03, then 0.04; it does not jump in 0.02 blocks or shrink below base.
+  Widening uses the same base; its optional lot fallback starts there too.
+  Balance scaling respects the base as a minimum. Scope disabled on both sides
+  means use the base unchanged (except in balance-scaling mode).
+  `--default-lot` overrides it; `--stop-lot` remains a legacy alias, while
+  `--lot` stays the exact diagnostic override. Older configs without the new
+  key accept `stop_sizing.fixed_lot`; the new key wins if both exist.
+  Invalid/non-finite/subminimum/non-0.01-step bases are refused. Shared rules
+  feed backtest, dice and live planning; params/ledger record `default_lot`.
+  Fixed an existing float-floor bug in `live.snap_volume`: exact 0.03 lots
+  could become 0.02. Live rechecks the base and risk band after broker snapping.
+  Tests: 258 passed (`$env:PYTHONPATH="python"; uv run pytest -q`).
+  No backtest, live order or ledger rebuild run. Rebuild the ledger separately
+  to expose its new column in existing headers.
+
+- **Optional lot fallback after a widening-cap refusal (default OFF).**
+  `risk.stop_sizing.increase_lots_if_widening_fails` only acts while
+  `widen_stop_to_scope` is ON. Try the fixed-lot widening first; if it exceeds
+  `max_stop_atr`, use the original strategy stop and the smallest 0.01-lot
+  multiple that reaches the scope floor without breaking its ceiling.
+  Scope failures, bad tick data, cost failures and broker-stop failures remain
+  refusals. The target follows the final stop; compounding remains incompatible.
+  Shared math serves backtest, dice and live planning. Params and ledger record
+  the switch; `funnel.csv` counts sized fallback candidates as `lot_fallback`
+  (before portfolio filters), and the live plan identifies fallback use.
+  Removed the account-size, swap-timing and redesign TODOs at the user's request;
+  H4/Daily is the new design. These removals are not validation claims.
+  Tests: 234 passed (`$env:PYTHONPATH="python"; uv run pytest -q`), including
+  fallback on/off, widening-first precedence, ceiling/tick refusals, final-stop
+  cost checks, both live directions, broker constraints and config/ledger wiring.
+  No backtest or live order run for this change. Existing ledger headers need
+  `uv run python -m quant.ledger --rebuild` to show the new switch column
+  (not run).
+
+- **Widened-stop mode (`risk.stop_sizing`) — the alternative to trading more
+  lots, ships OFF.** New config block in `_base.yaml` (and both presets):
+  `widen_stop_to_scope` (bool), `fixed_lot` (0.01), `max_stop_atr` (3.0).
+  OFF = today's behaviour: the lot grows until 1R reaches
+  `sizing_scope_usd.low`. ON = the lot is FIXED and the stop is widened until
+  that lot risks `low`; the take profit is placed from the widened stop with
+  the same `tp_mult`, so the R:R is unchanged — only the distance to both
+  levels grows. The stop is only ever widened, never narrowed.
+  - Refusals (both named in the funnel): `stopcap` = the widening needs more
+    than `max_stop_atr` x ATR from price (a stop that far away is not the
+    trade the rules described); `scope` = the fixed lot already risks more
+    than `sizing_scope_usd.high`, or the resulting 1R would leave the band.
+    The cost gate (`max_cost_ratio`) now judges the FINAL stop distance.
+  - One shared implementation: `rules.fit_stop_to_scope` is called by the
+    engine (`backtest.simulate`) and by the live planner
+    (`trader.plan_entry`), so a backtest and a live order cannot drift. The
+    live path also refuses a stop closer than the broker's
+    `trade_stops_level` ("stops-level") instead of letting the order bounce.
+  - `rules.stop_sizing_conflict` is the single guard used by the backtest and
+    the live loop: the mode cannot run together with
+    `scale_lot_with_balance` (fixed lot vs compounding lot), the fixed lot
+    must be >= 0.01 and `max_stop_atr` must be > 0.
+  - CLI: `--widen-stop` (force on), `--stop-lot`, `--stop-max-atr`. The mode
+    is recorded in `params.json` (`stop_sizing`) and in the run ledger
+    (new columns `widen_stop`, `stop_lot`, `stop_max_atr` — run
+    `python -m quant.ledger --rebuild` once, appends keep the old header
+    until then). The dice probe reads the same block, so the null model
+    stays comparable with the engine.
+  - Tests: 224 passed (+11: shared widen math, the ATR cap refusal, the
+    ceiling refusal, the engine path (stop + target + fixed lot), the live
+    planner path, the broker minimum stop distance, the conflict guard, the
+    preset/config wiring, the ledger columns). NOT run: any backtest, any
+    live order.
+
+- **Config keys renamed by ROLE, not by timeframe.** `bias.h4_ema_fast` /
+  `h4_ema_slow` / `h4_atr_n` -> `bias_ema_fast_period` / `bias_ema_slow_period`
+  / `bias_atr_period`; `entry.h1_ema_fast` / `h1_ema_slow` / `atr_n` ->
+  `entry_ema_fast_period` / `entry_ema_slow_period` / `entry_atr_period`. The
+  names now describe the CHART ROLE (bias chart vs entry chart) and stay the
+  same if the timeframes change. The `bias_`/`entry_` prefixes stay because
+  `flatten_strategy` merges both sections into ONE flat dict — a plain
+  `ema_fast_period` in both would overwrite one with the other.
+  Old key names are still accepted (older configs, older run folders), with
+  the new names winning when both are present. The ledger and journal CSV
+  headers keep their old column names; only the values follow the new keys.
+  `warmup_bars` stays shared by bias and entry (splitting it would change the
+  strategy, not just the names). The `execution:` block in `_base.yaml` is
+  documentation only — no code reads `signal_bar` / `fill_bar` / `fill`; the
+  comments now say so.
+
+- **H4->D1 backtest no longer resamples broker candles.** The engine built
+  its H4 and Daily grids from the H1 CSV at 00:00 UTC, so the Daily bias could
+  see a day that the broker had not closed yet, and the entry scan mapped
+  the bias with a 4-hour regime length regardless of the configured combo.
+  Now: H4->D1 runs need broker-exported `data/<SYM>_H4.csv` and
+  `data/<SYM>_D1.csv` beside the H1 CSV (missing files stop the run), and the
+  bias map uses the next regime bar's open as the proof that the previous one
+  closed. H1->H4 keeps its old resampled grid.
+
+- **H4/Daily entry: two candle patterns, both for buys and sells.** The W1
+  gate now requires the CLOSED H4 candle to end on the trend side of the
+  EMA20, with two separate switches: `w1_touch_from_trend_side` (open on the
+  trend side, wick touches across EMA20) and `w1_cross_from_other_side`
+  (open on the other side, close back on the trend side). Either pattern
+  enters; each can be switched off on its own.
 
 ## 2026-10-19
 

@@ -1,7 +1,7 @@
 """Bias core tests. Synthetic frames only, no terminal, no data/."""
 import pandas as pd
 
-from quant.bias import h4_bias
+from quant.bias import bias_periods, h4_bias
 
 
 def _frame(closes, start_ts=1_700_000_000, step=14_400):
@@ -77,6 +77,15 @@ def test_periods_come_from_params_not_constants():
     a = h4_bias(df, ema_fast=20, ema_slow=50)
     b = h4_bias(df, ema_fast=20, ema_slow=100)
     assert a.ema_slow != b.ema_slow and a.ema_fast == b.ema_fast
+
+
+def test_bias_period_names_are_chart_roles_and_new_names_win():
+    new = {"bias_ema_fast_period": 20, "bias_ema_slow_period": 100,
+           "bias_atr_period": 14}
+    old = {"h4_ema_fast": 20, "h4_ema_slow": 100, "h4_atr_n": 14}
+    assert bias_periods(new) == bias_periods(old) == (20, 100, 14)
+    assert bias_periods({**old, **new, "h4_ema_fast": 8,
+                         "h4_ema_slow": 12, "h4_atr_n": 7}) == (20, 100, 14)
 
 
 def test_ma_only_ignores_sep_and_hr1_and_never_flat():

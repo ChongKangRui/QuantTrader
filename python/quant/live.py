@@ -9,6 +9,7 @@ full order path (open fill, close fill, journal, records sync).
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +24,8 @@ DEVIATION_POINTS = 20
 
 def snap_volume(want: float, vmin: float, vmax: float, step: float) -> float:
     """Round down to the broker step, clamped to [vmin, vmax]."""
-    steps = int(want // step) if step > 0 else 0
+    # Remove float noise at exact broker steps (0.03 // 0.01 can be 2).
+    steps = math.floor(round(want / step, 9)) if step > 0 else 0
     lot = round(steps * step, 8)
     return max(vmin, min(vmax, lot))
 

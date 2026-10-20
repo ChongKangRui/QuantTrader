@@ -4,10 +4,10 @@ Status: DRAFT v1.0. Every rule below is a **hypothesis to be tested**, not a pro
 `[TEST]` = has a range to evaluate. `[DECIDE]` = needs your choice before coding. Parked ideas sit in section 15 and are NOT active rules.
 
 Changes from v0.9 (2026-10-19):
-- **Variant strategy V-D1 recorded as section 16**: the "Daily bias / H4 sweep"
+- **Variant strategy V-D1 recorded as section 16**: the "Daily bias / H4 entry"
   strategy (Daily EMA20/100 direction with a flat rule at EMA100, H4 EMA
-  alignment, wick sweep against the H4 EMA20 with the candle OPEN on the trade
-  side, RR 1:2.5, trailing deferred to its own exit model). It runs on the
+  alignment, H4 touch from the trend side OR cross from the other side, both
+  closing on the trend side of EMA20; RR 1:2.5, trailing deferred). It runs on the
   SAME engine from its own preset (`configs/_base_h4d1.yaml` copied over
   `_base.yaml`); only one variant is active at a time. Its "max 2 per pair per
   week" and "pair disabled for the day after a loss" rules are recorded but
@@ -60,31 +60,32 @@ Candidates (finalize after a correlation check):
 - MT5 bar timestamps are bar **open** time in broker server time. Derive bar boundaries from data.
 - **Signals are evaluated only on H1 bar close. Fills happen at the next H1 bar open.**
 - H4 bias at H1 time `t` uses the **last fully completed H4 bar** only (never the forming one).
-- EMA = standard exponential MA. ATR and RSI = Wilder smoothing. **H1 ATR period = `atr_n` (default 7)**. H4 ATR (bias separation and the optional H4 filters only) and RSI use period 14.
+- EMA = standard exponential MA. ATR and RSI = Wilder smoothing. **H1 ATR period = `entry_atr_period` (default 7)**. H4 ATR (`bias_atr_period`, bias separation) and RSI use period 14.
 - Candle terms: body = |close - open|, range = high - low. A bar with range = 0 never qualifies as a signal bar.
 - Warmup: ignore the first `warmup_bars` bars of each series so the EMAs and ATR have settled (code default 300; the current `_base.yaml` value is 100).
 - **Position checks are tick-like.** With `timeframes.position_checks: M1` (the default), everything that manages an open position — stop, target, breakeven, trail — is checked on the minute (M1) feed built from the same data source (`data/<SYM>_M1.csv`). An H1 bar with no M1 rows falls back to H1 checks for that bar only. Backtest and live share these conventions.
 
 ## 4. H4 bias (direction filter)
 
-### HR1 (hard rule): H4 candle must be on the trend side of EMA(h4_ema_slow)
+### HR1 (hard rule): bias candle must be on the trend side of its slow EMA
 The last completed H4 candle must satisfy, for longs (mirror for shorts), one of `[TEST]`:
-- **HR1a (baseline):** close > EMA(`h4_ema_slow`, H4)
-- **HR1b:** body fully above: min(open, close) > EMA(`h4_ema_slow`, H4)
-- **HR1c (strict):** whole candle above: low > EMA(`h4_ema_slow`, H4)
+- **HR1a (baseline):** close > EMA(`bias_ema_slow_period`, bias chart)
+- **HR1b:** body fully above: min(open, close) > EMA(`bias_ema_slow_period`, bias chart)
+- **HR1c (strict):** whole candle above: low > EMA(`bias_ema_slow_period`, bias chart)
 
-Note: HR1c removes most signals during pullbacks and may leave too few trades. HR1 overlaps with the `h4_ema_fast > h4_ema_slow` condition but is not identical: during a pullback the close can dip under the slow line while the fast line is still above it, and HR1 reacts first.
+Note: HR1c removes most signals during pullbacks and may leave too few trades. HR1 overlaps with the fast-EMA-above-slow-EMA rule but is not identical: during a pullback the close can dip under the slow line while the fast line is still above it, and HR1 reacts first.
 
 ### Bias definition
-Baseline **B1: EMA(20/50) on H4** — the MA periods are now CONFIG keys, not code
-constants: `h4_ema_fast = 20`, `h4_ema_slow = 50`, `h4_atr_n = 14` in
-`configs/_base.yaml` (locked defaults; changing them is its own declared
-change-set). Long bias when all are true on the last completed H4 bar:
-1. EMA(`h4_ema_fast`) > EMA(`h4_ema_slow`)
+Original **B1: EMA(20/50) on H4** — periods are config keys, not code
+constants. The older `configs/_base_h1h4.yaml` preset currently sets
+`bias_ema_fast_period = 20`, `bias_ema_slow_period = 100`, and
+`bias_atr_period = 14` (the 20/100 variant). Long bias when all are true on
+the last completed H4 bar:
+1. EMA(`bias_ema_fast_period`) > EMA(`bias_ema_slow_period`)
 2. HR1 satisfied
-3. (EMA(`h4_ema_fast`) - EMA(`h4_ema_slow`)) >= `sep_atr` x ATR(`h4_atr_n`, H4)   `[TEST]` 0.0 / 0.2 / 0.4 (default 0.3)
+3. (EMA(`bias_ema_fast_period`) - EMA(`bias_ema_slow_period`)) >= `sep_atr` x ATR(`bias_atr_period`, bias chart)   `[TEST]` 0.0 / 0.2 / 0.4 (default 0.3)
 
-Short bias is the mirror. Otherwise NEUTRAL (no new entries). Variant **B2** uses EMA(100) instead of EMA(50) for the slow line (and HR1 against that line). Comparison leg (not baseline): `use_atr_sep: false` drops the separation gate, HR1 and NEUTRAL — pure `h4_ema_fast`/`h4_ema_slow` direction, for ablation only.
+Short bias is the mirror. Otherwise NEUTRAL (no new entries). Variant **B2** uses EMA(100) instead of EMA(50) for the slow line (and HR1 against that line). Comparison leg (not baseline): `use_atr_sep: false` drops the separation gate, HR1 and NEUTRAL — pure `bias_ema_fast_period`/`bias_ema_slow_period` direction, for ablation only.
 
 On H4, EMA20 is about 3 days, EMA50 about 8 days, EMA100 about 17 days.
 
@@ -94,19 +95,19 @@ Test variant (not baseline): **HR5 body-EMA agreement**, which adds "last comple
 - **Efficiency Ratio (Kaufman), H4, length 20:** ER = |close_t - close_t-n| / sum(|close_i - close_i-1|). Range 0-1, how straight the path was. Trade only if ER >= threshold (try 0.20 / 0.30 / 0.40).
 - **ADX(14, H4) >= 20 or 25.** ER and ADX overlap, so test them separately, not stacked.
 - **EMA50 slope:** (EMA50_now - EMA50_6 bars ago) / ATR(14, H4) >= `slope_min` in the trade direction (try 0.2 / 0.5).
-- **Volatility regime:** skip when ATR(`atr_n`, H1) is in the bottom 10% or top 10% of its trailing 100-day range (dead market or news spike).
+- **Volatility regime:** skip when ATR(`entry_atr_period`, H1) is in the bottom 10% or top 10% of its trailing 100-day range (dead market or news spike).
 
 ## 5. H1 entry
 
-All ATR in sections 5-7 means ATR(`atr_n`, H1). Everything is evaluated at the close of the H1 signal bar. Fill is at the next H1 open. `signals.py` evaluates at the signal close; the backtest and execution layers re-check against the actual fill (see "Fill-time re-check").
+All ATR in sections 5-7 means ATR(`entry_atr_period`, H1). Everything is evaluated at the close of the H1 signal bar. Fill is at the next H1 open. `signals.py` evaluates at the signal close; the backtest and execution layers re-check against the actual fill (see "Fill-time re-check").
 
 ### Parameters for sections 5-7 (put all in config)
 
 | Parameter | Default | Test range | Used in |
 |---|---|---|---|
-| `atr_n` | 7 | 7 / 14 | every H1 ATR rule |
-| `h1_ema_fast` | 20 | config | extension cap, E1 trigger |
-| `h1_ema_slow` | 50 | config | E1 setup |
+| `entry_atr_period` | 7 | 7 / 14 | every entry-chart ATR rule |
+| `entry_ema_fast_period` | 20 | config | extension cap, E1 trigger |
+| `entry_ema_slow_period` | 50 | config | E1 setup |
 | `warmup_bars` | 300 | fixed | all indicators |
 | `stop_atr` | 1.5 | 1.0 / 1.5 / 2.0 | S1 stop |
 | `tp_mult` | 3.0 (R) = 4.5 ATR | 2 / 3 | take profit |
@@ -140,10 +141,10 @@ All ATR in sections 5-7 means ATR(`atr_n`, H1). Everything is evaluated at the c
 The signal is built on the signal bar's close, but the order fills at the next open. Before accepting the fill, recompute with the actual fill price: the extension cap, the sizing-scope risk distance, the lot size and the cost filter. If any fails (for example after a gap), skip the trade. This check lives in the backtest and execution layers, which know the real fill price.
 
 ### E1: Pullback-resume (baseline trigger)
-Long, short is the mirror, in addition to the hard rules. Over the window of the last `lookback` H1 bars **including the signal bar**, using **each bar's own** EMA(`h1_ema_slow`) and ATR:
+Long, short is the mirror, in addition to the hard rules. Over the window of the last `lookback` H1 bars **including the signal bar**, using **each bar's own** EMA(`entry_ema_slow_period`) and ATR:
 - **Touch:** at least one bar in the window has `low - EMA50 <= touch_atr x ATR`. Lows may pierce below EMA50; the touch only requires price to have reached down to within `touch_atr x ATR` above it (or lower).
 - **No breakdown:** no bar in the window has `close < EMA50 - breakdown_atr x ATR`. Only closes are floored, not lows (a pullback, not a breakdown).
-- **Trigger:** the signal candle closes above H1 EMA(`h1_ema_fast`) and above the previous H1 bar's high.
+- **Trigger:** the signal candle closes above H1 EMA(`entry_ema_fast_period`) and above the previous H1 bar's high.
 - **Entry:** market order at the next H1 open.
 
 ### E2: Channel breakout (variant)
@@ -184,6 +185,21 @@ Skip rules that apply to every stop type:
 - If lots would fall below `volume_min`, skip.
 - Skip if `(spread + expected slippage) / stop distance > max_cost_ratio`.
 
+### S1w (variant): widen the stop instead of trading more lots
+`risk.stop_sizing.widen_stop_to_scope` (OFF by default) swaps the sizing
+branch: the lot stays at `risk.default_lot` and the stop is widened until that lot
+risks `sizing_scope_usd.low`. The take profit is placed with the same
+`tp_mult` from the widened stop, so the reward-to-risk ratio does not change —
+only the distance to both levels. The stop is only ever widened, never
+narrowed, and the trade is skipped when the widening needs more than
+`max_stop_atr` x ATR (funnel gate `stopcap`) or when the fixed lot already
+risks more than `sizing_scope_usd.high` (gate `scope`). It cannot run together
+with percent sizing (`scale_lot_with_balance`): a fixed lot and a compounding
+lot are different contracts. Engine and live planner share the same math
+(`rules.size_stop_to_scope`). With `increase_lots_if_widening_fails: true`,
+a widening-cap refusal instead sizes up from the base in 0.01-lot steps at
+the original strategy stop. Scope and cost refusals remain enforced.
+
 ## 7. Exit
 
 Take profit at `tp_mult` (3R). **Working baseline (R2, docs/TESTLOG.md) is X1: frozen initial stop** (`use_trail: false`, `use_be: false`). The T1 profit trail and the BE leg stay as toggles for the comparison runs. All exit legs are toggles in `_base.yaml` (`use_trail`, `use_be`, `bias_flip_exit`, `weekend_flat`).
@@ -214,7 +230,7 @@ Caution: breakeven stops get hit by ordinary pullbacks and can reduce the share 
 
 ## 8. Risk and sizing (LOCKED rules)
 
-- **Per-trade risk (sizing scope, since 2026-10-17):** the engine sizes the smallest 0.01-lot multiple whose actual 1R reaches `risk.sizing_scope_usd.low` (2.5 USD) and refuses the trade when that would overshoot `high` (3.6 USD) — including when even `volume_min` already risks more than `high`. The old fixed USD 3 cap is retired (section 12 sizing rule; funnel gate renamed `scope`). A fixed `--lot` is a diagnostic override and must still land inside the band.
+- **Per-trade risk (base sizing updated 2026-10-20):** start at `risk.default_lot` (default 0.01), then add individual 0.01 lots until actual 1R reaches `risk.sizing_scope_usd.low`. Skip when the base or the next required size exceeds `high`; never reduce below the base. Both bounds come from config. With both bounds disabled, use the base unchanged. Balance-based sizing also uses the base as its minimum. Widened-stop mode uses that same base instead of adding lots first (S1w above). The old fixed USD 3 cap is retired. A fixed `--lot` is an exact diagnostic override and must still land inside the band.
 - If the result is below `volume_min` (usually 0.01), **skip the trade**. Do not round up.
 - **Max 1 open position per pair.** If the pair already has an ongoing trade, skip it — no new entries.
 - **Max 1 entry per pair per calendar day** (broker server date of the H1 signal bar). A stop-out or time-stop exit does not allow same-day re-entry. Ablation may later test whether this adds value beyond the bar-cooldown in section 5.
@@ -316,7 +332,7 @@ Demo forward test (2-3 months) checks plumbing (fills, timing, slippage, swaps) 
 - Python on Windows with the MT5 terminal open and logged in. Evaluate once per H1 bar close for all pairs.
 - Every order carries a server-side SL and TP. The trailing stop is applied by modifying the SL each bar. On startup, reconcile open positions with system state.
 - Log every decision with its reason (including which rule vetoed a candidate). Kill switch: the daily, weekly and drawdown limits in 8A, plus a manual stop file.
-- Trade record: every fill appends one row to `trades/journal.csv` (`time_utc,symbol,direction,entry,sl,tp,lot,h4_bias,h4_ema20,h4_ema50,h4_sep_atr,hr1,trigger,spread_pts,slippage_pips,magic,comment,ticket,dry_run,reason`; the `h4_ema20`/`h4_ema50` column names are legacy labels — their VALUES follow the configured `h4_ema_fast`/`h4_ema_slow` periods). The MT5 on-chain comment is a short code only (`QT B1-L E1`, 31-char limit); the full reason lives in the journal + log.
+- Trade record: every fill appends one row to `trades/journal.csv` (`time_utc,symbol,direction,entry,sl,tp,lot,h4_bias,h4_ema20,h4_ema50,h4_sep_atr,hr1,trigger,spread_pts,slippage_pips,magic,comment,ticket,dry_run,reason`; the `h4_ema20`/`h4_ema50` column names are legacy labels — their VALUES follow the configured `bias_ema_fast_period`/`bias_ema_slow_period` periods). The MT5 on-chain comment is a short code only (`QT B1-L E1`, 31-char limit); the full reason lives in the journal + log.
 - Panel: `python -m quant.monitor` prints bias + entry checklist per pair (`GO` or first failing section-5 rule, `*` = open position), repainted only on a new closed H1 bar. Header rows: laptop local time (Malaysia UTC+8), broker last-H1-close time (UTC), per-account week P&L with `HALTED` banner at the `WEEKLY_LOSS_PCT` limit. `NONE DETECTED` when no pair holds UP/DOWN H4 bias; per-pair `DATA ERROR` rows otherwise. Halt state persists in `memory/weekly_<demo|real>.json`.
 - Executor: `python -m quant.live --roundtrip` (open + immediate market close) and `--touch-close` (open with close SL+TP, broker closes on first touch, timeout falls back to market close). No signal entries yet. Dry-run default; real orders need `--no-dry-run` plus exactly one enabled account. Both legs journaled.
 - Trading loop (built, 2026-10-18): `python -m quant.monitor --trade` = the panel PLUS the trading supervisor. Nothing trades unless this process runs — closing the window closes the system. Layers, in order per new closed H1 bar: same-bar stamp memory file (`memory/live_<demo|real>.json`, restart double-send guard) -> per-pair open check -> weekly halt -> daily portfolio cap + structural 1-per-pair-per-day -> no-trade windows -> shared portfolio caps (`risk.max_total_positions`, `risk.max_ccy_net`) -> E1 gate on fresh closed bars -> cost gate + sizing scope with the SAME `quant/rules.py` math as the backtest -> market entry with broker-side SL/TP attached. Adopted from broker IN-deal history + journal rows on restart (position context survives; one loud "adopt" journal row if a position has no row). Trail/BE (`use_trail/trail_r/use_be/be_trigger_r/be_buffer`, off stays off) evaluates every cycle (~60s) against the best bid since entry. Every event lands in `trades/journal.csv` (columns extended with `position` + `risk_usd`; legacy header auto-upgrades). Launch: `start-trader.bat` (dry-run default; real orders only with `--no-dry-run`, one enabled account, and the user's own action).
@@ -333,7 +349,7 @@ Demo forward test (2-3 months) checks plumbing (fills, timing, slippage, swaps) 
 - [x] HR1 variant: HR1a (close) is the baseline (section 4)
 - [x] Baseline stop = S1 (1.5 x H1 ATR), take profit 3R = 4.5 x H1 ATR
 - [x] E1 setup defined exactly (section 5); E1-only for the first build
-- [ ] `atr_n`: 7 vs 14 (test)
+- [ ] `entry_atr_period`: 7 vs 14 (test)
 - [ ] `ext_atr` / `edge_atr`: keep equal to `stop_atr` (1.5) or test 1.0 and 2.0
 - [ ] Loss limits in 8A: daily / weekly limits, drawdown ladder levels, open-risk cap (calibrate in the backtest)
 - [ ] Whether to use `pair_pause` (test only)
@@ -363,7 +379,7 @@ one is active — the engine reads `configs/_base.yaml` ONLY:
 
 ### 16.1 Daily directional bias
 - EMA 20 and EMA 100 on the DAILY chart determine the trend
-  (`bias.h4_ema_fast` / `h4_ema_slow` are read on D1 bars in this variant).
+  (`bias_ema_fast_period` / `bias_ema_slow_period` are read on D1 bars in this variant).
 - EMA20 above EMA100 = bullish bias; below = bearish; mirror for shorts.
 - **Flat rule:** if price closes beyond EMA100 AGAINST the maintained
   direction, the market is flat and no trading happens.
@@ -379,17 +395,21 @@ one is active — the engine reads `configs/_base.yaml` ONLY:
 ### 16.2 H4 setup and entry (the W1 sweep)
 - H4 EMA20/EMA100 must agree with the Daily bias: W1's alignment check — the
   entry chart's fast/slow EMA relation must point the same way as the regime
-  bias (`h1_ema_fast`/`h1_ema_slow` carry the H4 EMA lengths here: 20/100).
-- Setup + trigger in one: the last CLOSED H4 candle's low (long) or high
-  (short) penetrates AGAINST the EMA20 — the EMA100 is irrelevant to the
-  sweep itself (spec: "don't care"). Any touch counts (`w1_pen_atr: 0.0`;
-  raise it to demand a deeper sweep).
-- The candle's OPEN must sit on the trade side of the EMA20
-  (`w1_open_side: true`; long: open above EMA20, mirror for shorts).
+  bias (`entry_ema_fast_period`/`entry_ema_slow_period` set the H4 EMA lengths here: 20/100).
+- Setup + trigger in one: the last CLOSED H4 candle must close on the trade
+  side of EMA20 (above for long; below for short). Enable either or both:
+  `w1_touch_from_trend_side` = open on the trade side, wick touches across
+  EMA20; `w1_cross_from_other_side` = open on the opposite side and close back
+  on the trade side. Each switch applies to both buys and sells. An exact
+  touch counts with `w1_pen_atr: 0.0`; raise it to demand a deeper reach.
+  EMA100 matters for H4 alignment, not for the candle's touch.
 - Entry order: enter in the Daily bias direction at the NEXT H4 bar open after
   the candle closes — the execution model is unchanged (signal on bar t, fill
   at t+1, costs on top; sections 3, 6, 9, 10 apply as written, with all ATR
   here read on H4).
+- Offline H4/D1 signals read broker-exported H4 and D1 CSVs beside the H1 CSV.
+  Missing files stop the run; UTC-resampled H1 candles no longer substitute
+  for these two charts. Broker and data source must match live.
 - Not part of this spec, therefore OFF: E1-setup, E1-trigger and HR2
   (`use_*: false`); EXT/HR3/HR4 stay off as in the baseline. With those off,
   W1 is the only entry-side gate besides the bias.

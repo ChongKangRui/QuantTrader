@@ -70,6 +70,38 @@ def test_append_writes_header_once_and_row_is_right(tmp_path):
     assert r["notes"] == ""
 
 
+def test_new_role_named_params_fill_existing_ledger_columns(tmp_path):
+    root, run = _run_dir(tmp_path)
+    params_path = run / "params.json"
+    params = json.loads(params_path.read_text(encoding="utf-8"))
+    params["strategy"].update({
+        "entry_ema_fast_period": 18, "entry_ema_slow_period": 80,
+        "bias_ema_fast_period": 24, "bias_ema_slow_period": 120,
+        "bias_atr_period": 21, "entry_atr_period": 14})
+    params_path.write_text(json.dumps(params), encoding="utf-8")
+    append(run)
+    row = _rows(root / "_ledger.csv")[0]
+    assert [row[k] for k in ("h1_ema_fast", "h1_ema_slow", "h4_ema_fast",
+                             "h4_ema_slow", "h4_atr_n", "atr_n")] == [
+                                 "18", "80", "24", "120", "21", "14"]
+
+
+def test_ledger_records_the_widened_stop_mode(tmp_path):
+    root, run = _run_dir(tmp_path)
+    params_path = run / "params.json"
+    params = json.loads(params_path.read_text(encoding="utf-8"))
+    params["default_lot"] = 0.02
+    params["stop_sizing"] = {"widen_stop_to_scope": True, "fixed_lot": 0.01,
+                              "max_stop_atr": 3.0, "increase_lots_if_widening_fails": True}
+    params_path.write_text(json.dumps(params), encoding="utf-8")
+    append(run)
+    row = _rows(root / "_ledger.csv")[0]
+    assert row["widen_stop"] == "Y"
+    assert row["default_lot"] == "0.02"
+    assert row["increase_lots_if_widening_fails"] == "Y"
+    assert row["stop_lot"] == "0.01" and row["stop_max_atr"] == "3"
+
+
 def test_incomplete_folder_is_skipped(tmp_path):
     root, _ = _run_dir(tmp_path)
     (root / "half_run").mkdir()

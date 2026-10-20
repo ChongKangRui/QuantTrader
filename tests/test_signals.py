@@ -65,6 +65,20 @@ def test_warmup_and_bad_direction():
     assert check_entry(_frame(bars), "SIDEWAYS", {})["fail"] == "direction"
 
 
+def test_entry_period_names_work_and_override_old_names():
+    bars, _ = _go_bars()
+    frame = _frame(bars)
+    old = {"atr_n": 14, "h1_ema_fast": 60, "h1_ema_slow": 100}
+    new = {"entry_atr_period": 14, "entry_ema_fast_period": 60,
+           "entry_ema_slow_period": 100}
+    expected = check_entry(frame, "LONG", old)
+    assert check_entry(frame, "LONG", new) == expected
+    conflicting = {**old, **new, "atr_n": 2, "h1_ema_fast": 2,
+                   "h1_ema_slow": 2}
+    assert check_entry(frame, "LONG", conflicting) == expected
+    assert expected["atr"] != check_entry(frame, "LONG", {})["atr"]
+
+
 def test_hr2_fails_on_doji():
     bars, _ = _go_bars()
     o, h, lo, c = bars[-1]
@@ -236,3 +250,41 @@ def test_w1_off_autopasses():
     # the result object keeps the raw computed outcome visible for debugging
     on = check_entry(_frame(_w1_bars("SHORT")[0]), "SHORT", dict(_W1_ISO))
     assert on["checks"]["W1"] is True  # same bar, gate on: real pass (not auto)
+
+
+def test_w1_h4_two_patterns_work_for_buys_and_sells():
+    for side in ("LONG", "SHORT"):
+        bars, fast = _w1_bars(side)
+        params = dict(_W1_ISO, w1_touch_from_trend_side=True,
+                      w1_cross_from_other_side=True)
+        assert check_entry(_frame(bars), side, params)["signal"] is True
+
+        crossed = list(bars)
+        o, hi, lo, c = crossed[-1]
+        crossed[-1] = ([fast - 0.3, hi, fast - 0.4, c] if side == "LONG" else
+                       [fast + 0.3, fast + 0.4, lo, c])
+        assert check_entry(_frame(crossed), side, params)["signal"] is True
+        assert check_entry(_frame(crossed), side, dict(
+            params, w1_cross_from_other_side=False))["fail"] == "W1"
+        assert check_entry(_frame(bars), side, dict(
+            params, w1_touch_from_trend_side=False))["fail"] == "W1"
+        assert check_entry(_frame(bars), side, dict(
+            params, w1_touch_from_trend_side=False,
+            w1_cross_from_other_side=False))["fail"] == "W1"
+
+
+def test_w1_h4_rejects_wrong_close_and_open_on_ema():
+    params = dict(_W1_ISO, w1_touch_from_trend_side=True,
+                  w1_cross_from_other_side=True)
+    for side in ("LONG", "SHORT"):
+        bars, fast = _w1_bars(side)
+        wrong = list(bars)
+        o, hi, lo, _ = wrong[-1]
+        wrong[-1] = [o, hi, lo, fast - 0.2 if side == "LONG" else fast + 0.2]
+        assert check_entry(_frame(wrong), side, params)["fail"] == "W1"
+        equal_close = list(bars)
+        equal_close[-1] = [o, hi, lo, fast]
+        assert check_entry(_frame(equal_close), side, params)["fail"] == "W1"
+        at_ema = list(bars)
+        at_ema[-1] = [fast, hi, lo, bars[-1][3]]
+        assert check_entry(_frame(at_ema), side, params)["fail"] == "W1"

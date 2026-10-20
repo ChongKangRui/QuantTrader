@@ -1,6 +1,6 @@
-"""Shared H4 trend-bias core (B1). Pure pandas, no MT5 import.
+"""Shared bias-chart trend core (B1). Pure pandas, no MT5 import.
 
-Baseline B1 (STRATEGY.md section 4): on the last CLOSED H4 bar, LONG when
+Baseline B1 (STRATEGY.md section 4): on the last CLOSED bias bar, LONG when
 EMA20 > EMA50, close > EMA50 (HR1a), and (EMA20 - EMA50) >= sep_min * ATR14
 (Wilder). Mirror for SHORT. Strict inequalities: equality/doji -> NEUTRAL.
 Callers must pass closed bars only, never the forming bar.
@@ -16,6 +16,13 @@ EMA_SLOW = 50
 ATR_PERIOD = 14
 SEP_MIN_DEFAULT = 0.3
 MIN_BARS = 70  # slow EMA + ATR warmup plus margin
+
+
+def bias_periods(params: dict) -> tuple[int, int, int]:
+    """Bias chart periods; accept old timeframe-named keys from older configs."""
+    return (int(params.get("bias_ema_fast_period", params.get("h4_ema_fast", EMA_FAST))),
+            int(params.get("bias_ema_slow_period", params.get("h4_ema_slow", EMA_SLOW))),
+            int(params.get("bias_atr_period", params.get("h4_atr_n", ATR_PERIOD))))
 
 
 @dataclass(frozen=True)
@@ -46,9 +53,9 @@ def h4_bias(h4: pd.DataFrame, sep_min: float = SEP_MIN_DEFAULT, hr1: str = "a",
             use_atr_sep: bool = True, min_bars: int = 300,
             ema_fast: int = EMA_FAST, ema_slow: int = EMA_SLOW,
             atr_n: int = ATR_PERIOD) -> Bias:
-    """Bias from the last row of a closed-bar H4 frame (needs open/high/low/close).
+    """Bias from the last row of a closed regime frame (needs open/high/low/close).
 
-    ema_fast/ema_slow/atr_n come from config (h4_ema_fast/h4_ema_slow/h4_atr_n);
+    ema_fast/ema_slow/atr_n come from the bias chart's configured periods;
     the constants above are the locked B1 defaults, never re-tuned silently.
     hr1 selects the STRATEGY.md section 4 variant: a = close past ema_slow
     (baseline), b = full body past, c = whole candle past.

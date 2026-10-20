@@ -1,4 +1,4 @@
-"""H1 entry core (STRATEGY.md sections 5-7). Pure pandas, no MT5 import.
+"""Execution-chart entry core (STRATEGY.md sections 5-7, 16). No MT5 import.
 
 E1 pullback-resume plus the hard rules only (HR2/HR3/HR4/extension cap),
 plus the optional W1 wick-sweep gate (off until its config switch is on).
@@ -13,9 +13,9 @@ import pandas as pd
 # Section-5 parameter table. Callers override per key from config.
 # use_* flags switch gates off for ablation (off = gate auto-passes).
 DEFAULTS = {
-    "atr_n": 7,
-    "h1_ema_fast": 20,
-    "h1_ema_slow": 50,
+    "entry_atr_period": 7,
+    "entry_ema_fast_period": 20,
+    "entry_ema_slow_period": 50,
     "warmup_bars": 300,
     "stop_atr": 1.5,
     "tp_mult": 3.0,
@@ -83,8 +83,14 @@ def _result(signal: bool, fail: str | None, checks: dict, level=None, atr=None) 
 
 
 def check_entry(h1: pd.DataFrame, direction: str, params: dict | None = None) -> dict:
-    """Full E1 gate for one direction on closed bars. t = last row (signal bar)."""
+    """Entry gates on closed execution bars. t = last row (signal bar)."""
     p = {**DEFAULTS, **(params or {})}
+    # Keep old flat configs working without letting legacy keys override new ones.
+    for new, old in (("entry_atr_period", "atr_n"),
+                     ("entry_ema_fast_period", "h1_ema_fast"),
+                     ("entry_ema_slow_period", "h1_ema_slow")):
+        if params is not None and new not in params and old in params:
+            p[new] = params[old]
     warmup = int(p["warmup_bars"])
     lookback = int(p["lookback"])
     n = int(p["pivot_n"])
@@ -95,9 +101,9 @@ def check_entry(h1: pd.DataFrame, direction: str, params: dict | None = None) ->
         return _result(False, "direction", {}, None, None)
 
     close, high, low = h1["close"], h1["high"], h1["low"]
-    efast = _ema(close, int(p["h1_ema_fast"]))
-    eslow = _ema(close, int(p["h1_ema_slow"]))
-    atr = _atr_wilder(high, low, close, int(p["atr_n"]))
+    efast = _ema(close, int(p["entry_ema_fast_period"]))
+    eslow = _ema(close, int(p["entry_ema_slow_period"]))
+    atr = _atr_wilder(high, low, close, int(p["entry_atr_period"]))
     t = len(h1) - 1
     o, hi, lo, c = (float(h1[col].iloc[t]) for col in ("open", "high", "low", "close"))
     a = float(atr.iloc[t])
@@ -106,6 +112,9 @@ def check_entry(h1: pd.DataFrame, direction: str, params: dict | None = None) ->
     body, rng = abs(c - o), hi - lo
     checks: dict[str, bool] = {}
     w1_depth = float(p.get("w1_pen_atr", 0.0)) * a  # W1 sweep yardstick
+    # The two-pattern mode is opt-in so older W1 configurations keep their behavior.
+    w1_patterns = params is not None and ("w1_touch_from_trend_side" in params
+                                           or "w1_cross_from_other_side" in params)
 
     if side == "LONG":
         checks["HR2"] = rng > 0 and body / rng >= float(p["min_body_ratio"]) and c > o
@@ -129,10 +138,13 @@ def check_entry(h1: pd.DataFrame, direction: str, params: dict | None = None) ->
         checks["E1-trigger"] = c > float(efast.iloc[t]) and c > float(high.iloc[t - 1])
         # W1 · wick swept the fast EMA against the trade; the chart's own
         # fast/slow EMA relation must agree with the bias direction
-        checks["W1"] = (float(efast.iloc[t]) > float(eslow.iloc[t])
-                        and float(low.iloc[t]) <= float(efast.iloc[t]) - w1_depth
-                        and (o > float(efast.iloc[t]) if bool(p.get("w1_open_side", False))
-                             else True))
+        fast = float(efast.iloc[t])
+        open_ok = ((bool(p.get("w1_touch_from_trend_side")) and o > fast)
+                   or (bool(p.get("w1_cross_from_other_side")) and o < fast))
+        checks["W1"] = (fast > float(eslow.iloc[t])
+                        and lo <= fast - w1_depth
+                        and ((c > fast and open_ok) if w1_patterns else
+                             (o > fast if bool(p.get("w1_open_side", False)) else True)))
         level = hl[1]
     else:
         checks["HR2"] = rng > 0 and body / rng >= float(p["min_body_ratio"]) and c < o
@@ -154,10 +166,13 @@ def check_entry(h1: pd.DataFrame, direction: str, params: dict | None = None) ->
                       for i in win)
         checks["E1-setup"] = touch and nobreak
         checks["E1-trigger"] = c < float(efast.iloc[t]) and c < float(low.iloc[t - 1])
-        checks["W1"] = (float(efast.iloc[t]) < float(eslow.iloc[t])
-                        and float(high.iloc[t]) >= float(efast.iloc[t]) + w1_depth
-                        and (o < float(efast.iloc[t]) if bool(p.get("w1_open_side", False))
-                             else True))
+        fast = float(efast.iloc[t])
+        open_ok = ((bool(p.get("w1_touch_from_trend_side")) and o < fast)
+                   or (bool(p.get("w1_cross_from_other_side")) and o > fast))
+        checks["W1"] = (fast < float(eslow.iloc[t])
+                        and hi >= fast + w1_depth
+                        and ((c < fast and open_ok) if w1_patterns else
+                             (o < fast if bool(p.get("w1_open_side", False)) else True)))
         level = lh[1]
 
     # Ablation switches: a disabled gate auto-passes (still reported per gate).

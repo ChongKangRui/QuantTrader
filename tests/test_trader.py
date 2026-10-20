@@ -367,7 +367,7 @@ def test_read_trade_cfg_same_yaml_paths_as_engine(tmp_path):
     d.mkdir()
     (d / "_base.yaml").write_text(yaml.safe_dump({
         "live": {"magic": 777, "dry_run_default": True},
-        "risk": {"max_total_positions": 4, "max_ccy_net": 2,
+        "risk": {"max_total_positions": 4, "max_ccy_net": 2, "default_lot": 0.02,
                  "scale_lot_with_balance": True, "balance_risk_pct": 2.5,
                  "sizing_scope_usd": {"low": 12, "high": 30}},
         "limits": {"max_trades_per_day": 20, "max_cost_ratio": 0.15,
@@ -375,6 +375,7 @@ def test_read_trade_cfg_same_yaml_paths_as_engine(tmp_path):
         "costs": {"spread_pips": 1.5, "slippage_pips": 0.3},
     }), encoding="utf-8")
     cfg = read_trade_cfg(d)
+    assert cfg["default_lot"] == cfg["stop_sizing"]["fixed_lot"] == 0.02
     assert cfg["magic"] == 777 and cfg["dry_run_default"] is True
     assert cfg["max_total_positions"] == 4 and cfg["max_ccy_net"] == 2
     assert cfg["scale_lot_with_balance"] is True and cfg["balance_risk_pct"] == 2.5
@@ -383,6 +384,7 @@ def test_read_trade_cfg_same_yaml_paths_as_engine(tmp_path):
     assert cfg["ranges"] == () and cfg["costs"]["spread_pips"] == 1.5
     # missing file -> engine defaults, everything still a working dict
     cfg2 = read_trade_cfg(tmp_path / "nope")
+    assert cfg2["default_lot"] == 0.01
     assert cfg2["magic"] == 100001 and cfg2["dry_run_default"] is True
     assert cfg2["max_total_positions"] == 0 and cfg2["scope_high"] == 0.0
     assert cfg2["scale_lot_with_balance"] is False and cfg2["balance_risk_pct"] == 3.0
@@ -403,3 +405,118 @@ def test_plan_entry_scaled_aim_uses_scope_fence():
     busting = tr.plan_entry("LONG", 1.1050, 0.0010, "EURUSD", info, params, {},
                             2.5, 3.6, 0.10, risk_target=10.0)
     assert busting == (None, "scope")  # 10 -> 7 steps x 1.5 = 10.5 busts the ceiling
+
+
+def test_plan_entry_widens_the_stop_instead_of_adding_lots():
+    """stop_sizing: fixed lot, the stop grows until that lot reaches the floor."""
+    params = {"stop_atr": 1.0, "tp_mult": 3.0}
+    info = SimpleNamespace(symbol="EURUSD", point=0.00001, trade_tick_size=0.00001,
+                           trade_tick_value=1.0, digits=5, spread=0,
+                           volume_min=0.01, volume_max=100.0, volume_step=0.01,
+                           trade_stops_level=0)
+    sizing = {"widen_stop_to_scope": True, "fixed_lot": 0.01, "max_stop_atr": 5.0}
+    plan, why = tr.plan_entry("LONG", 1.1000, 0.0010, "EURUSD", info, params, {},
+                              4.0, 5.5, 0.10, stop_sizing=sizing)
+    assert why == "" and plan["lots"] == 0.01
+    # 10-pip stop risks 1.00 USD at 0.01 lot -> widened to 40 pips (4.00 USD)
+    assert abs(plan["stop_dist"] - 0.0040) < 1e-9
+    assert abs(plan["tp_dist"] - 0.0120) < 1e-9   # the target follows the stop
+    assert plan["risk_usd"] == pytest.approx(4.0, rel=0.01)
+    # beyond the ATR cap the trade is refused, not taken with a huge stop
+    capped = dict(sizing, max_stop_atr=3.0)
+    assert tr.plan_entry("LONG", 1.1000, 0.0010, "EURUSD", info, params, {},
+                          4.0, 5.5, 0.10, stop_sizing=capped) == (None, "stop-cap")
+    # percent sizing cannot run with a fixed lot
+    assert tr.plan_entry("LONG", 1.1000, 0.0010, "EURUSD", info, params, {},
+                          4.0, 5.5, 0.10, risk_target=4.0,
+                          stop_sizing=sizing) == (None, "config")
+
+
+@pytest.mark.parametrize("direction", ["LONG", "SHORT"])
+def test_plan_entry_lot_fallback_and_guards(direction):
+    info = SimpleNamespace(symbol="EURUSD", point=0.00001, trade_tick_size=0.00001,
+                           trade_tick_value=1.0, digits=5, spread=0,
+                           volume_min=0.01, volume_max=100.0, volume_step=0.01,
+                           trade_stops_level=0)
+    params = {"stop_atr": 1.0, "tp_mult": 3.0}
+    sizing = {"widen_stop_to_scope": True, "fixed_lot": 0.01,
+              "max_stop_atr": 3.0, "increase_lots_if_widening_fails": True}
+    def plan(low=4.0, high=5.5, costs=None):
+        return tr.plan_entry(direction, 1.1000, 0.0010, "EURUSD", info, params,
+                             costs or {}, low, high, 0.10, stop_sizing=sizing)
+
+    result, why = plan()
+    assert why == "" and result["lot_fallback"]
+    assert result["lots"] == pytest.approx(0.04)
+    assert result["risk_usd"] == pytest.approx(4.0)
+    assert result["stop_dist"] == pytest.approx(0.0010)
+    assert result["tp_dist"] == pytest.approx(0.0030)
+    assert plan(4.1, 4.5) == (None, "scope")  # snapped 0.05 lot risks too much
+    info.spread = 20
+    assert plan() == (None, "cost")
+    info.spread = 0
+    info.trade_stops_level = 200
+    assert plan() == (None, "stops-level")
+    info.trade_stops_level = 0
+    info.volume_max = 0.03
+    assert plan() == (None, "scope")  # broker volume clamp falls below floor
+
+
+@pytest.mark.parametrize("atr,expected_lot", [(0.0015, 0.03), (0.0010, 0.04), (0.003, None)])
+def test_plan_entry_stacks_above_base(atr, expected_lot):
+    info = SimpleNamespace(symbol="EURUSD", point=0.00001, trade_tick_size=0.00001,
+                           trade_tick_value=1.0, digits=5, spread=0,
+                           volume_min=0.01, volume_max=100.0, volume_step=0.01,
+                           trade_stops_level=0)
+    result, why = tr.plan_entry("LONG", 1.1000, atr, "EURUSD", info,
+                                {"stop_atr": 1.0, "tp_mult": 2.5}, {},
+                                4.0, 5.5, 0.10, default_lot=0.02)
+    if expected_lot is None:
+        assert result is None and why == "scope"
+    else:
+        assert why == "" and result["lots"] == pytest.approx(expected_lot)
+
+
+def test_plan_entry_new_base_controls_widening_and_fallback():
+    info = SimpleNamespace(symbol="EURUSD", point=0.00001, trade_tick_size=0.00001,
+                           trade_tick_value=1.0, digits=5, spread=0,
+                           volume_min=0.01, volume_max=100.0, volume_step=0.01,
+                           trade_stops_level=0)
+    sizing = {"widen_stop_to_scope": True, "fixed_lot": 0.01, "max_stop_atr": 3.0,
+              "increase_lots_if_widening_fails": True}
+    def plan():
+        return tr.plan_entry("LONG", 1.1000, 0.0010, "EURUSD", info,
+                             {"stop_atr": 1.0, "tp_mult": 2.5}, {},
+                             4.0, 5.5, 0.10, default_lot=0.02, stop_sizing=sizing)
+    result, why = plan()
+    assert why == "" and result["lots"] == 0.02 and not result["lot_fallback"]
+    assert result["stop_dist"] == pytest.approx(0.002)
+    sizing["max_stop_atr"] = 1.5
+    result, why = plan()
+    assert why == "" and result["lots"] == 0.04 and result["lot_fallback"]
+    assert result["stop_dist"] == pytest.approx(0.001)
+
+
+def test_plan_entry_refuses_a_broker_minimum_lot_that_breaks_the_band():
+    params = {"stop_atr": 1.0, "tp_mult": 3.0}
+    info = SimpleNamespace(symbol="EURUSD", point=0.00001, trade_tick_size=0.00001,
+                           trade_tick_value=1.0, digits=5, spread=0,
+                           volume_min=0.10, volume_max=100.0, volume_step=0.01,
+                           trade_stops_level=0)
+    sizing = {"widen_stop_to_scope": True, "fixed_lot": 0.01, "max_stop_atr": 5.0}
+    # the broker forces 0.10 lot -> 40 USD of risk, far above the 5.5 ceiling
+    assert tr.plan_entry("LONG", 1.1000, 0.0010, "EURUSD", info, params, {},
+                          4.0, 5.5, 0.10, stop_sizing=sizing) == (None, "scope")
+
+
+def test_plan_entry_refuses_a_stop_the_broker_would_reject():
+    params = {"stop_atr": 1.0, "tp_mult": 3.0}
+    info = SimpleNamespace(symbol="EURUSD", point=0.00001, trade_tick_size=0.00001,
+                           trade_tick_value=1.0, digits=5, spread=0,
+                           volume_min=0.01, volume_max=100.0, volume_step=0.01,
+                           trade_stops_level=200)  # 200 points = 20 pips
+    sizing = {"widen_stop_to_scope": True, "fixed_lot": 0.01, "max_stop_atr": 5.0}
+    # scope_low 0.4 USD -> the stop stays at 10 pips, below the broker minimum
+    plan, why = tr.plan_entry("LONG", 1.1000, 0.0010, "EURUSD", info, params, {},
+                              0.4, 5.5, 0.10, stop_sizing=sizing)
+    assert why == "stops-level" and plan is None
