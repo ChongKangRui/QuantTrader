@@ -16,6 +16,21 @@
 - [ ] H4->D1 variant (code done 2026-10-19): flip `_base.yaml` timeframes,
   run its own batch + TESTLOG row, re-tune knob expectations — user runs
   backtests. Probes stay H1/H4-only until a D1 dice null is designed.
+- [x] System check (2026-10-19 ~23:40, agent, read-only) RESOLVED same day:
+  the "Held (N bars)" report failures are gone — the report is now
+  combo-driven (`report.py` reads `timeframes` from params.json; the Held
+  header labels the execution TF by design, tests assert the JS template).
+  Full suite 2026-10-19: 198 passed, 0 failed. Still not verified against a
+  terminal (no smoke).
+- [ ] H4->D1 batch (latest new strategy) — report edits settled 2026-10-19
+  (combo-driven report + bias shading shipped). Still HELD on user's calls:
+  D1 fence ceiling ([4,5.5] = 5/9 pairs vs [4,8] = 9/9) and the two frequency
+  knobs (max 2/pair/week, pair-day disable after a loss — NOT BUILT). Then:
+  `Copy-Item configs/_base_h4d1.yaml
+  configs/_base.yaml -Force` -> write the TESTLOG pre-declaration ->
+  `$env:PYTHONPATH="python"; uv run python -m quant.backtest --batch` ->
+  revert `Copy-Item configs/_base_h1h4.yaml configs/_base.yaml -Force`
+  (live default stays H4->D1 only if user promotes it).
 
 ### Verdict track (timebox: 2-3 more experiments, then decide)
 
@@ -43,6 +58,71 @@
 
 ## 2026-10-19
 
+- **Report rebuilt combo-driven; Daily regime view + bias shading shipped**
+  (`quant/report.py`, `quant/backtest.py`, `tests/test_report.py`). The popup
+  now follows the RUN's own timeframes from `params.json`: execution chart
+  first (default view), regime chart second (4H baseline / Daily for H4->D1),
+  plus the raw H1 tape whenever execution != H1. New per-run artifact
+  `bias_<SYM>.csv` (time, direction, hr1 per regime bar — captured from the
+  same `bias_frames` the scan used, `backtest.py:write_bias_maps`) shades the
+  regime view: LONG green / SHORT red / NEUTRAL grey, regime chart only,
+  clipped to the window; old runs without the file show no shading. EMA
+  periods follow the run (entry EMAs on exec, regime EMAs on the regime
+  view; payload keys `emaH1/emaH4` -> `emaExec/emaRegime`, old params still
+  read). "Held (N bars)" header counts execution-TF bars. Old runs without
+  a `timeframes` key fall back to H1->H4 — validated by rebuilding
+  `backtest_results/20261019_200214` (3790 trades, fallback keys correct,
+  no raw/spans keys). Tests: 198 passed (+2: `_bias_spans` merge/pad, D1
+  combo embed with shading). Not verified in a browser (static HTML/JS
+  checks only); no real H4->D1 run exists yet, its report shape is covered
+  by the unit test only.
+
+- **Sizing-switch comment expanded in both active copies** (`_base.yaml`,
+  `_base_h4d1.yaml`): `scale_lot_with_balance` now documents the two engines —
+  OFF = fence sizing (floor is the target; SCOPE path), ON = percent sizing
+  (target = balance_risk_pct % x the balance at entry; backtest walk starts at
+  benchmarks.account_usd; live = MT5 balance; fence only guards). The stale
+  fence NOTE (old 2.5/3.6 numbers) was replaced with the measured facts: H4
+  bricks ~2.2-4.9 USD, the (2.75, 4.00)-brick dead band refuses EURUSD/USDJPY/
+  USDCHF/EURJPY at [4, 5.5], high ~=8 revives all nine.
+- **STRATEGY.md v1.0: variant strategy V-D1 recorded as section 16**
+  (Daily EMA20/100 bias + flat rule, W1 sweep vs the H4 EMA20 with OPEN-side
+  on, RR 1:2.5, trailing = separate exit model later). The spec's frequency
+  rules (max 2/pair/week, pair-day disable after a loss) are recorded as NOT
+  BUILT; open decisions list fence choice [4,5.5] vs [4,8], sep 0.0 literal
+  flat rule, warmup, and the RR comparison. Version bumped v0.9 -> v1.0
+  ("Changes from v0.9" block added).
+
+- **Two config presets written, both INERT** (`configs/_base_h1h4.yaml`,
+  `configs/_base_h4d1.yaml`). `_base_*` filenames are skipped by the pair
+  loader, so applying = `Copy-Item` over `_base.yaml`, revert =
+  `configs/_base_h1h4.yaml` back over it. The H4->D1 preset encodes the new
+  strategy per spec: D1 bias (B1 + HR1 ≈ the "flat beyond EMA100" rule), W1
+  sweep ON with `w1_open_side: true` and `w1_pen_atr: 0.0` (wick vs the H4
+  EMA20, EMA100 ignored), E1-setup/E1-trigger/HR2 off (not in the spec),
+  `h1_ema_fast/slow` = 20/100 (the H4 alignment pair), `tp_mult: 2.5`, trail
+  off. The spec's per-pair weekly cap (2) and daily loss-disable are marked
+  NOT BUILT inside the file. Active `_base.yaml` untouched (default combo
+  verified after the edit: H1->H4).
+- **W1 gate ("wick swept the fast EMA") — optional entry gate, OFF by default.**
+  The closed candle's wick pokes through the entry-chart fast EMA AGAINST the
+  trade (high above it for SHORT / low below it for LONG) while the entry
+  chart's fast/slow EMA relation agrees with the regime bias (H4->D1: H4
+  20/100 must point the same way the Daily 20/100 does). One shared rule in
+  `signals.check_entry` -> backtest, live loop and panel all get it from the
+  same code, zero live-specific lines. New keys in `strategy.entry` (all
+  switchable in yaml, none hardcoded): `use_w1` (default false = today
+  byte-identical), `w1_open_side` (candle must OPEN on the trade side of the
+  fast EMA), `w1_pen_atr` (min sweep depth, 0 = any touch). Funnel gets a
+  `w1` counter (first-failure code W1 sits after EXT, before E1-setup);
+  ledger gains a `use_w1` gate column — run `python -m quant.ledger
+  --rebuild` once (appends keep the old header until then). Deliberately NOT
+  here (user's strategy list, later knobs): max 2 per pair per week, a loss
+  disabling the pair for the day.
+- Tests: 196 passed (was 191; +5 W1: SHORT sweep + alignment block, LONG
+  mirror, open-side flag both sides, depth knob, off = auto-pass). Real-config
+  smoke: flatten reads the keys; a no-sweep frame blocks at exactly W1 when
+  forced on, passes untouched when off.
 - **Lot scaling switch (`scale_lot_with_balance`) — compounding sizing, OFF
   by default.** OFF is byte-identical to before (1R aims at the scope floor).
   ON = each entry re-aims its 1R at `balance_risk_pct` % of the account
@@ -55,7 +135,8 @@
   timestamp AFTER daily cap + portfolio pass (`scale_lots_to_balance`) so the
   balance timeline sees only trades that happened; exits book realized pnl,
   kept trades keep their `pnl_R` exactly, USD rescales (pnl_usd = R x new 1R,
-  swap x lot ratio); drops recorded in params.json. Live: aim = pct x
+  swap/risk_usd/tp_usd x lot ratio — MTM marks open trades at R x risk_usd,
+  stale risk would corrupt max_dd_mtm); drops recorded in params.json. Live: aim = pct x
   `account_info().equity` in the sizing path (`plan_entry(..., risk_target=)`);
   no equity/pct <= 0 -> unstamped DATA ERROR, retried next cycle. CLI:
   `--scale-lots` force ON + `--balance-risk-pct` override; mode + pct into

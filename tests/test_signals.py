@@ -1,7 +1,7 @@
 """Signals tests. Synthetic closed-bar frames only, no terminal, no data/."""
 import pandas as pd
 
-from quant.signals import check_entry, pivot_lows
+from quant.signals import _ema, check_entry, pivot_lows
 
 
 def _frame(bars):
@@ -157,3 +157,82 @@ def test_disabled_hr3_passes_giant_body():
     df = _frame(bars)
     assert check_entry(df, "LONG", {})["fail"] == "HR3"
     assert check_entry(df, "LONG", {"use_hr3": False})["fail"] != "HR3"
+
+
+# ── W1 · "wick swept the fast EMA" ──────────────────────────────────────────
+# 30-bar linear move: the EMA relation is aligned by construction (a falling
+# series puts EMA20 below EMA100, rising puts it above); closes fix the EMAs,
+# so open/high/low of the signal bar can be crafted around them exactly.
+
+_W1_ISO = {"use_w1": True, "use_hr2": False, "use_hr3": False, "use_hr4": False,
+           "use_ext": False, "use_e1_setup": False, "use_e1_trigger": False,
+           "warmup_bars": 12, "lookback": 5}
+
+
+def _w1_bars(side: str):
+    drift = -0.5 if side == "SHORT" else 0.5
+    closes = [120.0 + drift * i for i in range(30)]
+    ef = float(_ema(pd.Series(closes), 20).iloc[-1])
+    bars = [[closes[i - 1] if i else closes[0], closes[i] + 0.1,
+             closes[i] - 0.1, closes[i]] for i in range(30)]
+    if side == "SHORT":  # open below the fast EMA, wick pokes above it
+        bars[-1] = [ef - 0.3, ef + 0.4, closes[-1] - 0.1, closes[-1]]
+    else:                # mirror: open above, wick dips below
+        bars[-1] = [ef + 0.3, closes[-1] + 0.1, ef - 0.4, closes[-1]]
+    return bars, ef
+
+
+def test_w1_short_sweep_enters_and_alignment_blocks():
+    bars, _ef = _w1_bars("SHORT")
+    r = check_entry(_frame(bars), "SHORT", dict(_W1_ISO))
+    assert r["signal"] is True and r["checks"]["W1"] is True
+    # EMAs point UP -> no agreement with the SHORT bias -> the sweep is void
+    up_bars, _u = _w1_bars("LONG")
+    r2 = check_entry(_frame(up_bars), "SHORT", dict(_W1_ISO))
+    assert r2["signal"] is False and r2["fail"] == "W1"
+
+
+def test_w1_long_mirror_sweep():
+    bars, _ef = _w1_bars("LONG")
+    r = check_entry(_frame(bars), "LONG", dict(_W1_ISO))
+    assert r["signal"] is True and r["checks"]["W1"] is True
+    down_bars, _d = _w1_bars("SHORT")
+    r2 = check_entry(_frame(down_bars), "LONG", dict(_W1_ISO))
+    assert r2["signal"] is False and r2["fail"] == "W1"
+
+
+def test_w1_open_side_flag():
+    bars, ef = _w1_bars("SHORT")
+    iso = dict(_W1_ISO, w1_open_side=True)
+    assert check_entry(_frame(bars), "SHORT", iso)["signal"] is True  # opens below
+    bars2 = list(bars)
+    bars2[-1] = [ef + 0.3, ef + 0.4, bars2[-1][2], bars2[-1][3]]  # opens above
+    r = check_entry(_frame(bars2), "SHORT", iso)
+    assert r["signal"] is False and r["fail"] == "W1"
+    long_bars, ef_l = _w1_bars("LONG")
+    iso_l = dict(_W1_ISO, w1_open_side=True)
+    assert check_entry(_frame(long_bars), "LONG", iso_l)["signal"] is True
+    lb2 = list(long_bars)
+    lb2[-1] = [ef_l - 0.3, lb2[-1][1], ef_l - 0.4, lb2[-1][3]]  # opens below
+    r2 = check_entry(_frame(lb2), "LONG", iso_l)
+    assert r2["signal"] is False and r2["fail"] == "W1"
+
+
+def test_w1_pen_depth_knob():
+    bars, _ef = _w1_bars("SHORT")  # wick reaches ef + 0.4
+    shallow = check_entry(_frame(bars), "SHORT", dict(_W1_ISO, w1_pen_atr=0.1))
+    assert shallow["signal"] is True      # 0.4 >= 0.1 x ATR (~0.7)
+    deep = check_entry(_frame(bars), "SHORT", dict(_W1_ISO, w1_pen_atr=3.0))
+    assert deep["signal"] is False and deep["fail"] == "W1"  # far past the wick
+    zero = check_entry(_frame(bars), "SHORT", dict(_W1_ISO, w1_pen_atr=0.0))
+    assert zero["signal"] is True         # any touch counts
+
+
+def test_w1_off_autopasses():
+    # sweep geometry exists, but the gate is off: auto-pass, never a hidden False
+    bars, _ef = _w1_bars("SHORT")
+    r = check_entry(_frame(bars), "SHORT", {"warmup_bars": 12})
+    assert r["checks"]["W1"] is True
+    # the result object keeps the raw computed outcome visible for debugging
+    on = check_entry(_frame(_w1_bars("SHORT")[0]), "SHORT", dict(_W1_ISO))
+    assert on["checks"]["W1"] is True  # same bar, gate on: real pass (not auto)

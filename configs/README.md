@@ -1,5 +1,19 @@
 # Configs — `_base.yaml` and the pair files
 
+## Presets (kept inert next to `_base.yaml`)
+
+`_base_*` filenames are skipped by the pair loader, so full copies can sit
+here safely. The engine reads `configs/_base.yaml` ONLY:
+
+- `configs/_base_h1h4.yaml` — the default system (H1->H4); identical to
+  `_base.yaml`. Use it to switch back.
+- `configs/_base_h4d1.yaml` — the "Daily bias / H4 sweep" strategy: W1 gate
+  on with `w1_open_side: true`, E1-setup/trigger + HR2 off, `tp_mult: 2.5`,
+  trail off. NOTE inside: the spec's "max 2 per pair per week" and "a loss
+  disables the pair for the day" are not built — no knobs exist yet.
+- Apply one: `Copy-Item configs/_base_h4d1.yaml configs/_base.yaml -Force`
+- Revert:    `Copy-Item configs/_base_h1h4.yaml configs/_base.yaml -Force`
+
 `_base.yaml` = shared defaults, the single source of truth for strategy
 and risk. The engine and the live trader read the SAME keys from it.
 
@@ -33,6 +47,7 @@ reason). The yaml lists gates in reading order, not funnel order.
 | EXT | `strategy.entry` | not stretched: close stays close to the H1 fast EMA |
 | E1-setup | `strategy.entry` | pullback happened: within `lookback` bars price touched the H1 slow EMA WITHOUT closing below it (zone held) |
 | E1-trigger | `strategy.entry` | the fire button: the bar closed beyond the fast EMA AND beyond the previous bar's high (LONG) / low (SHORT) |
+| W1 | `strategy.entry` | optional extra gate: the wick swept through the fast EMA AGAINST the trade (high above it for SHORT / low below it for LONG) while the entry-chart fast/slow EMA relation agrees with the regime bias. Knobs: `w1_open_side` (candle must OPEN on the trade side of the fast EMA), `w1_pen_atr` (min sweep depth beyond the fast EMA; 0 = any touch) |
 
 `timeframes.position_checks: M1` selects the feed for open-trade checks.
 

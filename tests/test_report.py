@@ -88,15 +88,20 @@ def test_write_report_full(tmp_path):
     assert set(tb["embedded"]) == {"S1-0", "S1-1"}
     ctx = tb["embedded"]["S1-0"]
     # entry at index 100: window 0..160 (120 before, 40 after exit at 120)
-    assert len(ctx["t"]) == len(ctx["o"]) == len(ctx["c"]) == 161
-    assert ctx["efast"][0] is not None and ctx["eslow"][0] is not None
-    assert tb["emaH1"] == {"fast": 20, "slow": 50}   # no params.json -> B1 defaults
-    assert tb["emaH4"] == {"fast": 20, "slow": 50}
+    assert len(ctx["exec"]["t"]) == len(ctx["exec"]["o"]) == len(ctx["exec"]["c"]) == 161
+    assert ctx["exec"]["efast"][0] is not None and ctx["exec"]["eslow"][0] is not None
+    assert tb["tf"] == {"exec": "H1", "reg": "H4"}  # no params.json -> baseline combo
+    assert tb["emaExec"] == {"fast": 20, "slow": 50}   # no params.json -> B1 defaults
+    assert tb["emaRegime"] == {"fast": 20, "slow": 50}
+    assert "raw" not in ctx and "spans" not in ctx  # H1 exec: no duplicate tape view
     assert figs["equity"] is not None and figs["yearly"] is None  # no yearly.csv
     assert 'class="tot"' in html  # TOTAL row highlighted
     assert "TOTAL verdict" in html
-    # no broker H4 CSV -> the engine's H1 resample (build_h4) feeds the 4H view
-    assert ctx["h4"] is not None and ctx["h4"]["t"][0] == "2020-01-01 00:00"
+    # bars_held counts the EXECUTION grid: header label assembled in JS from
+    # TB.tf.exec (== "H1" here, asserted via the tf payload above)
+    assert "Held (' + TB.tf.exec + ' bars)" in html
+    # no broker H4 CSV -> the engine's H1 resample (build_htf) feeds the regime view
+    assert ctx["reg"] is not None and ctx["reg"]["t"][0] == "2020-01-01 00:00"
 
 
 def test_h4_window_embedded(tmp_path):
@@ -105,13 +110,13 @@ def test_h4_window_embedded(tmp_path):
     assert write_report(run, data) is True
     html = (run / "report.html").read_text(encoding="utf-8")
     ctx = _blob(html, "trades-json")["embedded"]["S1-0"]
-    h4 = ctx["h4"]
+    h4 = ctx["reg"]
     # broker file wins over the resample: its 01:00-anchored grid, bar 25 holds
     # the 04:00 entry; window is 60 bars before (clamped to bar 0) .. 20 after exit
     assert h4 is not None
     assert h4["t"][0] == "2020-01-01 01:00" and len(h4["t"]) == 50 == len(h4["c"])
     assert h4["efast"][0] is not None and h4["eslow"][-1] is not None
-    assert h4["t"] != ctx["t"]                       # the two views differ
+    assert h4["t"] != ctx["exec"]["t"]               # the two views differ
     assert '#ffd400' in html                         # yellow entry marker
     assert 'window.open' in html                     # chart renders in a popup
     assert '<script id="plotly-lib">' in html        # popup copies the lib at runtime
@@ -128,10 +133,11 @@ def test_ema_periods_follow_params(tmp_path):
     html = (run / "report.html").read_text(encoding="utf-8")
     tb = _blob(html, "trades-json")
     ctx = tb["embedded"]["S1-0"]
-    assert tb["emaH1"] == {"fast": 20, "slow": 100}
-    assert tb["emaH4"] == {"fast": 10, "slow": 200}
+    assert tb["emaExec"] == {"fast": 20, "slow": 100}
+    assert tb["emaRegime"] == {"fast": 10, "slow": 200}
     # keys rename: the window carries whichever period the run was configured with
-    assert ctx["efast"] is not None and ctx["eslow"] is not None and ctx["h4"]["eslow"] is not None
+    assert ctx["exec"]["efast"] is not None and ctx["exec"]["eslow"] is not None \
+        and ctx["reg"]["eslow"] is not None
 
 
 def test_ema_periods_fall_back_to_old_key_names(tmp_path):
@@ -141,8 +147,53 @@ def test_ema_periods_fall_back_to_old_key_names(tmp_path):
         {"strategy": {"ema_fast": 20, "ema_slow": 33}}), encoding="utf-8")
     assert write_report(run, data) is True
     tb = _blob((run / "report.html").read_text(encoding="utf-8"), "trades-json")
-    assert tb["emaH1"] == {"fast": 20, "slow": 33}
-    assert tb["emaH4"] == {"fast": 20, "slow": 50}
+    assert tb["tf"] == {"exec": "H1", "reg": "H4"}  # no timeframes key -> baseline
+    assert tb["emaExec"] == {"fast": 20, "slow": 33}
+    assert tb["emaRegime"] == {"fast": 20, "slow": 50}
+
+
+def test_bias_spans_merge(tmp_path):
+    from quant.report import _bias_spans
+
+    run = tmp_path / "run"
+    run.mkdir()
+    pd.DataFrame({
+        "time": ["2020-01-01 00:00", "2020-01-02 00:00", "2020-01-03 00:00",
+                 "2020-01-04 00:00", "2020-01-05 00:00"],
+        "direction": ["NEUTRAL", "NEUTRAL", "LONG", "LONG", "LONG"]}).to_csv(
+        run / "bias_S1.csv", index=False)
+    # consecutive same-direction rows merge; t1 pads to the regime bar close
+    assert _bias_spans(run, "S1", pad_hours=24) == [
+        {"t0": "2020-01-01 00:00", "t1": "2020-01-03 00:00", "d": "NEUTRAL"},
+        {"t0": "2020-01-03 00:00", "t1": "2020-01-06 00:00", "d": "LONG"}]
+    assert _bias_spans(tmp_path / "nope", "S1") == []  # missing artifact -> no shading
+
+
+def test_h4d1_combo_embedded_with_bias_shading(tmp_path):
+    run, data, _ = _run_dir(tmp_path)
+    (run / "params.json").write_text(json.dumps(
+        {"timeframes": {"execution": "H4", "regime": "D1"},
+         "strategy": {"h1_ema_fast": 20, "h1_ema_slow": 100,
+                      "h4_ema_fast": 20, "h4_ema_slow": 100}}), encoding="utf-8")
+    d1_times = pd.DatetimeIndex(pd.date_range("2020-01-01", periods=300,
+                                              freq="24h", tz="UTC"))
+    pd.DataFrame({"time": [str(t) for t in d1_times],
+                  "direction": ["NEUTRAL"] * 80 + ["LONG"] * 100 + ["NEUTRAL"] * 120}
+                 ).to_csv(run / "bias_S1.csv", index=False)
+    assert write_report(run, data) is True
+    html = (run / "report.html").read_text(encoding="utf-8")
+    tb = _blob(html, "trades-json")
+    assert tb["tf"] == {"exec": "H4", "reg": "Daily"}
+    assert "Held (' + TB.tf.exec + ' bars)" in html  # label built in JS
+    ctx = tb["embedded"]["S1-0"]
+    # exec view = the run's OWN grid (resampled H4); the raw H1 tape embeds too
+    assert ctx["exec"]["t"][0] == "2020-01-01 00:00"
+    assert ctx["raw"] is not None and ctx["raw"]["efast"] is None  # no tape overlays
+    d1 = ctx["reg"]
+    assert d1 is not None and d1["efast"] is not None  # regime EMAs on the Daily view
+    # the entry/exit days sit inside the opening NEUTRAL span -> clipped to it
+    assert [s["d"] for s in ctx["spans"]] == ["NEUTRAL"]
+    assert ctx["spans"][0]["t0"] <= d1["t"][0] and ctx["spans"][0]["t1"] >= d1["t"][-1]
 
 
 def test_missing_h1_and_yearly_skip(tmp_path):

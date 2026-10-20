@@ -3,10 +3,14 @@
 plotly.js is embedded exactly once. The overview figures render on load; each
 trade's candles are stored as a compact JSON blob and drawn only when the user
 clicks the trade row (rendered in a separate popup window), so the browser
-never renders the whole trade history at once. Both a 1H and a 4H window are
-embedded per trade (the report browser picks the timeframe); EMA20/50 are
-computed on the FULL series of each timeframe and sliced afterwards, so the
-overlays do not restart at the window edge.
+never renders the whole trade history at once. The views follow the RUN's own
+timeframes (params.json): the execution grid first (the popup default), then
+the regime chart (4H baseline / Daily for the H4->D1 variant) with the
+regime chart's bias direction shaded (from the run's bias_<SYM>.csv artifact),
+plus the raw H1 tape whenever the execution grid is not H1. EMA periods per
+view are the run's own (entry EMAs on the execution chart, regime EMAs on the
+regime chart), computed on the FULL series of each timeframe and sliced
+afterwards, so the overlays do not restart at the window edge.
 """
 
 import argparse
@@ -22,6 +26,15 @@ WINDOW_CAP = 800         # hard cap on H1 chart length in bars
 H4_BEFORE = 60           # H4 bars of context before entry (4H window, same doubling)
 H4_AFTER = 20            # H4 bars after exit
 H4_CAP = 400             # hard cap on 4H chart length in bars
+D1_BEFORE = 120          # D1 bars of context before entry (Daily regime window)
+D1_AFTER = 40            # D1 bars after exit
+D1_CAP = 400             # hard cap on Daily chart length in bars
+
+# candle-window context per timeframe (before, after, cap)
+_TF_VIEW = {"H1": (CONTEXT_BEFORE, CONTEXT_AFTER, WINDOW_CAP),
+            "H4": (H4_BEFORE, H4_AFTER, H4_CAP),
+            "D1": (D1_BEFORE, D1_AFTER, D1_CAP)}
+_TF_HOURS = {"H4": 4, "D1": 24}   # engine resample hours when no broker file
 
 
 def try_write_report(run_dir: Path | str, data_dir: Path | str = "data") -> bool:
@@ -144,35 +157,107 @@ def _num(row, key: str) -> float | None:
     return None if v is None or v != v else _round(v)
 
 
-def _run_ema_periods(run_dir: Path) -> tuple[int, int, int, int]:
-    """(H1 fast, H1 slow, H4 fast, H4 slow) from the run's params.json strategy
-    block; old folders with ema_fast/ema_slow keys and folderless runs fall back
-    to the B1 defaults. The report must show what the engine actually used."""
-    h1_fast, h1_slow, h4_fast, h4_slow = 20, 50, 20, 50
+def _run_config(run_dir: Path) -> dict:
+    """What the ENGINE ran with: timeframes + EMA periods per chart, from the
+    run's params.json. Old folders (no timeframes key, ema_fast/ema_slow key
+    names) and folderless runs fall back to the H1->H4/B1 defaults. The report
+    must show what the engine actually used."""
+    cfg = {"exec": "H1", "reg": "H4",
+           "entry": {"fast": 20, "slow": 50},
+           "regime": {"fast": 20, "slow": 50}}
     path = Path(run_dir) / "params.json"
     if path.exists():
         try:
-            st = json.loads(path.read_text(encoding="utf-8")).get("strategy") or {}
-            h1_fast = int(st.get("h1_ema_fast", st.get("ema_fast")) or h1_fast)
-            h1_slow = int(st.get("h1_ema_slow", st.get("ema_slow")) or h1_slow)
-            h4_fast = int(st.get("h4_ema_fast") or h4_fast)
-            h4_slow = int(st.get("h4_ema_slow") or h4_slow)
+            pp = json.loads(path.read_text(encoding="utf-8"))
+            tf = pp.get("timeframes") or {}
+            cfg["exec"] = str(tf.get("execution") or "H1").upper()
+            cfg["reg"] = str(tf.get("regime") or "H4").upper()
+            st = pp.get("strategy") or {}
+            cfg["entry"]["fast"] = int(st.get("h1_ema_fast", st.get("ema_fast")) or 20)
+            cfg["entry"]["slow"] = int(st.get("h1_ema_slow", st.get("ema_slow")) or 50)
+            cfg["regime"]["fast"] = int(st.get("h4_ema_fast") or 20)
+            cfg["regime"]["slow"] = int(st.get("h4_ema_slow") or 50)
         except Exception:
             pass  # broken params: keep chart defaults rather than fail the report
-    return h1_fast, h1_slow, h4_fast, h4_slow
+    return cfg
 
 
-def _bar_arrays(df: pd.DataFrame, e_fast_n: int, e_slow_n: int) -> dict:
+def _tf_label(tf: str, is_regime: bool) -> str:
+    # human view label: the regime Daily chart reads "Daily", others "H1"/"H4"
+    return "Daily" if (is_regime and str(tf).upper() == "D1") else str(tf).upper()
+
+
+def _tf_bars(data_dir: Path, sym: str, tf: str, h1: pd.DataFrame) -> pd.DataFrame | None:
+    """Bars for one timeframe: the broker file FIRST (data contract), else the
+    engine's own resample — the same grid the backtest traded on."""
+    tf = str(tf).upper()
+    if tf == "H1":
+        return h1
+    hours = _TF_HOURS.get(tf)
+    if hours is None:
+        return None
+    from quant.backtest import build_htf, load_h1
+
+    path = data_dir / f"{sym}_{tf}.csv"
+    if path.exists():
+        try:
+            return load_h1(path)
+        except Exception as exc:
+            print(f"report: {sym} {tf} file unreadable — resampling ({exc})",
+                  flush=True)
+    try:
+        return build_htf(h1, hours)
+    except Exception as exc:
+        print(f"report: {sym} {tf}: resample failed ({exc})", flush=True)
+        return None
+
+
+def _bias_spans(run_dir: Path, sym: str, pad_hours: int = 0) -> list[dict]:
+    """The regime chart's per-bar direction (run artifact bias_<SYM>.csv)
+    merged into consecutive spans {t0, t1, d}; t1 padded to the bar close."""
+    path = run_dir / f"bias_{sym}.csv"
+    if not path.exists():
+        return []
+    try:
+        df = pd.read_csv(path)
+    except Exception as exc:
+        print(f"report: {sym} bias artifact unreadable ({exc})", flush=True)
+        return []
+    if not {"time", "direction"}.issubset(df.columns):
+        return []
+    spans: list[dict] = []
+    prev = start = end = None
+    for t, d in zip(df["time"], df["direction"]):
+        ts = str(t)[:16]
+        if d != prev:
+            if prev is not None:
+                spans.append({"t0": start,
+                              "t1": str(pd.Timestamp(end) + pd.Timedelta(hours=pad_hours))[:16],
+                              "d": prev})
+            start = ts
+            prev = d
+        end = ts
+    if prev is not None:
+        spans.append({"t0": start,
+                      "t1": str(pd.Timestamp(end) + pd.Timedelta(hours=pad_hours))[:16],
+                      "d": prev})
+    return spans
+
+
+def _bar_arrays(df: pd.DataFrame, e_fast_n: int, e_slow_n: int,
+                with_ema: bool = True) -> dict:
     """Loose arrays per timeframe for fast window slicing."""
     from quant.backtest import _ema
 
     # EMA over the FULL series first, sliced per window afterwards (why: overlay
-    # continuity); periods are the run's own (h1_ema_* / h4_ema_* from params)
+    # continuity); periods are the run's own (entry EMAs on the execution chart,
+    # regime EMAs on the regime chart). with_ema=False for views the engine has
+    # no EMA on (the raw H1 tape) — the JS then skips the overlay.
     return {
         "ts": pd.to_datetime(df["time"]),
         "time": [str(s)[:16] for s in df["time"]],
-        "efast": _ema(df["close"], e_fast_n).to_numpy(dtype=float),
-        "eslow": _ema(df["close"], e_slow_n).to_numpy(dtype=float),
+        "efast": _ema(df["close"], e_fast_n).to_numpy(dtype=float) if with_ema else None,
+        "eslow": _ema(df["close"], e_slow_n).to_numpy(dtype=float) if with_ema else None,
         "o": df["open"].to_numpy(dtype=float),
         "h": df["high"].to_numpy(dtype=float),
         "l": df["low"].to_numpy(dtype=float),
@@ -200,24 +285,20 @@ def _slice_window(bars: dict, entry_time, exit_time,
         "h": _rounds(bars["h"][i0:i1 + 1]),
         "l": _rounds(bars["l"][i0:i1 + 1]),
         "c": _rounds(bars["c"][i0:i1 + 1]),
-        "efast": _rounds(bars["efast"][i0:i1 + 1]),
-        "eslow": _rounds(bars["eslow"][i0:i1 + 1]),
+        "efast": _rounds(bars["efast"][i0:i1 + 1]) if bars["efast"] is not None else None,
+        "eslow": _rounds(bars["eslow"][i0:i1 + 1]) if bars["eslow"] is not None else None,
     }
 
 
-def _contexts(sym: str, h1: pd.DataFrame, trades: pd.DataFrame,
-              h4: pd.DataFrame | None, h1_f: int, h1_s: int,
-              h4_f: int, h4_s: int) -> list[dict]:
-    """Embedded candle windows (1H + optional 4H); entries outside H1 are skipped."""
-    b1 = _bar_arrays(h1, h1_f, h1_s)
-    b4 = _bar_arrays(h4, h4_f, h4_s) if h4 is not None else None
+def _contexts(sym: str, charts: dict, trades: pd.DataFrame,
+              spans: list[dict]) -> list[dict]:
+    """One embedded record per trade: candles for EACH chart of this run's
+    combo (charts maps view key -> (timeframe, bars); insertion order keeps
+    exec first), plus the regime chart's bias spans clipped to the window.
+    An entry outside the EXECUTION frame skips the trade, as before."""
     out = []
     for _, tr in trades.iterrows():
-        w1 = _slice_window(b1, tr["entry_time"], tr["exit_time"],
-                           CONTEXT_BEFORE, CONTEXT_AFTER, WINDOW_CAP)
-        if w1 is None:
-            continue
-        out.append({
+        rec = {
             "id": str(tr["_id"]), "sym": sym, "side": str(tr["direction"]),
             "entryTime": str(tr["entry_time"])[:16], "exitTime": str(tr["exit_time"])[:16],
             "entry": _round(tr["entry"]), "exit": _round(tr["exit"]),
@@ -226,47 +307,69 @@ def _contexts(sym: str, h1: pd.DataFrame, trades: pd.DataFrame,
             "bars": int(tr["bars_held"]),
             "pnlUsd": _round(tr["pnl_usd"]),
             "riskUsd": _num(tr, "risk_usd"), "tpUsd": _num(tr, "tp_usd"),
-            **w1,
-            "h4": None if b4 is None else _slice_window(b4, tr["entry_time"],
-                                                        tr["exit_time"],
-                                                        H4_BEFORE, H4_AFTER, H4_CAP),
-        })
+        }
+        embedded = True
+        for key, (tf, bars) in charts.items():
+            before, after, cap = _TF_VIEW[tf]
+            w = _slice_window(bars, tr["entry_time"], tr["exit_time"],
+                              before, after, cap)
+            if key == "exec" and w is None:
+                embedded = False
+                break
+            if w is None:
+                rec[key] = None
+                continue
+            if key == "reg" and spans:
+                lo, hi = w["t"][0], w["t"][-1]
+                rec["spans"] = [{"t0": max(s["t0"], lo), "t1": min(s["t1"], hi),
+                                 "d": s["d"]}
+                                for s in spans if s["t1"] >= lo and s["t0"] <= hi]
+            rec[key] = w
+        if embedded:
+            out.append(rec)
     return out
 
 
 def _bundle(run_dir: Path, data_dir: Path, trades: list[tuple[str, pd.DataFrame]]
-            ) -> tuple[list[dict], int, int, int, int]:
-    """Windows + the run's own EMA periods (read once from params.json)."""
+            ) -> tuple[list[dict], dict]:
+    """Per-view windows + the run's own config (timeframes, EMA periods)."""
     from quant.backtest import load_h1  # generic bars loader (columns/UTC/ascending)
 
-    h1_f, h1_s, h4_f, h4_s = _run_ema_periods(run_dir)
+    cfg = _run_config(run_dir)
+    # the view set follows THIS run's timeframes: execution chart + regime
+    # chart, and the raw H1 tape whenever the execution grid is not H1
+    view_tfs = {"exec": cfg["exec"], "reg": cfg["reg"]}
+    if cfg["exec"] != "H1":
+        view_tfs["raw"] = "H1"
     bundle: list[dict] = []
     for sym, df in trades:
         h1_path = data_dir / f"{sym}_H1.csv"
         if not h1_path.exists():
             continue
         try:
-            b1 = load_h1(h1_path)
+            h1 = load_h1(h1_path)
         except Exception as exc:
             print(f"report: {sym} H1 unreadable ({exc})", flush=True)
             continue
-        # Broker H4 export first (data contract); today's runs resample H1 with the
-        # engine's build_h4 instead, so the 4H view shows what the engine traded on.
-        b4 = None
-        h4_path = data_dir / f"{sym}_H4.csv"
-        if h4_path.exists():
-            try:
-                b4 = load_h1(h4_path)
-            except Exception as exc:
-                print(f"report: {sym} H4 unreadable — 4H view off ({exc})", flush=True)
-        else:
-            from quant.backtest import build_h4
-            b4 = build_h4(b1)
         try:
-            bundle.extend(_contexts(sym, b1, df, b4, h1_f, h1_s, h4_f, h4_s))
+            charts: dict[str, tuple[str, dict]] = {}
+            for key, tf in view_tfs.items():
+                bars = _tf_bars(data_dir, sym, tf, h1)
+                if bars is None:
+                    if key == "exec":
+                        raise ValueError(f"no candles on the {tf} execution grid")
+                    print(f"report: {sym} {tf} unavailable — {key} view off",
+                          flush=True)
+                    continue
+                per = cfg["entry"] if tf == cfg["exec"] else cfg["regime"]
+                with_ema = key != "raw"  # the raw tape: the engine has no EMA there
+                charts[key] = (tf, _bar_arrays(bars, per["fast"], per["slow"],
+                                               with_ema=with_ema))
+            spans = _bias_spans(run_dir, sym, pad_hours=_TF_HOURS.get(cfg["reg"], 0))
+            bundle.extend(_contexts(sym, charts, df, spans))
         except Exception as exc:
             print(f"report: {sym} windows failed ({exc})", flush=True)
-    return bundle, h1_f, h1_s, h4_f, h4_s
+    return bundle, cfg
 
 
 def write_report(run_dir: Path, data_dir: Path) -> bool:
@@ -281,8 +384,8 @@ def write_report(run_dir: Path, data_dir: Path) -> bool:
     all_trades = (pd.concat([df for _, df in loaded], ignore_index=True)
                   if loaded else pd.DataFrame())
 
-    bundle, h1_f, h1_s, h4_f, h4_s = _bundle(Path(run_dir), Path(data_dir), loaded) if loaded \
-        else ([], 20, 50, 20, 50)
+    bundle, cfg = _bundle(Path(run_dir), Path(data_dir), loaded) if loaded \
+        else ([], _run_config(Path(run_dir)))
     embedded = {c["id"]: c for c in bundle}
     embedded_ids = set(embedded)
     meta = [{"id": r["_id"], "sym": r["symbol"], "side": r["direction"],
@@ -306,8 +409,9 @@ def write_report(run_dir: Path, data_dir: Path) -> bool:
     html = _html(run_dir.name, get_plotlyjs(), _summary_table(summary), verdict_cell,
                  no_nan(figs),
                  no_nan({"embedded": embedded, "meta": meta,
-                         "emaH1": {"fast": h1_f, "slow": h1_s},
-                         "emaH4": {"fast": h4_f, "slow": h4_s}}))
+                         "tf": {"exec": _tf_label(cfg["exec"], False),
+                                "reg": _tf_label(cfg["reg"], True)},
+                         "emaExec": cfg["entry"], "emaRegime": cfg["regime"]}))
     out = run_dir / "report.html"
     out.write_text(html, encoding="utf-8")
     print(f"report -> {out}", flush=True)
@@ -353,7 +457,7 @@ function drawList() {
   var rnd = function (v) { return Math.round(v * 100) / 100; };
   var hasSwap = rows.some(function (r) { return r.swap != null; });
   rowsEl.innerHTML = '<tr><th>Entry time</th><th>Side</th><th>P/L (USD)</th>' +
-    '<th>P/L (R)</th><th>Exit type</th><th>Held (bars)</th>' +
+    '<th>P/L (R)</th><th>Exit type</th><th>Held (' + TB.tf.exec + ' bars)</th>' +
     '<th>1R (USD)</th><th>TP amount (USD)</th><th>Swap (USD)</th></tr>' +
     '<tr class="tot"><td>TOTAL ' + rows.length + '</td><td></td>' +
     '<td>' + usd(rnd(sum(function (r) { return r.pnlUsd; }))) + '</td>' +
@@ -379,7 +483,7 @@ rowsEl.onclick = function (e) {
   var tr = e.target.closest('tr');
   if (tr && tr.dataset.id) openChart(tr.dataset.id);
 };
-var curTf = '1h';  // sticks across trades while browsing
+var curTf = 'exec';  // sticks across trades while browsing (execution view first)
 var chartWin = null;
 var POP_CSS = "body{font:13px system-ui,sans-serif;margin:6px;background:#111;color:#ddd}" +
   "#tfbtns button{background:#222;color:#ddd;border:1px solid #555;padding:3px 14px;cursor:pointer}" +
@@ -411,21 +515,26 @@ function chartWindow() {
 }
 function openChart(id, forceTf) {
   var ctx = TB.embedded[id];
-  if (!ctx) { msgEl.textContent = 'chart not embedded (no H1 quote data for that trade)'; return; }
+  if (!ctx) { msgEl.textContent = 'chart not embedded (no quote data for that trade)'; return; }
   if (forceTf) curTf = forceTf;
-  if (!ctx.h4) curTf = '1h';
+  if (!ctx[curTf]) curTf = 'exec';
   var w = chartWindow();
   if (!w) return;
   w.__tid = id;
+  function btn(key, label) {
+    return ctx[key] ? ('<button data-tf="' + key + '"' +
+      (curTf === key ? ' class="on"' : '') + '>' + label + '</button>') : '';
+  }
   w.document.getElementById('tfbtns').innerHTML =
-    '<button data-tf="1h"' + (curTf === '1h' ? ' class="on"' : '') + '>1H</button>' +
-    (ctx.h4 ? ('<button data-tf="4h"' + (curTf === '4h' ? ' class="on"' : '') + '>4H</button>') : '') +
-    (ctx.h4 ? '' : '<span id="tfnote">no H4 data for this run</span>');
+    btn('exec', TB.tf.exec) + btn('reg', TB.tf.reg) + btn('raw', 'H1') +
+    (ctx.reg ? '' : '<span id="tfnote">no ' + TB.tf.reg + ' data for this run</span>') +
+    (ctx.spans && curTf === 'reg' ?
+      '<span id="tfnote">shading: LONG green / SHORT red / NEUTRAL grey</span>' : '');
   drawChart(w, ctx);
 }
 function drawChart(w, ctx) {
-  var d = (curTf === '4h' && ctx.h4) ? ctx.h4 : ctx;
-  var tfName = (d === ctx.h4) ? 'H4' : 'H1';
+  var d = ctx[curTf] || ctx.exec;
+  var tfName = TB.tf[curTf] || TB.tf.exec;
   // pin the y zoom to candles + levels: shapes are NOT auto-included by Plotly,
   // so a stop/target away from the candle span would otherwise be cut off
   var yMin = null, yMax = null;
@@ -453,23 +562,38 @@ function drawChart(w, ctx) {
       x: d.t[0], y: y, xref: 'x', yref: 'y', text: text, showarrow: false,
       xanchor: 'left', yanchor: 'bottom', font: {color: color, size: 10}};
   }
-  var per = (TB[tfName === 'H4' ? 'emaH4' : 'emaH1'] || {});
+  var per = (TB[curTf === 'reg' ? 'emaRegime' : 'emaExec'] || {});
   var traces = [
     {type: 'candlestick', x: d.t, open: d.o, high: d.h, low: d.l, close: d.c,
      name: tfName, increasing_line_color: '#3ddc84', decreasing_line_color: '#ff5f5f'},
-    {x: d.t, y: d.efast, type: 'scatter', mode: 'lines',
-     name: 'EMA' + per.fast, line: {width: 1.2}},
-    {x: d.t, y: d.eslow, type: 'scatter', mode: 'lines',
-     name: 'EMA' + per.slow, line: {width: 1.2}},
     // entry marker must be unmistakable on dark candles: yellow, not green
     {x: [ctx.entryTime], y: [ctx.entry], type: 'scatter', mode: 'markers', name: 'entry',
      marker: {size: 13, symbol: 'triangle-up', color: '#ffd400'}},
     {x: [ctx.exitTime], y: [ctx.exit], type: 'scatter', mode: 'markers', name: 'exit',
      marker: {size: 11, symbol: 'triangle-down', color: '#f66'}}
   ];
-  var shapes = [{type: 'rect', xref: 'x', yref: 'paper',
-                 x0: ctx.entryTime, x1: ctx.exitTime, y0: 0, y1: 1,
-                 line: {width: 0}, fillcolor: 'rgba(120,150,255,0.08)'}];
+  // the engine's own EMA overlays (regime EMAs on the regime chart, entry EMAs
+  // on the execution chart); the raw H1 tape carries none (raw: efast = null)
+  if (d.efast) {
+    traces.splice(1, 0,
+      {x: d.t, y: d.efast, type: 'scatter', mode: 'lines',
+       name: 'EMA' + per.fast, line: {width: 1.2}},
+      {x: d.t, y: d.eslow, type: 'scatter', mode: 'lines',
+       name: 'EMA' + per.slow, line: {width: 1.2}});
+  }
+  // regime-chart bias shading first (layer below), then the trade highlight;
+  // shading belongs to the regime chart only (spans are regime-grid stamps)
+  var spans = (curTf === 'reg' && ctx.spans) ? ctx.spans : [];
+  var shade = {LONG: 'rgba(46,204,113,0.10)', SHORT: 'rgba(231,76,60,0.10)',
+               NEUTRAL: 'rgba(150,150,150,0.07)'};
+  var shapes = spans.map(function (s) {
+    return {type: 'rect', xref: 'x', yref: 'paper', x0: s.t0, x1: s.t1,
+            y0: 0, y1: 1, line: {width: 0},
+            fillcolor: shade[s.d] || shade.NEUTRAL, layer: 'below'};
+  });
+  shapes.push({type: 'rect', xref: 'x', yref: 'paper',
+               x0: ctx.entryTime, x1: ctx.exitTime, y0: 0, y1: 1,
+               line: {width: 0}, fillcolor: 'rgba(120,150,255,0.08)'});
   var s1 = level(ctx.sl, '#d33');
   var s2 = level(ctx.tp, '#3a3');
   if (s1) shapes.push(s1);

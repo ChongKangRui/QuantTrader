@@ -302,11 +302,14 @@ def test_scaled_lots_rule():
 
 def _scale_rows():
     # step 0.30 USD per 0.01 lot: engine sized t1 at 0.10 lot = 3.0 USD 1R
+    # (tp_usd shown for tp_mult = 2 on t1; engine schema carries risk_usd/tp_usd)
     return [
         {"entry_time": "2026-01-05 10:00", "exit_time": "2026-01-05 12:00",
-         "lot": 0.10, "pnl_usd": -3.0, "pnl_R": -1.0, "swap": 0.0},
+         "lot": 0.10, "pnl_usd": -3.0, "pnl_R": -1.0, "swap": 0.0,
+         "risk_usd": 3.0, "tp_usd": 6.0},
         {"entry_time": "2026-01-05 13:00", "exit_time": "2026-01-05 14:00",
-         "lot": 0.10, "pnl_usd": -1.5, "pnl_R": -0.5, "swap": 0.0},
+         "lot": 0.10, "pnl_usd": -1.5, "pnl_R": -0.5, "swap": 0.0,
+         "risk_usd": 3.0, "tp_usd": 3.0},
     ]
 
 
@@ -326,6 +329,10 @@ def test_scale_lots_to_balance_shrinks_then_fences():
     # balance 87.3 -> aim 2.619 -> still 9 steps; compounded into the next trade
     assert k["lot"].iloc[1] == pytest.approx(0.09)
     assert k["pnl_usd"].iloc[1] == pytest.approx(-1.35)
+    # bookkeeping follows the lot: 1R money and TP money rescale (MTM reads risk_usd)
+    assert k["risk_usd"].iloc[0] == pytest.approx(2.7)
+    assert k["tp_usd"].iloc[0] == pytest.approx(5.4)
+    assert k["tp_usd"].iloc[1] == pytest.approx(2.7)
 
 
 def test_scale_lots_to_balance_fence_refuses_high():
@@ -335,9 +342,11 @@ def test_scale_lots_to_balance_fence_refuses_high():
 
     # coarse step: 1.0 USD per 0.01 lot (t1 sized 0.03 lot = 3.0 USD 1R)
     rows = [{"entry_time": "2026-01-05 10:00", "exit_time": "2026-01-05 12:00",
-             "lot": 0.03, "pnl_usd": 3.0, "pnl_R": 1.0, "swap": 0.0},
+             "lot": 0.03, "pnl_usd": 3.0, "pnl_R": 1.0, "swap": 0.0,
+             "risk_usd": 3.0, "tp_usd": 4.8},
             {"entry_time": "2026-01-05 13:00", "exit_time": "2026-01-05 14:00",
-             "lot": 0.03, "pnl_usd": 3.0, "pnl_R": 1.0, "swap": 0.0}]
+             "lot": 0.03, "pnl_usd": 3.0, "pnl_R": 1.0, "swap": 0.0,
+             "risk_usd": 3.0, "tp_usd": 4.8}]
     trades = {"EURUSD": pd.DataFrame(rows)}
     kept, dropped = scale_lots_to_balance(dict(trades), 3.0, 2.5, 3.6, 100.0)
     k = kept["EURUSD"]  # kept: trade 2 kept
@@ -354,9 +363,11 @@ def test_scale_lots_to_balance_inherits_scratch_rows():
     from quant.backtest import scale_lots_to_balance
 
     rows = [{"entry_time": "2026-01-05 10:00", "exit_time": "2026-01-05 12:00",
-             "lot": 0.02, "pnl_usd": 3.0, "pnl_R": 1.0, "swap": 0.0},  # step 1.5
+             "lot": 0.02, "pnl_usd": 3.0, "pnl_R": 1.0, "swap": 0.0,
+             "risk_usd": 3.0, "tp_usd": 4.5},  # step 1.5
             {"entry_time": "2026-01-05 13:00", "exit_time": "2026-01-05 14:00",
-             "lot": 0.02, "pnl_usd": 0.0, "pnl_R": 0.0, "swap": 0.0}]  # scratch
+             "lot": 0.02, "pnl_usd": 0.0, "pnl_R": 0.0, "swap": 0.0,
+             "risk_usd": 3.0, "tp_usd": 3.0}]  # scratch
     trades = {"EURUSD": pd.DataFrame(rows)}
     kept, dropped = scale_lots_to_balance(dict(trades), 3.0, 2.5, 3.6, 80.0)
     k = kept["EURUSD"]
@@ -458,6 +469,8 @@ def test_scan_finds_calibrated_go():
     p = {"sep_atr": 0.3, "hr1": "a", "use_atr_sep": True, "warmup_bars": 300}
     funnel, cands = scan_pair(h1, build_h4(h1), "EURUSD", p)
     assert funnel["e1trigger"].iloc[0] >= 1 and len(cands) >= 1
+    # W1 off: auto-pass keeps the funnel accounting identical to before
+    assert funnel["w1"].iloc[0] == funnel["ext"].iloc[0]
 
 
 def _synthetic_csv(path, n=800, seed_phase=0.0):

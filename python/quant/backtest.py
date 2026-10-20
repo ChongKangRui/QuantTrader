@@ -209,7 +209,7 @@ def scan_pair(h1: pd.DataFrame, h4: pd.DataFrame, symbol: str, p: dict) -> tuple
         atr_n=int(p.get("h4_atr_n") or ATR_PERIOD)).direction  # shared-core guard
     mapped = map_bias(h1, h4, bf)
     funnel = {"scanned": 0, "stacksep": 0, "hr1": 0, "hr2": 0, "hr3": 0,
-              "hr4": 0, "ext": 0, "e1setup": 0, "e1trigger": 0}
+              "hr4": 0, "ext": 0, "w1": 0, "e1setup": 0, "e1trigger": 0}
     cands = []
     t0 = max(WIN_BARS, int(p.get("warmup_bars", 300)))
     for t in range(t0, len(h1)):
@@ -225,7 +225,7 @@ def scan_pair(h1: pd.DataFrame, h4: pd.DataFrame, symbol: str, p: dict) -> tuple
         win = h1.iloc[max(0, t - WIN_BARS + 1):t + 1]
         res = check_entry(win, "LONG" if direction == "LONG" else "SHORT", p)
         for key, col in (("HR2", "hr2"), ("HR3", "hr3"), ("HR4", "hr4"),
-                         ("HR4-guard", "hr4"), ("EXT", "ext"),
+                         ("HR4-guard", "hr4"), ("EXT", "ext"), ("W1", "w1"),
                          ("E1-setup", "e1setup"), ("E1-trigger", "e1trigger")):
             if res["checks"].get(key):
                 funnel[col] += 1
@@ -591,7 +591,8 @@ def run_pair(symbol: str, h1_path: str | Path, p: dict, costs: dict, args,
     exec_df = h1 if exec_hours == 1 else build_htf(h1, exec_hours)
     reg_df = build_htf(h1, reg_hours)   # both grids anchor at 00:00 UTC
     funnel, cands = scan_pair(exec_df, reg_df, symbol, p)
-    mapped = map_bias(exec_df, reg_df, bias_frames(reg_df, p), reg_hours=reg_hours)
+    bframes = bias_frames(reg_df, p)
+    mapped = map_bias(exec_df, reg_df, bframes, reg_hours=reg_hours)
     m1 = None
     if str(getattr(args, "position_checks", "M1")).upper() == "M1":
         m1 = _load_m1(h1_path, symbol)
@@ -616,7 +617,12 @@ def run_pair(symbol: str, h1_path: str | Path, p: dict, costs: dict, args,
     m["signals"] = len(cands)
     return {"funnel": funnel, "trades": trades, "metrics": m, "n_bars": len(exec_df),
             "span_days": days,
-            "span": (str(h1["time"].iloc[0]), str(h1["time"].iloc[-1]))}
+            "span": (str(h1["time"].iloc[0]), str(h1["time"].iloc[-1])),
+            # the regime chart's per-bar direction, straight from the frame the
+            # scan just used — the report shades its regime view with this
+            "reg_bias": ([str(t) for t in reg_df["time"]],
+                         [str(v) for v in bframes["direction"]],
+                         [bool(v) for v in bframes["hr1"]])}
 
 
 def resolve_workers(requested: int, n_pairs: int) -> int:
@@ -673,6 +679,21 @@ def run_all(jobs: list[tuple[str, Path, dict]], p: dict, args, converters,
                 continue
             print(_done_line(sym, results[sym]["metrics"]), flush=True)
     return results, failures
+
+
+def write_bias_maps(outdir: Path, results: dict[str, dict]) -> None:
+    """Run artifact bias_<SYM>.csv: (time, direction, hr1) of the regime grid.
+
+    Emitted from each pair's own regime frame, so the report shades its regime
+    view with exactly what the engine believed while scanning. Pairs that
+    failed before the scan simply get no file (report shows no shading).
+    """
+    for sym, res in results.items():
+        rb = res.pop("reg_bias", None)
+        if rb is None:
+            continue
+        pd.DataFrame({"time": rb[0], "direction": rb[1], "hr1": rb[2]}
+                     ).to_csv(outdir / f"bias_{sym}.csv", index=False)
 
 
 def _epoch_s(col: pd.Series) -> np.ndarray:
@@ -846,8 +867,10 @@ def scale_lots_to_balance(trades_by_sym: dict[str, pd.DataFrame],
     closed trades (realized). Each entry re-aims its 1R at pct% of that
     balance through rules.scaled_lots (0.01 snapping + the SAME scope fence).
     Every kept trade keeps its pnl_R exactly (R is lot-invariant); the USD
-    fields scale with the lot: pnl_usd = pnl_R x new 1R, swap x lot ratio
-    (commission is already inside pnl_usd, so it scales with it).
+    fields scale with the lot: pnl_usd = pnl_R x new 1R, and swap, risk_usd,
+    tp_usd x lot ratio (commission is already inside pnl_usd, so it scales
+    with it). risk_usd MUST rescale: the MTM equity curve marks open trades
+    at R x risk_usd, and stale risk would corrupt max_dd_mtm.
     A trade's own per-0.01 risk is recovered from pnl/pnl_R when informative
     (|pnl_R| >= 0.05), else inherited from the symbol's previous trade
     (scratch rows); with nothing to inherit the row is left unscaled.
@@ -898,6 +921,8 @@ def scale_lots_to_balance(trades_by_sym: dict[str, pd.DataFrame],
         factor = lots_new / lot_old
         out[sym].at[idx, "lot"] = lots_new
         out[sym].at[idx, "pnl_usd"] = round(pnl_r * risk_new, 2)
+        out[sym].at[idx, "risk_usd"] = round(risk_new, 2)  # MTM marks read this
+        out[sym].at[idx, "tp_usd"] = round(float(out[sym].at[idx, "tp_usd"]) * factor, 2)
         out[sym].at[idx, "swap"] = round(float(out[sym].at[idx, "swap"]) * factor, 2)
     if unscaled:
         print(f"scale pass: {unscaled} trade(s) left unscaled (no 0.01-risk info)",
@@ -1154,6 +1179,7 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"running {len(jobs)} pair(s) on {workers} worker(s)", flush=True)
     results, failures = run_all(jobs, strat, args, converters, workers)
+    write_bias_maps(outdir, results)  # per-run shading artifact for the report
     dropped: list[dict] = []
     if max_day > 0 and results:
         capped, dropped = apply_daily_cap({s: r["trades"] for s, r in results.items()}, max_day)

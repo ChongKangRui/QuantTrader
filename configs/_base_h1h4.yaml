@@ -1,0 +1,186 @@
+# ── PRESET · H1->H4 (the default system) ────────────────────────────────
+# Copy of configs/_base.yaml as of 2026-10-19. NOT active while named
+# `_base_*` (the engine reads `configs/_base.yaml` only).
+# Apply:   Copy-Item configs/_base_h1h4.yaml configs/_base.yaml -Force
+# Revert:  Copy-Item configs/_base_h1h4.yaml configs/_base.yaml -Force
+# (the H4->D1 preset switches back with configs/_base_h1h4.yaml)
+
+# Shared defaults for every pair. Pair files set: symbol + costs ONLY.
+# Strategy/risk all live here; pair-level copies of those blocks are ignored
+# (single source of truth — locked by test_load_pairs_strategy_comes_only_from_base).
+# Engine + live trader read the SAME keys. Gate codes, units, how-to: configs/README.md
+
+# ────────────────────────────────────────────────────────────────────────
+# TIMEFRAMES · when the system runs
+# ────────────────────────────────────────────────────────────────────────
+timeframes:
+  execution: H1          # entry bar grid: H1 (default) or H4 (then regime must be D1)
+  regime: H4             # bias chart: H4 (default) or D1 (then execution must be H4)
+                         # the two allowed combos: H1->H4 and H4->D1 ("same logic,
+                         # higher TF"). Backtest derives both grids from the H1 CSV
+                         # (00:00 UTC anchor); live fetches both from the broker.
+  position_checks: M1    # stop/TP/trail checked on M1 feed, H1 when M1 missing
+
+# ────────────────────────────────────────────────────────────────────────
+# EXECUTION · same t / t+1 model in the backtest and the live loop
+# ────────────────────────────────────────────────────────────────────────
+execution:
+  signal_bar: t                # decisions read the LAST CLOSED bar only
+  fill_bar: t+1                # the order fills on the NEXT bar open (no lookahead)
+  fill: next_open_plus_costs   # fill price = next bar open + spread/slippage
+
+# ────────────────────────────────────────────────────────────────────────
+# STRATEGY · gates in run order: H4 bias -> H1 entry -> open trade -> tests
+# ═══ Gate codes: B1 HR1 E1-setup E1-trigger HR2 HR3 HR4 EXT W1 (configs/README.md)
+# Every use_x: false = that gate auto-passes and its knobs are ignored.
+# ════════════════════════════════════════════════════════════════════════
+strategy:
+
+  # ════════════════════════════════════════════════════════════════════
+  # BIAS · B1 + HR1 · the H4 chart decides direction only (UP/DOWN/FLAT)
+  # ════════════════════════════════════════════════════════════════════
+  bias:
+    h4_ema_fast: 20         # H4 trend EMA (short side of the pair)
+    h4_ema_slow: 100        # H4 trend EMA (long side); fast above slow = UP bias
+    use_atr_sep: true       # false = MA-only: no HR1 band, no NEUTRAL
+    h4_atr_n: 14            # H4 ATR period behind the HR1 separation band
+    hr1: a                  # HR1 band: a = close / b = body / c = whole candle
+    sep_atr: 0.3            # HR1 band width in H4 ATR (EMAs must stay this apart)
+    warmup_bars: 100        # bars needed before any signal is trusted
+
+  # ════════════════════════════════════════════════════════════════════
+  # ENTRY · E1 + filters · read on the LAST CLOSED H1 bar (fills t+1)
+  # ════════════════════════════════════════════════════════════════════
+  entry:
+    # Shared yardstick for every gate below (and for the stop).
+    atr_n: 7                # H1 ATR period (n)
+    h1_ema_fast: 20         # entry fast EMA (trigger distance + EXT stretch)
+    h1_ema_slow: 50         # entry slow EMA = the pullback zone
+
+    # ── E1-setup · "did price pull back to the zone — and the zone hold?" ──
+    use_e1_setup: true      # ON/OFF; false = gate auto-passes
+    lookback: 5             # bars during which a low must touch the zone
+    touch_atr: 0.5          # how close a low must get to the zone (H1 ATR)
+    breakdown_atr: 1.0      # how deep a close may pierce the zone (H1 ATR)
+
+    # ── E1-trigger · "did this bar fire?" ────────────────────────────
+    use_e1_trigger: true    # ON/OFF; closed past fast EMA AND prior bar high/low
+
+    # ── HR2 · "is the signal candle convincing?" ─────────────────────
+    use_hr2: true           # ON/OFF; right color AND min body share of range
+    min_body_ratio: 0.5     # min body / range share of the signal candle
+
+    # ── OFF by default ──────────────────────────────────────────────
+    # Keys stay live even when the gate is off (false = gate auto-passes).
+    # Never comment them out: the engine's code defaults differ (README).
+
+    # EXT · "not stretched": close stays close to the fast EMA
+    use_ext: false
+    ext_atr: 1.5            # max stretch from the fast EMA (H1 ATR)
+
+    # HR3 · "candle not too big": never chase a giant bar
+    use_hr3: false
+    max_body_atr: 1.5       # max candle body (H1 ATR)
+
+    # HR4 · "swing structure intact": recent higher-low (LONG) / lower-high (SHORT)
+    use_hr4: false
+    edge_atr: 1.5           # max distance from close to the swing (H1 ATR)
+    pivot_n: 3              # pivot confirmation bars, left + right
+    hl_guard: false         # HR4 extra: no NEW lower-low (LONG) since the swing
+
+    # W1 · "wick swept the fast EMA" (extra entry gate, off by default): the
+    # closed candle's wick pokes through the fast EMA AGAINST the trade
+    # direction, while the entry chart's fast/slow EMA relation agrees with
+    # the regime bias (H4->D1: H4 20/100 must point the way the Daily does)
+    use_w1: false           # ON/OFF; false = gate auto-passes (today's behavior)
+    w1_open_side: false     # extra: candle must OPEN on the trade side of the fast EMA
+    w1_pen_atr: 0.0         # min wick depth beyond the fast EMA (ATR; 0 = any touch)
+
+  # ════════════════════════════════════════════════════════════════════
+  # OPEN TRADE · after the fill (live attaches SL/TP on the broker)
+  # ════════════════════════════════════════════════════════════════════
+  open_trade:
+    stop_atr: 1.5           # stop distance at fill (H1 ATR; S1 style)
+    tp_mult: 2.0            # TP distance = tp_mult x the stop distance (R)
+    use_trail: false        # trail the stop behind price (false = initial only)
+    trail_r: 1.5            # trail keeps this share of initial risk behind (R)
+    use_be: false           # breakeven lift: stop -> entry (+buffer) when armed
+    be_trigger_r: 1.0       # R of profit that arms BE (or the trail) (R)
+    be_buffer: 0            # extra pips beyond entry on the BE stop (pips)
+
+  # ════════════════════════════════════════════════════════════════════
+  # EXPERIMENTAL · off by default; backtest CLI can force one run
+  # ════════════════════════════════════════════════════════════════════
+  experimental:
+    bias_flip_exit: false   # exit when the H4 bias flips against the trade
+    weekend_flat: false     # force-close before the weekend
+
+# ────────────────────────────────────────────────────────────────────────
+# RISK · portfolio caps, enforced by the backtest pass AND the live loop
+# (1 open position per pair is structural — not a knob here)
+# ────────────────────────────────────────────────────────────────────────
+risk:
+  max_total_positions: 5      # max open trades, all pairs combined (0 = off)
+  max_ccy_net: 2              # max NET positions per currency (0 = off)
+                              # long EURUSD = +EUR/-USD; hedging nets to ~0
+                              # basically determine how many same direction of trade to pair
+                              # like EURUSD and GBPUSD both bet for buy, but not USDCHF for sell
+                              # if example is 2
+  scale_lot_with_balance: false  # OFF = fixed sizing like today (1R aims at the scope floor)
+                                 # ON = compounding: 1R aims at balance_risk_pct % of the
+                                 # account balance at entry. Wins grow the lot, drawdown
+                                 # shrinks it — compounding, NOT martingale (no doubling
+                                 # after a loss). The sizing_scope_usd fence still applies:
+                                 # the snapped 1R must land inside low/high, else refused.
+  balance_risk_pct: 3.0          # % of the account balance each trade risks (read only
+                                 # when the switch above is ON; 0 there is a config error)
+  sizing_scope_usd:           # every trade's 1R must land inside (USD)
+    low: 2.5                  # minimum 1R (USD; 0 = no minimum)
+    high: 3.6                 # maximum 1R (USD; 0 = no maximum)
+
+# ────────────────────────────────────────────────────────────────────────
+# COSTS · backtest assumptions; pair files override with sampled values
+# ────────────────────────────────────────────────────────────────────────
+costs:
+  spread_points: 20           # BACKTEST spread (points; 20 pts = 2.0 pips)
+  swap_long_per_0_01: -0.08   # nightly carry, long (ccy per 0.01 lot/night)
+  swap_short_per_0_01: -0.08  # nightly carry, short (ccy per 0.01 lot/night)
+  commission_per_lot: 0.0     # commission per 1.0 lot per SIDE (USD); Standard account
+                              # = 0 by decision 2026-10-19 (spread covers it); Razor ~3.5/side
+  slippage_pips: 0.0          # assumed fill slip (pips; backtest and live); 0 by decision
+                              # 2026-10-19 — charged on exits only in the engine
+
+# Triple swap = broker charges 3x on the Wednesday rollover; the engine
+# approximates it as the first bar after Wed 21:xx UTC (hardcoded, STRATEGY 10).
+
+# ── ACCOUNT · the PnL / 1R reporting unit for the backtest ────────────
+account:
+  currency: USD               # account currency
+
+# ────────────────────────────────────────────────────────────────────────
+# LIMITS · entry caps, same rules in the backtest and the live loop
+# (0 on any limit = that rule off)
+# ────────────────────────────────────────────────────────────────────────
+limits:
+  weekly_loss_r: 3.0          # BACKTEST weekly halt: week's CLOSED R total <= -this (8A; 0 = off)
+  weekly_loss_pct: 15.0       # LIVE/panel weekly halt: % of week-start equity (live only)
+  max_trades_per_day: 20      # portfolio-wide, per day
+  max_cost_ratio: 0.10        # round-trip cost < this share of stop distance
+  no_trade_ranges:            # {start,end} = MM-DD UTC; wraps the New Year
+    - { start: "12-15", end: "01-01" }   # no NEW fills inside; open trades keep SL/TP/trail
+
+# ── LIVE · real-order plumbing; read by the live trading loop only ─────
+live:
+  magic: 100001               # every order we send/adopt carries this (0 = ignore)
+  dry_run_default: true       # trading loop starts in dry-run (plans only)
+
+# ────────────────────────────────────────────────────────────────────────
+# BENCHMARKS · backtest grading only: PASS/WARN/FAIL bands per metric
+# ────────────────────────────────────────────────────────────────────────
+benchmarks:
+  account_usd: 100            # drawdown % is graded against this equity
+  max_dd_pct: { good: 30.0, ok: 50.0 }
+  profit_factor: { good: 1.50, ok: 1.00 }
+  expect_r: { good: 0.10, ok: 0.00 }
+  per_month: { good: 2.0, ok: 0.2 }
+  worst_year_r: { ok: -20.0 }

@@ -1,6 +1,7 @@
 """H1 entry core (STRATEGY.md sections 5-7). Pure pandas, no MT5 import.
 
-E1 pullback-resume plus the hard rules only (HR2/HR3/HR4/extension cap).
+E1 pullback-resume plus the hard rules only (HR2/HR3/HR4/extension cap),
+plus the optional W1 wick-sweep gate (off until its config switch is on).
 E2/E3 and every optional filter stay out until ablation. Evaluates at the
 signal-bar close; the caller re-checks against the actual fill (spec: fill-time
 re-check lives in the backtest/execution layers, which know the fill price).
@@ -28,6 +29,9 @@ DEFAULTS = {
     "use_ext": True,
     "use_e1_setup": True,
     "use_e1_trigger": True,
+    "use_w1": False,          # W1 wick sweep: new experiment, off until enabled
+    "w1_open_side": False,    # W1 extra: candle opens on the trade side
+    "w1_pen_atr": 0.0,        # W1 min wick depth beyond the fast EMA (ATR)
     "min_body_ratio": 0.5,
     "max_body_atr": 1.5,
     "lookback": 12,
@@ -39,7 +43,7 @@ DEFAULTS = {
 }
 
 # Funnel order for the first-failure code (spec section 2).
-FAIL_ORDER = ["HR2", "HR3", "HR4", "HR4-guard", "EXT", "E1-setup", "E1-trigger"]
+FAIL_ORDER = ["HR2", "HR3", "HR4", "HR4-guard", "EXT", "W1", "E1-setup", "E1-trigger"]
 
 
 def _ema(s: pd.Series, period: int) -> pd.Series:
@@ -101,6 +105,7 @@ def check_entry(h1: pd.DataFrame, direction: str, params: dict | None = None) ->
         return _result(False, "warmup", {}, None, None)
     body, rng = abs(c - o), hi - lo
     checks: dict[str, bool] = {}
+    w1_depth = float(p.get("w1_pen_atr", 0.0)) * a  # W1 sweep yardstick
 
     if side == "LONG":
         checks["HR2"] = rng > 0 and body / rng >= float(p["min_body_ratio"]) and c > o
@@ -122,6 +127,12 @@ def check_entry(h1: pd.DataFrame, direction: str, params: dict | None = None) ->
                       for i in win)
         checks["E1-setup"] = touch and nobreak
         checks["E1-trigger"] = c > float(efast.iloc[t]) and c > float(high.iloc[t - 1])
+        # W1 · wick swept the fast EMA against the trade; the chart's own
+        # fast/slow EMA relation must agree with the bias direction
+        checks["W1"] = (float(efast.iloc[t]) > float(eslow.iloc[t])
+                        and float(low.iloc[t]) <= float(efast.iloc[t]) - w1_depth
+                        and (o > float(efast.iloc[t]) if bool(p.get("w1_open_side", False))
+                             else True))
         level = hl[1]
     else:
         checks["HR2"] = rng > 0 and body / rng >= float(p["min_body_ratio"]) and c < o
@@ -143,6 +154,10 @@ def check_entry(h1: pd.DataFrame, direction: str, params: dict | None = None) ->
                       for i in win)
         checks["E1-setup"] = touch and nobreak
         checks["E1-trigger"] = c < float(efast.iloc[t]) and c < float(low.iloc[t - 1])
+        checks["W1"] = (float(efast.iloc[t]) < float(eslow.iloc[t])
+                        and float(high.iloc[t]) >= float(efast.iloc[t]) + w1_depth
+                        and (o < float(efast.iloc[t]) if bool(p.get("w1_open_side", False))
+                             else True))
         level = lh[1]
 
     # Ablation switches: a disabled gate auto-passes (still reported per gate).
@@ -159,5 +174,7 @@ def check_entry(h1: pd.DataFrame, direction: str, params: dict | None = None) ->
         checks["E1-setup"] = True
     if not bool(p.get("use_e1_trigger", True)):
         checks["E1-trigger"] = True
+    if not bool(p.get("use_w1", False)):
+        checks["W1"] = True
     fail = next((code for code in FAIL_ORDER if not checks.get(code, False)), None)
     return _result(fail is None, fail, checks, level, a)

@@ -16,7 +16,8 @@ import pandas as pd
 
 LEDGER_NAME = "_ledger.csv"
 _GATES = ("use_atr_sep", "use_e1_setup", "use_e1_trigger", "use_ext", "use_hr2",
-          "use_hr3", "use_hr4", "use_trail", "use_be", "bias_flip_exit", "weekend_flat")
+          "use_hr3", "use_hr4", "use_trail", "use_be", "use_w1",
+          "bias_flip_exit", "weekend_flat")
 # knobs shown only while their owning gate is on
 _LINKED = {  # gate -> ledger column(s)
     "use_e1_setup": ("lookback",),

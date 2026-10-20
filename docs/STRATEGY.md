@@ -1,7 +1,18 @@
 # Strategy Spec: Multi-Pair Trend System (H4 bias, H1 entry) on MT5
 
-Status: DRAFT v0.9. Every rule below is a **hypothesis to be tested**, not a proven edge.
+Status: DRAFT v1.0. Every rule below is a **hypothesis to be tested**, not a proven edge.
 `[TEST]` = has a range to evaluate. `[DECIDE]` = needs your choice before coding. Parked ideas sit in section 15 and are NOT active rules.
+
+Changes from v0.9 (2026-10-19):
+- **Variant strategy V-D1 recorded as section 16**: the "Daily bias / H4 sweep"
+  strategy (Daily EMA20/100 direction with a flat rule at EMA100, H4 EMA
+  alignment, wick sweep against the H4 EMA20 with the candle OPEN on the trade
+  side, RR 1:2.5, trailing deferred to its own exit model). It runs on the
+  SAME engine from its own preset (`configs/_base_h4d1.yaml` copied over
+  `_base.yaml`); only one variant is active at a time. Its "max 2 per pair per
+  week" and "pair disabled for the day after a loss" rules are recorded but
+  NOT built yet. Also: `_base.yaml`'s sizing switch now documents both sizing
+  modes explicitly (fence sizing vs percent/compounding sizing).
 
 Changes from v0.8:
 - **No-trade windows** (section 8): `limits.no_trade_ranges`, a list of `{start, end}` MM-DD ranges that repeat every year (wrap-safe across New Year). No NEW entries whose fill day falls inside a window; open trades keep being managed.
@@ -338,3 +349,79 @@ Demo forward test (2-3 months) checks plumbing (fills, timing, slippage, swaps) 
   - Known concerns to check: (1) it can veto the best E1 pullback setups, because the last H4 bar often contains the pullback and is counter-direction; (2) it duplicates HR2 (H1 signal candle direction); (3) the bias then flips at most every H4 bar, and candle color depends on broker server-time boundaries; (4) it strongly correlates with HR1.
   - Judge it by the signal funnel plus ablation: the trades removed vs kept, and whether the removed trades were actually worse after costs. Keep it only if the improvement is clear and out-of-sample.
   - Never include it in the bias-flip exit (section 7).
+
+---
+
+## 16. Variant strategy V-D1: Daily bias / H4 sweep entry ("H4/Days")
+
+Recorded 2026-10-19, **not yet backtested**. A second strategy spec on the SAME
+engine and the same section-8 risk rules; only the chart roles, the entry gate
+and the target RR differ. Both variants live in this file, but at runtime only
+one is active — the engine reads `configs/_base.yaml` ONLY:
+- apply this variant: `Copy-Item configs/_base_h4d1.yaml configs/_base.yaml -Force`
+- revert to the H1 baseline: `Copy-Item configs/_base_h1h4.yaml configs/_base.yaml -Force`
+
+### 16.1 Daily directional bias
+- EMA 20 and EMA 100 on the DAILY chart determine the trend
+  (`bias.h4_ema_fast` / `h4_ema_slow` are read on D1 bars in this variant).
+- EMA20 above EMA100 = bullish bias; below = bearish; mirror for shorts.
+- **Flat rule:** if price closes beyond EMA100 AGAINST the maintained
+  direction, the market is flat and no trading happens.
+  - Engine mapping (approximate, current config): HR1a (close vs the D1
+    EMA100) plus the separation gate (`sep_atr: 0.3` x D1 ATR14; NEUTRAL when
+    the EMAs are too close). The 0.3-ATR band makes it looser than the literal
+    "any close beyond" near the line; the separation NEUTRAL makes it stricter
+    elsewhere. The literal rule needs `sep_atr: 0.0` (bias.py behavior at 0.0
+    not verified) — a run decision, not a free edit.
+- Warmup note: `warmup_bars: 100` on D1 ≈ 5 months; the D1 EMA100 is only
+  partly converged early on. Raising it is its own declared change (`[DECIDE]`).
+
+### 16.2 H4 setup and entry (the W1 sweep)
+- H4 EMA20/EMA100 must agree with the Daily bias: W1's alignment check — the
+  entry chart's fast/slow EMA relation must point the same way as the regime
+  bias (`h1_ema_fast`/`h1_ema_slow` carry the H4 EMA lengths here: 20/100).
+- Setup + trigger in one: the last CLOSED H4 candle's low (long) or high
+  (short) penetrates AGAINST the EMA20 — the EMA100 is irrelevant to the
+  sweep itself (spec: "don't care"). Any touch counts (`w1_pen_atr: 0.0`;
+  raise it to demand a deeper sweep).
+- The candle's OPEN must sit on the trade side of the EMA20
+  (`w1_open_side: true`; long: open above EMA20, mirror for shorts).
+- Entry order: enter in the Daily bias direction at the NEXT H4 bar open after
+  the candle closes — the execution model is unchanged (signal on bar t, fill
+  at t+1, costs on top; sections 3, 6, 9, 10 apply as written, with all ATR
+  here read on H4).
+- Not part of this spec, therefore OFF: E1-setup, E1-trigger and HR2
+  (`use_*: false`); EXT/HR3/HR4 stay off as in the baseline. With those off,
+  W1 is the only entry-side gate besides the bias.
+
+### 16.3 Risk and trade frequency (variant-specific)
+- Fixed RR 1:2.5: `tp_mult: 2.5`; stop S1 = 1.5 x ATR (H4) frozen at the
+  signal close; TP = 2.5 x the stop distance.
+- Trailing: evaluated as a SEPARATE exit model in its own run
+  (`use_trail: false`, `use_be: false` for now; the section 7 comparison
+  runs X1/X4a-X4c are the evaluation checklist).
+- **Max 2 opportunities per pair per week:** NOT BUILT — no knob exists yet
+  (`[DECIDE]` whether to build it as a `limits` key). The engine cannot
+  enforce it in the current presets.
+- **A loss disables further trading for that pair for the rest of the day:**
+  NOT BUILT — no knob exists yet (same status). Only the section-8 caps apply
+  meanwhile (`max_total_positions`, `max_ccy_net`, the weekly halt in R, the
+  daily portfolio cap, no-trade windows).
+- Sizing: the engine's section-8 rules as configured. With the current fence
+  `low 4 / high 5.5` and H4-sized stops (measured 2026-10-19, median
+  1.5xATR7): GBPUSD, AUDUSD, NZDUSD, USDCAD, GBPJPY clear the band; EURUSD,
+  USDJPY, USDCHF, EURJPY have no fitting lot (1 brick ≈ 2.75-4.0 < low, 2
+  bricks > high) and typically refuse every entry as scope skips. Widening
+  `high` to ≈8 revives all nine pairs — a deliberate decision to record in
+  the run before the first variant backtest.
+  - The `scale_lot_with_balance` switch (fence vs percent sizing) decides the
+    1R target; see the switch's comment block in `_base.yaml`.
+
+### 16.4 Open decisions (variant)
+- [ ] Backtest the variant end-to-end: funnel first (section 2, adjusted:
+      no E1 columns, a W1 column), then after-cost metrics (section 11).
+- [ ] Sizing fence for H4-sized stops: [4, 5.5] (≈5/9 pairs) vs [4, 8] (9/9).
+- [ ] Literal flat rule (`sep_atr: 0.0`) vs the 0.3-ATR band approximation.
+- [ ] `warmup_bars` on D1: 100 vs 300.
+- [ ] Build the two frequency knobs (max 2 per pair-week; pair-day lock).
+- [ ] RR comparison run: 2.5 vs 3.0 (`tp_mult`).
