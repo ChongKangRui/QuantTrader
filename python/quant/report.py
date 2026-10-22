@@ -20,6 +20,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from quant.signals import ENTRY_REASON_LABELS
+
 CONTEXT_BEFORE = 120     # H1 bars of context before entry (H1 window, user-requested double)
 CONTEXT_AFTER = 40       # H1 bars after exit
 WINDOW_CAP = 800         # hard cap on H1 chart length in bars
@@ -106,6 +108,121 @@ def _load_trades(run_dir: Path) -> list[tuple[str, pd.DataFrame]]:
     return out
 
 
+def _reason_code(value) -> str:
+    return value if isinstance(value, str) and value in ENTRY_REASON_LABELS else "unknown"
+
+
+def annotate_entry_reasons(run_dir: Path, loaded: list) -> list:
+    """Old rows stay Unknown unless saved config + exact source verify the signal."""
+    from quant.backtest import WIN_BARS, load_h1
+    from quant.signals import check_entry
+
+    try:
+        params = json.loads((run_dir / "params.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        params = {}
+    strategy = params.get("strategy") or {}
+    modern = (bool(strategy.get("use_w1")) and
+              any(k in strategy for k in ("w1_touch_from_trend_side", "w1_cross_from_other_side")) and
+              all(k in strategy for k in ("entry_ema_fast_period", "entry_ema_slow_period", "entry_atr_period")))
+    jobs = {item[0]: item[1] for item in params.get("jobs", [])}
+    out = []
+    for symbol, original in loaded:
+        df = original.copy()
+        raw = df["entry_reason"] if "entry_reason" in df else pd.Series("unknown", index=df.index)
+        df["entry_reason"] = raw.map(_reason_code)
+        df["_entry_reason_source"] = df["entry_reason"].map(
+            lambda code: "unknown" if code == "unknown" else "recorded")
+        unknown = df.index[df["entry_reason"] == "unknown"]
+        if modern and len(unknown):
+            try:
+                tf = (params.get("timeframes") or {}).get("execution", "H1")
+                if params.get("broker_data"):
+                    from quant.broker_data import dataset_info, chart_path
+                    identity = params["broker_data"]
+                    if dataset_info(identity["directory"]) != identity:
+                        raise ValueError("broker source identity changed")
+                    path = chart_path(identity["directory"], symbol, tf)
+                elif params.get("research_data"):
+                    from quant.mkdata import research_info, research_chart_path
+                    identity = params["research_data"]
+                    if research_info(identity["directory"]) != identity:
+                        raise ValueError("research source identity changed")
+                    path = research_chart_path(identity["directory"], symbol, tf, jobs[symbol])
+                else:
+                    raise ValueError("no verifiable saved data identity")
+                bars = load_h1(path)
+                times = pd.DatetimeIndex(bars["time"])
+                for idx in unknown:
+                    row = df.loc[idx]
+                    fill = times.get_indexer([pd.to_datetime(row["entry_time"], utc=True)])[0]
+                    signal = fill - 1
+                    if signal < max(WIN_BARS, int(strategy.get("warmup_bars", 300))):
+                        continue
+                    if "signal_bar_time" in df and pd.notna(row["signal_bar_time"]):
+                        if pd.to_datetime(row["signal_bar_time"], utc=True) != times[signal]:
+                            continue
+                    window = bars.iloc[max(0, signal - WIN_BARS + 1):signal + 1]
+                    result = check_entry(window, str(row["direction"]), strategy)
+                    # ATR was stored to five decimals; mismatches mean the old path
+                    # cannot be verified. Never guess a reason from the fill candle.
+                    if not result["signal"] or pd.isna(row.get("atr")) or abs(
+                            float(row["atr"]) - float(result["atr"])) > 0.000005 + 1e-12:
+                        continue
+                    reason = result.get("entry_reason", "unknown")
+                    if reason in ("wick_touch", "cross_candle"):
+                        df.at[idx, "entry_reason"] = reason
+                        df.at[idx, "_entry_reason_source"] = "reconstructed"
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                print(f"report: {symbol} historical entry reasons left Unknown ({exc})", flush=True)
+        out.append((symbol, df))
+    return out
+
+
+def entry_reason_summary(trades: pd.DataFrame) -> pd.DataFrame:
+    """Descriptive, cost-inclusive results of accepted closed trades, not signals."""
+    cols = ["symbol", "entry_reason", "entry_label", "trades", "wins", "losses", "scratches",
+            "win_rate_pct", "net_usd", "loss_usd", "avg_usd", "avg_R"]
+    if trades.empty:
+        return pd.DataFrame(columns=cols)
+    df = trades.copy()
+    df["entry_reason"] = (df["entry_reason"] if "entry_reason" in df else
+                           pd.Series("unknown", index=df.index)).map(_reason_code)
+    rows = []
+    groups = [("TOTAL", df)] + list(df.groupby("symbol", sort=True))
+    for symbol, group in groups:
+        for reason, label in ENTRY_REASON_LABELS.items():
+            subset = group[group["entry_reason"] == reason]
+            if subset.empty:
+                continue
+            pnl = subset["pnl_usd"].astype(float)
+            wins, losses = int((pnl > 0).sum()), int((pnl < 0).sum())
+            rows.append({"symbol": symbol, "entry_reason": reason, "entry_label": label,
+                "trades": len(subset), "wins": wins, "losses": losses,
+                "scratches": int((pnl == 0).sum()), "win_rate_pct": round(wins / len(subset) * 100, 2),
+                "net_usd": round(float(pnl.sum()), 2), "loss_usd": round(float(pnl[pnl < 0].sum()), 2),
+                "avg_usd": round(float(pnl.mean()), 4), "avg_R": round(float(subset["pnl_R"].mean()), 4)})
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _entry_summary_html(summary: pd.DataFrame) -> str:
+    total = summary[summary["symbol"] == "TOTAL"]
+    columns = {"entry_label": "Entry reason", "trades": "Trades", "wins": "Wins",
+               "losses": "Losses", "win_rate_pct": "Win rate (%)", "net_usd": "Net P/L (USD)",
+               "avg_usd": "Avg P/L (USD)", "avg_R": "Avg P/L (R)"}
+    header = "".join(f"<th>{label}</th>" for label in columns.values())
+    body = "".join("<tr>" + "".join(f"<td>{_esc(row[key])}</td>" for key in columns) + "</tr>"
+                   for _, row in total.iterrows())
+    return ('<section id="entry-summary"><h2>Results by entry reason — all pairs</h2>'
+            '<p>Closed trades after costs and portfolio limits. Compare averages and trade counts, '
+            'not total losses alone. Scratch trades count in the win-rate denominator. '
+            'Small samples are not proof that one pattern is better.</p>'
+            f'<table><tr>{header}</tr>{body}</table>'
+            '<p>Reasons use the signal candle, not the entry candle. Historical reasons are '
+            'reconstructed only from verified saved config/data; otherwise Unknown. '
+            'Per-pair details: <code>entry_summary.csv</code>.</p></section>')
+
+
 def _equity_spec(all_trades: pd.DataFrame, run_dir: Path | None = None) -> dict | None:
     """Portfolio equity from exit-ordered trade PnL (R + USD) and drawdown in R."""
     if all_trades.empty:
@@ -169,6 +286,9 @@ def _run_config(run_dir: Path) -> dict:
     if path.exists():
         try:
             pp = json.loads(path.read_text(encoding="utf-8"))
+            cfg["research_data"] = pp.get("research_data")
+            cfg["broker_data"] = pp.get("broker_data")
+            cfg["data_dir"] = pp.get("data_dir")
             tf = pp.get("timeframes") or {}
             cfg["exec"] = str(tf.get("execution") or "H1").upper()
             cfg["reg"] = str(tf.get("regime") or "H4").upper()
@@ -338,14 +458,19 @@ def _bundle(run_dir: Path, data_dir: Path, trades: list[tuple[str, pd.DataFrame]
     from quant.backtest import load_h1  # generic bars loader (columns/UTC/ascending)
 
     cfg = _run_config(run_dir)
+    if data_dir == Path("data") and cfg.get("data_dir"):
+        data_dir = Path(cfg["data_dir"])
     # the view set follows THIS run's timeframes: execution chart + regime
     # chart, and the raw H1 tape whenever the execution grid is not H1
     view_tfs = {"exec": cfg["exec"], "reg": cfg["reg"]}
-    if cfg["exec"] != "H1":
+    if cfg["exec"] != "H1" and not cfg.get("broker_data"):
         view_tfs["raw"] = "H1"
     bundle: list[dict] = []
     for sym, df in trades:
-        h1_path = data_dir / f"{sym}_H1.csv"
+        if cfg.get("broker_data"):
+            from quant.broker_data import chart_path
+            data_dir = Path(cfg["broker_data"]["directory"])
+        h1_path = data_dir / f"{sym}_{'H4' if cfg.get('broker_data') else 'H1'}.csv"
         if not h1_path.exists():
             continue
         try:
@@ -356,7 +481,20 @@ def _bundle(run_dir: Path, data_dir: Path, trades: list[tuple[str, pd.DataFrame]
         try:
             charts: dict[str, tuple[str, dict]] = {}
             for key, tf in view_tfs.items():
-                bars = _tf_bars(data_dir, sym, tf, h1)
+                if cfg.get("broker_data"):
+                    from quant.broker_data import chart_path, dataset_info
+                    root = cfg["broker_data"]["directory"]
+                    if dataset_info(root) != cfg["broker_data"]:
+                        raise ValueError("broker dataset changed; refusing substitute charts")
+                    bars = load_h1(chart_path(root, sym, tf))
+                elif cfg.get("research_data"):
+                    from quant.mkdata import research_info, research_chart_path
+                    root = cfg["research_data"]["directory"]
+                    if research_info(root) != cfg["research_data"]:
+                        raise ValueError("research manifest changed since this run; refusing substitute charts")
+                    bars = load_h1(research_chart_path(root, sym, tf, h1_path))
+                else:
+                    bars = _tf_bars(data_dir, sym, tf, h1)
                 if bars is None:
                     if key == "exec":
                         raise ValueError(f"no candles on the {tf} execution grid")
@@ -382,16 +520,24 @@ def write_report(run_dir: Path, data_dir: Path) -> bool:
     from plotly.offline import get_plotlyjs
 
     summary = pd.read_csv(s_path)
-    loaded = _load_trades(run_dir)
+    loaded = annotate_entry_reasons(run_dir, _load_trades(run_dir))
     all_trades = (pd.concat([df for _, df in loaded], ignore_index=True)
-                  if loaded else pd.DataFrame())
+                   if loaded else pd.DataFrame())
+    entry_summary = entry_reason_summary(all_trades)
+    entry_summary.to_csv(run_dir / "entry_summary.csv", index=False)
 
     bundle, cfg = _bundle(Path(run_dir), Path(data_dir), loaded) if loaded \
         else ([], _run_config(Path(run_dir)))
     embedded = {c["id"]: c for c in bundle}
     embedded_ids = set(embedded)
     meta = [{"id": r["_id"], "sym": r["symbol"], "side": r["direction"],
-             "entry": str(r["entry_time"])[:16], "pnlR": _round(r["pnl_R"]),
+              "entry": str(r["entry_time"])[:16], "pnlR": _round(r["pnl_R"]),
+              "entryMalaysia": pd.to_datetime(r["entry_time"], utc=True).tz_convert(
+                  "UTC+08:00").strftime("%Y-%m-%d %H:%M"),
+              "lot": _num(r, "lot"),
+              "entryReason": r["entry_reason"],
+              "entryReasonLabel": ENTRY_REASON_LABELS[r["entry_reason"]],
+              "entryReasonSource": r["_entry_reason_source"],
              "pnlUsd": _round(r["pnl_usd"]),
              "exitType": str(r["exit_type"]), "bars": int(r["bars_held"]),
              "swap": _num(r, "swap"),  # null when the run predates the swap column
@@ -400,20 +546,31 @@ def write_report(run_dir: Path, data_dir: Path) -> bool:
             for _, r in all_trades.iterrows()]
 
     verdict_cell = ""
+    if cfg.get("broker_data"):
+        from quant.broker_data import WARNING
+        text = WARNING + " " + " ".join(cfg["broker_data"].get("coverage_warnings", []))
+        verdict_cell = f'<div id="broker-data-warning">{_esc(text)}</div>'
+    if cfg.get("research_data"):
+        from quant.mkdata import RESEARCH_WARNING
+        verdict_cell = f'<div id="research-warning">{_esc(RESEARCH_WARNING)}</div>'
     if "verdict" in summary.columns and len(summary):
         tot = summary[summary["symbol"] == "TOTAL"]
         if len(tot):
-            verdict_cell = (f'<div id="verdict">TOTAL verdict: '
+            verdict_cell += (f'<div id="verdict">TOTAL verdict: '
                             f"<b>{_esc(tot['verdict'].iloc[0])}</b></div>")
 
     figs = {"equity": _equity_spec(all_trades, run_dir), "yearly": _yearly_spec(run_dir)}
+    if cfg.get("broker_data") and figs["equity"]:
+        figs["equity"]["layout"]["title"] = "equity (all pairs, exit order; MTM = H4-close marks)"
     no_nan = lambda d: json.dumps(d, separators=(",", ":")).replace("</", "<\\/")
     html = _html(run_dir.name, get_plotlyjs(), _summary_table(summary), verdict_cell,
                  no_nan(figs),
                  no_nan({"embedded": embedded, "meta": meta,
                          "tf": {"exec": _tf_label(cfg["exec"], False),
                                 "reg": _tf_label(cfg["reg"], True)},
-                         "emaExec": cfg["entry"], "emaRegime": cfg["regime"]}))
+                          "emaExec": cfg["entry"], "emaRegime": cfg["regime"]}),
+                 coarse_marks=bool(cfg.get("broker_data")),
+                 entry_summary_html=_entry_summary_html(entry_summary))
     out = run_dir / "report.html"
     out.write_text(html, encoding="utf-8")
     print(f"report -> {out}", flush=True)
@@ -430,6 +587,7 @@ const pairSel = document.getElementById('pair');
 const rowsEl = document.getElementById('rows');
 const filterSel = document.getElementById('filter');
 const exitSel = document.getElementById('exitFilter');
+const reasonSel = document.getElementById('reasonFilter');
 const msgEl = document.getElementById('msg');
 const countEl = document.getElementById('count');
 const syms = Array.from(new Set(TB.meta.map(function (r) { return r.sym; }))).sort();
@@ -437,12 +595,19 @@ pairSel.innerHTML = syms.map(function (s) { return '<option>' + s + '</option>';
 const exitTypes = Array.from(new Set(TB.meta.map(function (r) { return r.exitType; }))).sort();
 exitSel.innerHTML = '<option value="all">All exits</option>' +
   exitTypes.map(function (t) { return '<option>' + t + '</option>'; }).join('');
+const reasonCodes = Array.from(new Set(TB.meta.map(function (r) { return r.entryReason; }))).sort();
+reasonSel.innerHTML = '<option value="all">All entry reasons</option>' +
+  reasonCodes.map(function (code) {
+    var label = TB.meta.find(function (r) { return r.entryReason === code; }).entryReasonLabel;
+    return '<option value="' + code + '">' + label + '</option>';
+  }).join('');
 function usd(v) { return v == null ? '-' : '$' + v; }
 function listTrades() {
-  var p = pairSel.value, f = filterSel.value, e = exitSel.value;
+  var p = pairSel.value, f = filterSel.value, e = exitSel.value, reason = reasonSel.value;
   return TB.meta.filter(function (r) {
     if (r.sym !== p) return false;
     if (e !== 'all' && r.exitType !== e) return false;
+    if (reason !== 'all' && r.entryReason !== reason) return false;
     return f === 'all' || (f === 'losses' ? r.pnlR < 0 : r.pnlR > 0);
   });
 }
@@ -458,10 +623,10 @@ function drawList() {
   };
   var rnd = function (v) { return Math.round(v * 100) / 100; };
   var hasSwap = rows.some(function (r) { return r.swap != null; });
-  rowsEl.innerHTML = '<tr><th>Entry time</th><th>Side</th><th>P/L (USD)</th>' +
+  rowsEl.innerHTML = '<tr><th>Entry time (UTC)</th><th>Entry time (Malaysia UTC+8)</th><th>Side</th><th>Lots</th><th>Entry reason</th><th>P/L (USD)</th>' +
     '<th>P/L (R)</th><th>Exit type</th><th>Held (' + TB.tf.exec + ' bars)</th>' +
     '<th>1R (USD)</th><th>TP amount (USD)</th><th>Swap (USD)</th></tr>' +
-    '<tr class="tot"><td>TOTAL ' + rows.length + '</td><td></td>' +
+    '<tr class="tot"><td>TOTAL ' + rows.length + '</td><td></td><td></td><td></td><td></td>' +
     '<td>' + usd(rnd(sum(function (r) { return r.pnlUsd; }))) + '</td>' +
     '<td>' + rnd(sum(function (r) { return r.pnlR; })) + '</td>' +
     '<td></td><td></td><td></td><td></td>' +
@@ -470,7 +635,12 @@ function drawList() {
     rows.map(function (r) {
       var col = r.pnlR < 0 ? '#f66' : '#6c6';
       return '<tr data-id="' + r.id + '"' + (r.missing ? ' class="nochart"' : '') +
-        '><td>' + r.entry + '</td><td>' + r.side +
+        '><td>' + r.entry + '</td><td>' + r.entryMalaysia + '</td><td>' + r.side +
+        '</td><td>' + (r.lot == null ? '-' : r.lot) +
+        '</td><td title="' + (r.entryReasonSource === 'reconstructed' ?
+        'Reconstructed from verified saved signal candle' :
+        (r.entryReasonSource === 'recorded' ? 'Recorded at candidate generation' : 'Not recorded or not verified')) +
+        '">' + r.entryReasonLabel +
         '</td><td style="color:' + col + '">' + usd(r.pnlUsd) +
         '</td><td style="color:' + col + '">' + r.pnlR + '</td><td>' + r.exitType +
         '</td><td>' + r.bars + '</td><td>' + usd(r.riskUsd) +
@@ -481,6 +651,7 @@ function drawList() {
 pairSel.onchange = drawList;
 filterSel.onchange = drawList;
 exitSel.onchange = drawList;
+reasonSel.onchange = drawList;
 rowsEl.onclick = function (e) {
   var tr = e.target.closest('tr');
   if (tr && tr.dataset.id) openChart(tr.dataset.id);
@@ -638,18 +809,20 @@ h1 { font-size: 18px; }
 
 
 def _html(title: str, plotlyjs: str, summary_html: str, verdict_cell: str,
-          figs_json: str, trades_json: str) -> str:
+          figs_json: str, trades_json: str, coarse_marks: bool = False,
+          entry_summary_html: str = "") -> str:
+    mark_timing = "at H4 candle closes" if coarse_marks else "hourly at each pair's close"
     glossary = ('<div id="glossary">R = distance from entry to the initial stop. '
                 "1R = account currency at risk on that trade (net of spread, slippage "
-                "and swap). MTM = mark-to-market: open positions are valued hourly at "
-                "each pair's close, so drawdown on the TOTAL row includes open "
+                f"and swap). MTM = mark-to-market: open positions are valued {mark_timing}, "
+                "so drawdown on the TOTAL row includes open "
                 "floating losses. All pairs share ONE account, so per-pair drawdowns "
                 "are not additive. Acceptance bands live in <code>configs/_base.yaml"
                 "</code>, section <code>benchmarks:</code>.</div>")
     return ("<!doctype html>\n<html><head><meta charset=\"utf-8\">"
             f"<title>run report - {escape(title)}</title>"
             f"<style>{_CSS}</style><script id=\"plotly-lib\">{plotlyjs}</script></head>\n<body>\n"
-            f"<h1>run report - {escape(title)}</h1>\n{glossary}\n{verdict_cell}\n{summary_html}\n"
+            f"<h1>run report - {escape(title)}</h1>\n{glossary}\n{verdict_cell}\n{summary_html}\n{entry_summary_html}\n"
             '<section id="overview"><div class="fig" id="fig-equity"></div>'
             '<div class="fig" id="fig-yearly"></div></section>\n'
             '<section id="browser">\n<select id="pair"></select>\n'
@@ -657,6 +830,7 @@ def _html(title: str, plotlyjs: str, summary_html: str, verdict_cell: str,
             '<option value="losses">Losses</option>'
             '<option value="winners">Winners</option></select>\n'
             '<select id="exitFilter"><option value="all">All exits</option></select>\n'
+            '<select id="reasonFilter"><option value="all">All entry reasons</option></select>\n'
             '<span id="count"></span>\n'
             '<table id="rows"></table>\n'
             '<span id="hint">click a row → chart opens in its own window</span>\n'

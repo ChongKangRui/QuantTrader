@@ -3,6 +3,147 @@
 Terminal must be open and logged in for anything that reads MT5.
 Monitor and smoke send no orders.
 
+## Active offline dataset: user's Pepperstone MT5 H4/D1 exports
+
+`configs/_base.yaml -> backtest_data` now selects `data/pepperstone` for offline
+backtests and dice. All **10 enabled pairs** have both charts. AUDJPY is parked
+and was not requested/imported. Live fetching and trading flags are unchanged.
+
+```text
+data/pepperstone/
+  raw/                 original 20 MT5 tab-separated exports, unchanged bytes
+  <SYM>_H4.csv         standardized UTC four-hour candles
+  <SYM>_D1.csv         standardized UTC daily candles
+  <SYM>_<TF>.meta.json source identity, checksums, server/UTC endpoints
+  manifest.json        full dataset identity and coverage warnings
+```
+
+The tagged originals were moved from the cluttered `data/` root into `raw/`
+after validating archived checksums. Original vendor H1/M1, source folders and
+the vendor-derived research dataset were not moved, renamed or changed.
+The importer command was run, not a backtest:
+
+```powershell
+$env:PYTHONPATH="python"; uv run python -m quant.mkdata --import-pepperstone --batch --src data --out-dir data/pepperstone
+```
+
+Do not rerun into the existing folder: overwrites are refused. A corrected export
+requires a fresh destination/review; retain the old dataset identity for old runs.
+
+**Coverage:** raw chart dates are 2020-01-02 through 2025-12-31, per pair 9341 H4
+and 1557 D1 candles. All full server days' H4 OHLC matches the supplied D1 except
+the final day. Every H4 export ends at **2025-12-31 16:00 server time**; the
+20:00 candle is missing while D1 includes later prices. This is recorded and
+shown as a warning; nothing is filled or silently trimmed. If the complete last
+day matters, re-export that final H4 candle. Pre-2020 history is not present:
+normal indicator warmup uses initial 2020 bars; earlier charts would be needed
+to start evaluating trades from the very beginning of 2020.
+
+**Time:** MT5 UI exports use broker server time, not UTC. Intake uses Pepperstone's
+documented GMT+2 winter / GMT+3 **US** daylight saving schedule (server clock =
+America/New_York + 7 hours), then converts timestamps to UTC without changing
+OHLC or resampling. It does not use Europe's DST calendar or a fixed offset.
+Reference: <https://pepperstone.com/en/about-us/trading-hours>.
+
+**Coarse execution:** this dataset has no broker M1 or H1. Offline checks explicitly
+use H4, not a silent fallback or mixed vendor feed. Both stop and target hit in
+one candle => stop first. Coarse exits are booked at bar end, not prematurely at
+bar open; their actual intrabar timestamp remains unknown. Trailing/breakeven
+are approximate if enabled (both currently OFF). Currency conversion uses the
+last broker H4 close only once the next candle opens. Drawdown marks use H4
+closes at their availability time, not invented hourly/minute observations.
+Existing configurable spread, commission, slippage and swaps remain charged;
+the raw export's zero `<SPREAD>` values do not turn costs off. Swap rollover
+timing remains the engine's existing approximation, not a newly exact model.
+
+User-run command when ready (NOT run by the agent):
+
+```powershell
+run-backtest.bat
+```
+
+or `$env:PYTHONPATH="python"; uv run python -m quant.backtest --batch`.
+Both now follow the broker dataset config. `--broker-data-dir` overrides the
+dataset folder; `use_broker_csv: false` disables this default and restores legacy
+input selection. An explicit `--research-data-dir` instead selects the separate
+research path. Missing enabled broker pairs, damaged checksums and wrong-source
+inputs fail rather than silently skipping pairs or mixing sources.
+
+Reports display the H4-coarse and coverage warnings and exact H4/D1 charts, with
+no fabricated H1 view. Run params save source identity, manifest hash, H4 check
+resolution and bar-close exit timing. Dice requires a NEW matching reference:
+
+```powershell
+$env:PYTHONPATH="python"; uv run python -m quant.dice_probe --real-only --reference backtest_results/<RUN_ID>
+```
+
+Only after parity and the pre-declared design are accepted, the user may run
+`--variant B --seeds 300` against that same reference. Research/H1-M1 pins do not
+match this source/resolution. Full 2020-2025 results would expose reserved
+2023-2025 holdout years; decide evaluation/holdout treatment before running.
+
+## Entry reasons and dice readiness
+
+### Malaysia entry hours (2026-10-21 update)
+
+`limits.entry_hours` in `_base.yaml` / `_base_h4d1.yaml` controls NEW strategy
+entries: `enabled: true`, `utc_offset_hours: 8`, `start: "09:15"`, `end: "23:00"`.
+Start is inclusive, end exclusive; `enabled: false` removes this guard.
+The offset is fixed (Malaysia has no DST), not the broker's seasonal offset.
+Times remain UTC internally; check live order-decision time / offline next-bar
+fill time in the configured local clock. Overnight windows are supported.
+Existing positions stay managed outside the window. Skipped signals are not
+queued. H4 entries still use broker candle boundaries, not arbitrary 09:15 fills.
+Manual order-testing utilities are outside this strategy-entry guard.
+
+The report displays Lots and explicitly labeled UTC and Malaysia entry times.
+Rebuilding an old report changes presentation only; it does NOT apply this new
+entry rule to old trades. **Dice now needs a NEW user-run baseline** with these
+settings; `20261021_202430` is unfiltered and no longer matches active config.
+After that baseline, run `--real-only --reference backtest_results/<NEW_RUN>`;
+only after PASS may the pre-declared random comparison run.
+
+New trade CSVs record `entry_reason` and `signal_bar_time` from the **signal
+candle**, not the subsequent fill candle. Modern W1 labels are Wick touch and
+Cross candle; disabled/legacy rules and random A/B entries have distinct labels.
+This is diagnostic metadata only, not a new strategy parameter or entry rule.
+
+Reports show an entry-reason column/filter and all-pair results by reason. Each
+report rebuild writes `entry_summary.csv` with combined and per-pair trade counts,
+wins/losses/scratches, win rate, net USD, negative-USD sum and average USD/R.
+All figures use accepted closed trades after costs/portfolio filters. A zero-net
+trade counts in the win-rate denominator but is neither a win nor loss.
+
+Rebuild an existing report **without rerunning a backtest**:
+
+```powershell
+$env:PYTHONPATH="python"; uv run python -m quant.report --run backtest_results/20261021_202430
+```
+
+Historical reasons are reconstructed only when saved modern strategy settings,
+source identity/checksums, signal-to-fill alignment and recorded ATR agree.
+Otherwise they display Unknown. Hover a reason to see recorded/reconstructed
+status. Rebuilding does not change original trades, totals or parameters.
+The latest report above has already been rebuilt for all 786 trades.
+
+**Historical dice command (before entry hours were enabled):** the old baseline
+passed read-only checks then, but no longer matches the active configuration.
+Replace the reference below with a new session-filtered run before using it:
+
+```powershell
+$env:PYTHONPATH="python"; uv run python -m quant.dice_probe --real-only --reference backtest_results/20261021_202430
+```
+
+This gate has **not** been run by the agent. Only after it PASSES can the
+pre-declared random B comparison proceed. Added diagnostic columns alone do not
+invalidate an older reference; original financial/trading columns still must
+match exactly within existing numeric tolerance. Do not disable a pattern just
+because its inspected sample looks worse: that is a new hypothesis, not proof.
+
+The year-end missing candle is an accepted source limitation, not a pending
+repair request. Audit metadata stays intact. The holiday window blocks new
+entries but does not force existing trades closed; its rules were not changed.
+
 ## Trading supervisor (the trading switch)
 
 ```powershell
@@ -38,6 +179,143 @@ $env:PYTHONPATH="python"; uv run python -m quant.edge_probe --batch
 
 Reads the same H1/H4 data as the backtest. Verdict line lives by the
 pre-decided rule in `docs/TESTLOG.md`; per-pair rows are information only.
+
+## Broker history export (read-only, no orders)
+
+The exporter follows `_base.yaml`'s execution, regime and position-check
+timeframes. It also exports H1 for the current backtest's price/report inputs
+and required USD conversion feeds. It exports broker candles, never resamples.
+It supports standard MT5 timeframes independently of the engine, which still
+accepts only H1/H4 and H4/D1 strategy combinations.
+
+First agree the pairs/date range. Example **only**, for calendar year 2025:
+
+```powershell
+$env:PYTHONPATH="python"; uv run python -m quant.mkdata --broker --batch --start 2025-01-01 --end 2026-01-01 --out-dir data/broker_review --plan
+```
+
+`--plan` connects to nothing and writes nothing. `--batch` uses selected config
+pairs; replace it with `--symbol EURUSD` for one pair. Dates without offsets
+mean UTC, and `--end` is exclusive. The example dates are not an approved test
+window. Actual export, after confirmation, uses the same command without `--plan`:
+
+```powershell
+$env:PYTHONPATH="python"; uv run python -m quant.mkdata --broker --batch --start 2025-01-01 --end 2026-01-01 --out-dir data/broker_review
+```
+
+Open and log in to the intended MT5 terminal first. Export uses that terminal's
+current account/server; it does not load account credentials or switch accounts.
+No orders or trading flags are touched. CSVs and matching `<SYM>_<TF>.meta.json`
+sidecars record server, symbol, UTC timestamps, export date, requested/actual
+coverage, warmup and gap statistics. Account login/password are not recorded.
+
+- Broker-retained history and terminal **Max. bars in chart** can limit available
+  data. Load more history or choose a later start when coverage/warmup fails.
+  The default warmup is the maximum configured warmup/known indicator period;
+  `--warmup-bars N` overrides it (0 explicitly disables it). Extra prefix bars
+  are included in **every** feed, including M1 and converters. The last prefix
+  candle is not counted as closed without a following broker open.
+- Missing M1 coverage stops export rather than silently using H4 stop checks.
+  Raw `None`, invalid prices/volumes, duplicates and descending timestamps fail.
+  Gaps/empty chunks and leading/trailing coverage are reported, never filled.
+  Gaps include normal weekends/holidays/session/DST changes; the exporter does
+  **not** certify that a reported gap is harmless or that broker history is complete.
+- Queries stream in bounded `--chunk-days` chunks (default 31). Only bars no
+  newer than the broker's last closed candle at collection are retained.
+- Existing output files are refused by default. Use a fresh review folder.
+  `--overwrite` explicitly replaces matching CSVs/sidecars; do not use it on
+  `data/` without deciding whether to replace existing vendor histories.
+  All feeds are staged/validated before publication; a collection failure
+  leaves existing CSVs alone. Publication is per-file, not a multi-file filesystem
+  transaction: a disk/rename failure during publication can leave a partial set.
+
+**Before backtesting:** review coverage/source consistency and the extra warmup
+prefix. The existing backtester does not use metadata to enforce a separate
+trade-start date. Its batch input paths still point at `data/`; a review folder
+is not automatically selected. Promoting/replacing files needs an explicit
+decision. Do not combine new broker H4/D1 with old vendor H1/M1 or conversion
+feeds without addressing their timezone/source differences.
+
+The original vendor workflow (`mkdata --symbol ... [--m1-csv]`) is unchanged.
+
+## Vendor-derived H4/D1 research dataset (explicit alternative, not broker candles)
+
+User-approved research alternative, 2026-10-21. Built directly from existing M1
+for all 11 available pairs, including parked AUDJPY; trading selection stays
+unchanged (10 enabled). It preserves the source timestamps as stored and groups
+at 00:00/04:00/etc. The source timezone is **unverified**: UTC labels are not
+proof that these candles match the broker clock. Signals, swaps and fills can
+differ from live trading. This is exploratory tooling, not live validation.
+
+Dataset: `data/vendor_derived_2015_2025/` (local-only). Build command, already run:
+
+```powershell
+$env:PYTHONPATH="python"; uv run python -m quant.mkdata --research --all-existing --src data --out-dir data/vendor_derived_2015_2025
+```
+
+The builder streams consolidated M1 CSVs, not H1. It writes H4/D1 CSVs with
+`n_minutes`, per-file coverage/source sidecars, and `manifest.json`. Empty periods
+are omitted, never filled; partial periods use observed OHLC only and are retained
+and counted. A partial period is not automatically corrupt: weekends, short
+sessions and quiet minutes also produce them. The first observed price stands
+in for that candle's open; this is an approximate fill model when early minutes
+are absent. Reports do not establish that every source gap is harmless.
+`--symbol` builds one pair; `--research-timeframes` accepts fixed-duration MT5
+names; `--chunk-rows` bounds memory. Existing outputs are refused without explicit
+`--overwrite`; sources must remain unchanged. This creates no synthetic pre-2015
+warmup; the engine consumes its normal warmup from the beginning of the files.
+
+Backtesting requires **explicit opt-in**. The following is the full-dataset
+command for the user to run, NOT executed by the agent:
+
+```powershell
+$env:PYTHONPATH="python"; uv run python -m quant.backtest --batch --data-dir data --research-data-dir data/vendor_derived_2015_2025
+```
+
+**Holdout warning:** this command uses 2015-2025, including the last three years
+previously reserved as unseen. If that holdout must stay unseen, prepare a
+separately date-sliced source snapshot/dataset before running; no holdout split
+was created here. Do not call an inspected full-range result out-of-sample.
+`docs/TESTLOG.md` records the pending research evaluation design.
+
+Research mode verifies original H1/M1 size/mtime snapshots and derived SHA256
+checksums; do not edit source files after building. It requires the manifest's
+matching H1/M1 and converter sources. Configured M1 checks cannot silently fall
+back when the feed fails to load. Run params save dataset identity/manifest hash;
+reports show the research warning and use these exact charts, never a silent
+broker/H1-resample substitution. Moved/changed datasets can make old report charts
+unavailable. Normal H4/D1 mode still requires broker-exported files; live ignores
+the research dataset entirely. No strategy, costs, risk limits or pair selection
+were retuned to make the dataset fit.
+
+## Configured dice comparison (user runs after a matching reference exists)
+
+Supports the engine's configured H1/H4 and H4/D1 combinations and its current
+shared trend-strategy core, not arbitrary plug-in strategies/timeframes. Both
+real and random paths load the same chart frames, use the last completed regime
+candle, and share execution-bar duration, costs, exits, sizing and portfolio/pair
+limits. `--variant A` randomizes timing and direction; `--variant B` randomizes
+timing while following the strategy's LONG/SHORT direction. B requires a valid
+direction map. Unsupported modes and balance-scaled references are refused.
+
+After the user runs a matching reference, replace `<RUN_ID>` below:
+
+```powershell
+$env:PYTHONPATH="python"; uv run python -m quant.dice_probe --real-only --reference backtest_results/<RUN_ID> --data-dir data --research-data-dir data/vendor_derived_2015_2025
+```
+
+Only after parity passes and the experiment is pre-declared:
+
+```powershell
+$env:PYTHONPATH="python"; uv run python -m quant.dice_probe --variant B --seeds 300 --reference backtest_results/<RUN_ID> --data-dir data --research-data-dir data/vendor_derived_2015_2025
+```
+
+No dice/real-only command above has been run against actual history in this change.
+Every invocation checks reference configuration/source identity first, then
+per-pair counts, complete trade rows and pooled totals before any random draws.
+H4/D1/research requires an explicit new reference: the old H1/H4 pin is not used.
+Zero-trade comparisons are refused. `edge_probe` remains legacy H1/H4-only and
+was not adapted; the old dice experiment identifier "D1" is not a timeframe lock.
 
 ## Backtest
 

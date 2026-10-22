@@ -9,6 +9,92 @@ Full numbers live in each `backtest_results/<run-id>/` (params.json is the truth
 - Probe verdict (pre-decided 2026-10-17): CONFIRMED iff pooled onset mean edge ≥ 0 AND mean − 2×SE > 0 at **both** 48 and 72 bars. 24-bar horizon = info only, never used to pick a horizon afterwards. Per-pair rows = information only, never verdict material.
 - One rule change per run. The variant count is the row count below.
 
+## Pepperstone H4/D1-only baseline — user-run reference, dice pending (2026-10-21)
+
+Superseding update: Malaysia new-entry window 09:15 inclusive–23:00 exclusive
+(fixed UTC+8) is now enabled. `20261021_202430` predates this rule and must NOT be
+used as the active dice reference. Pre-declare the revised comparison and obtain
+a new user-run baseline, then full-trade parity PASS, before random draws.
+Report-only lot/time display changes do not change old trades. No new backtest
+or actual-history parity/random experiment was run by the agent.
+
+Update: user produced `backtest_results/20261021_202430` and inspected results.
+Its config/source/pair coverage passed read-only compatibility checks; actual
+`--real-only` full-trade parity and dice remain pending. Entry-reason reporting
+was added without changing trading rules/results; report-only reconstruction
+does not rewrite the reference trades. Missing new diagnostic columns alone
+do not invalidate the old reference's financial/trading parity. Pattern tables
+are descriptive, not permission to pick a winner on the same inspected sample.
+
+**Agent work: intake/readiness/reporting only; no actual-history backtest, parity
+or dice experiment run by the agent.** User confirmed all tagged files are Pepperstone/MT5
+exports. All 10 enabled pairs have H4+D1; parked AUDJPY is excluded.
+
+- Active offline dataset: `data/pepperstone`, manifest SHA256
+  `f6b67d52faa3a0e097ceb9bf64564ce27688278bf3a52b9b92a2b3df2803b081`.
+  Per pair: 9341 H4 / 1557 D1, broker dates 2020-01-02 to 2025-12-31.
+  Raw originals archived unchanged; UTC conversion uses server = New York + 7h
+  with US DST, not Europe DST or a fixed offset. No price resampling/filling.
+- One known coverage problem per pair: final server day has five H4 candles,
+  ending 16:00, while D1 includes later prices. Missing 20:00 H4 is not filled,
+  reconstructed or silently trimmed; warnings remain in metadata/results.
+  No pre-2020 warmup added: early 2020 supplies the configured warmup.
+- Explicit H4-only stop/target checks and H4-close drawdown marks; no vendor
+  M1/H1 or fabricated helpers. Both stop and target inside one candle => stop.
+  Whole-bar exits book at bar close so portfolio state cannot see a later
+  candle result at its open. Actual intrabar ordering/time is still unknown.
+  Trailing/BE OFF as before; enabling either is a separate approximate model.
+- Quote-currency conversion uses only the last available closed broker H4
+  price; current-candle closes are not visible early. Existing configured costs,
+  scope, account benchmark and pair/portfolio limits are unchanged. The raw
+  export `<SPREAD>` zeros do not remove the configured trading costs.
+- A NEW matching user-run reference is required; old vendor/research/H1-M1 pins
+  are incompatible. Dice A/B design remains as below, but both paths must share
+  this manifest, H4 checks and bar-close exit timing and pass full-trade parity.
+  No automatic carryover of old verdicts. The P95 B timing criterion, separate
+  +0.10R money bar and configured benchmarks remain fixed before results.
+- User decides the evaluation/holdout window before running. Full 2020-2025
+  would inspect 2023-2025, previously reserved as unseen; no holdout split here.
+  Partial final-day history, coarse fills/marks and approximate swap timing
+  prevent claims of precise broker execution parity.
+
+## Vendor-derived H4/D1 research — pending evaluation design (2026-10-21)
+
+**No actual-history backtest, parity run or dice experiment executed for this
+change. Evaluation window / preservation of the unseen years remains a user
+decision before running.** This is not a result or a live-parity claim.
+
+- User approved deriving H4/D1 directly from existing M1 for all 11 available
+  pairs, 2015-2025. Only the existing 10 selected pairs take part in a batch;
+  AUDJPY remains parked. No source prices/periods are filled, no broker history
+  is substituted silently, and strategy/cost/risk settings are unchanged.
+- Dataset: `data/vendor_derived_2015_2025`, manifest SHA256
+  `e2297f26c674cff8346331759c0ed333a2cad8b0274b943f6675b2b4799fd75e`.
+  232037 H4+D1 candles; midnight-based grouping of timestamps as stored, source
+  timezone unverified. Partial periods are retained and counted, including
+  ordinary short sessions/quiet minutes and potentially missing data.
+- Reference must be a NEW user-run H4/D1 backtest with explicit research opt-in,
+  matching source, config, costs, sizing, limits and pair set. The old H1/H4 pin
+  is not a valid reference. The benchmark/$100 baseline and $4-$5.50 risk band
+  are unchanged; no parameters were selected from results of these new files.
+- Before any dice draws: `--real-only` must reproduce complete per-pair trades
+  and pooled totals, not just counts. Both paths use the same configured charts,
+  next-open completed-regime mapping, H4 bar duration, M1 checks and pair/portfolio
+  limits. At joint portfolio admission, disallowed entries cannot contribute
+  later loss/cap state; legacy per-pair candidate suppression remains unchanged.
+- A = random timing+direction (placebo, information only). B = random timing
+  among regime-bias-on execution bars, following that strategy direction. Only
+  entries are replaced; exits/costs/sizing/limits are unchanged. Existing adaptive
+  candidate waves / uniform trade thinning and pre-pass trade-count targets stay.
+- Existing planned null rule remains: 300 seeds, base 42; B timing evidence only
+  if real pooled post-filter mean R is above dice B's 95th percentile. A is not
+  verdict material. The separate +0.10R money bar and configured benchmarks stay.
+  Do not tune these after inspecting results. Zero-trade/unsupported comparisons
+  are refused. This design applies to the current trend core, not every strategy.
+- Keep the last ~3 years unseen for new ideas. The full-dataset RUNBOOK command
+  would expose them; use separate date-sliced source snapshots/datasets to keep
+  a holdout. No split or out-of-sample evaluation has been performed here.
+
 ## D1 dice probe — pre-declaration (2026-10-18, written BEFORE any dice run)
 
 Question: do the entry rules beat dice, or does the reference result sit inside dice luck?

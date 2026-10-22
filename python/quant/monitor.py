@@ -151,7 +151,7 @@ def read_trade_cfg(config_dir: str | Path) -> dict:
     """
     import yaml
 
-    from quant.limits import parse_no_trade_ranges
+    from quant.limits import parse_no_trade_ranges, read_pair_limits, read_entry_hours
 
     try:
         cfg = yaml.safe_load(
@@ -175,6 +175,8 @@ def read_trade_cfg(config_dir: str | Path) -> dict:
         "scale_lot_with_balance": _as_bool(risk.get("scale_lot_with_balance"), False),
         "balance_risk_pct": float(risk.get("balance_risk_pct", 3.0) or 0.0),
         "max_trades_per_day": int(lim.get("max_trades_per_day", 0) or 0),
+        **read_pair_limits(lim),
+        "entry_hours": read_entry_hours(lim),
         "max_cost_ratio": float(lim.get("max_cost_ratio", 0.10) or 0.0),
         "scope_low": float(scope.get("low", 0.0) or 0.0),
         "scope_high": float(scope.get("high", 0.0) or 0.0),
@@ -463,11 +465,15 @@ def _cycle(mt5, accounts, pairs, args, conditions: dict[str, str],
                                    exec_tf=getattr(args, "exec_tf", "TIMEFRAME_H1"),
                                    reg_tf=getattr(args, "reg_tf", "TIMEFRAME_H4"))
                 now = datetime.now(timezone.utc)
-                deals = mt5.history_deals_get(now - timedelta(days=365), now) or ()
+                try:
+                    deals = mt5.history_deals_get(now - timedelta(days=365), now)
+                except Exception as exc:
+                    deals = None
+                    print(f"DATA ERROR - {atag} deal history: {exc}", flush=True)
                 try:
                     n = rec.sync_closed_positions(
                         mt5, Path(args.records_dir) / f"{atag.lower()}.csv",
-                        magic=args.magic, conditions=conditions, account=atag, deals=deals)
+                        magic=args.magic, conditions=conditions, account=atag, deals=deals or ())
                     if n:
                         print(f"records: +{n} closed position(s) -> {atag.lower()}.csv", flush=True)
                 except Exception as exc:
@@ -480,7 +486,7 @@ def _cycle(mt5, accounts, pairs, args, conditions: dict[str, str],
                 try:
                     weeks[atag] = lim.evaluate(
                         Path(args.memory_dir) / f"weekly_{atag.lower()}.json",
-                        deals, args.magic, equity, loss_pct, now)
+                        deals or (), args.magic, equity, loss_pct, now)
                 except Exception as exc:
                     print(f"weekly halt check skipped ({atag}): {exc}", flush=True)
                 if tcfg:
@@ -590,6 +596,9 @@ def main(argv: list[str] | None = None) -> int:
                 "max_total_positions": tradecfg["max_total_positions"],
                 "max_ccy_net": tradecfg["max_ccy_net"],
                 "max_trades_per_day": tradecfg["max_trades_per_day"],
+                "max_trades_per_pair_per_week": tradecfg["max_trades_per_pair_per_week"],
+                "disable_pair_after_daily_loss": tradecfg["disable_pair_after_daily_loss"],
+                "entry_hours": tradecfg["entry_hours"],
                 "max_cost_ratio": tradecfg["max_cost_ratio"],
                 "scale_lot_with_balance": tradecfg["scale_lot_with_balance"],
                 "balance_risk_pct": tradecfg["balance_risk_pct"],

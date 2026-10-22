@@ -1,6 +1,25 @@
 # Strategy Spec: Multi-Pair Trend System (H4 bias, H1 entry) on MT5
 
 Status: DRAFT v1.0. Every rule below is a **hypothesis to be tested**, not a proven edge.
+
+Active offline source (2026-10-21): user-supplied Pepperstone MT5 H4/D1 chart
+exports in `data/pepperstone`, broker dates 2020-2025. Server timestamps are
+normalized using Pepperstone's US-DST clock; broker OHLC is not resampled.
+`backtest_data` enables/disables this selection separately from live settings.
+No broker H1/M1 is available, so offline position checks and drawdown marks are
+explicitly H4-resolution, with no vendor feed mixing. Stop wins ambiguous
+stop/target candles; coarse exits book at bar close. Trailing/BE remain OFF in
+the active strategy. The last 20:00 H4 candle on 2025-12-31 is missing for all
+10 enabled pairs and is warned, not fabricated. See RUNBOOK for limitations.
+
+Research exception (user approved 2026-10-21): offline experiments may explicitly
+opt into `--research-data-dir data/vendor_derived_2015_2025`, built directly from
+vendor M1 on stored-clock midnight/four-hour boundaries. These are NOT broker
+candles; source timezone is unverified, partial periods are retained, and no
+empty periods are filled. The normal H4/D1 and live contracts still use broker
+bars. Results from this alternative are exploratory, not evidence of live parity.
+Run parameters and HTML reports identify the research source. Unseen-period
+rules still apply: a full 2015-2025 run exposes any reserved 2023-2025 holdout.
 `[TEST]` = has a range to evaluate. `[DECIDE]` = needs your choice before coding. Parked ideas sit in section 15 and are NOT active rules.
 
 Changes from v0.9 (2026-10-19):
@@ -10,8 +29,8 @@ Changes from v0.9 (2026-10-19):
   closing on the trend side of EMA20; RR 1:2.5, trailing deferred). It runs on the
   SAME engine from its own preset (`configs/_base_h4d1.yaml` copied over
   `_base.yaml`); only one variant is active at a time. Its "max 2 per pair per
-  week" and "pair disabled for the day after a loss" rules are recorded but
-  NOT built yet. Also: `_base.yaml`'s sizing switch now documents both sizing
+   week" and "pair disabled for the day after a loss" rules were subsequently
+   built on 2026-10-21 (section 16.3). Also: `_base.yaml`'s sizing switch documents both sizing
   modes explicitly (fence sizing vs percent/compounding sizing).
 
 Changes from v0.8:
@@ -245,6 +264,16 @@ Caution: breakeven stops get hit by ordinary pullbacks and can reduce the share 
 - Margin check: with all positions open, free margin must stay comfortably positive.
 - **Log risk as a percentage of equity on every trade** (per-trade risk / equity). The USD risk is scoped, not fixed, so its percentage changes with the account and the stop, and it is the number that matters for drawdown (see 8A).
 
+**Local entry hours (2026-10-21):** `limits.entry_hours` is enabled in active
+H4/D1 configs: 09:15 inclusive–23:00 exclusive, fixed UTC+8 (Malaysia).
+`enabled`, `utc_offset_hours`, `start`, `end` are configurable; disabled means
+no hours guard. Uses actual live decision time / offline next-bar fill time,
+never the signal candle opening time. Outside-window entries are skipped, not
+queued; open positions keep being managed. Broker candle boundaries and UTC
+storage stay unchanged. Midnight-wrapping windows are supported. Backtest and
+dice share this guard; run params record it and the funnel counts `entry_hours`.
+This changes strategy results and requires a new baseline before dice parity.
+
 ## 8A. Loss limits and drawdown rules (PROPOSED, not locked)
 
 Principles:
@@ -420,13 +449,19 @@ one is active — the engine reads `configs/_base.yaml` ONLY:
 - Trailing: evaluated as a SEPARATE exit model in its own run
   (`use_trail: false`, `use_be: false` for now; the section 7 comparison
   runs X1/X4a-X4c are the evaluation checklist).
-- **Max 2 opportunities per pair per week:** NOT BUILT — no knob exists yet
-  (`[DECIDE]` whether to build it as a `limits` key). The engine cannot
-  enforce it in the current presets.
+- **Max 2 actual entries per pair per week:**
+  `limits.max_trades_per_pair_per_week: 2` (0 = off), UTC Monday-start week.
+  Rejected signals/orders and dry-run plans do not count; partial fills of
+  one live position count once. Counts recover from broker history on restart.
 - **A loss disables further trading for that pair for the rest of the day:**
-  NOT BUILT — no knob exists yet (same status). Only the section-8 caps apply
-  meanwhile (`max_total_positions`, `max_ccy_net`, the weekly halt in R, the
-  daily portfolio cap, no-trade windows).
+  `limits.disable_pair_after_daily_loss: true` (false = off). A fully closed
+  position's net loss after costs blocks its pair until the next UTC day.
+  Book it on the closing day, even for an older position; scratch/winning
+  positions and floating losses do not trigger it. Other pairs and existing
+  positions remain subject to the existing section-8 protections. Live history
+  failures block new entries and retry; complete position histories include
+  entry fees and manual closes. Backtest pair limits and portfolio limits
+  share one chronological pass, with closes before entries at equal times.
 - Sizing: the engine's section-8 rules as configured. With the current fence
   `low 4 / high 5.5` and H4-sized stops (measured 2026-10-19, median
   1.5xATR7): GBPUSD, AUDUSD, NZDUSD, USDCAD, GBPJPY clear the band; EURUSD,
@@ -443,5 +478,5 @@ one is active — the engine reads `configs/_base.yaml` ONLY:
 - [ ] Sizing fence for H4-sized stops: [4, 5.5] (≈5/9 pairs) vs [4, 8] (9/9).
 - [ ] Literal flat rule (`sep_atr: 0.0`) vs the 0.3-ATR band approximation.
 - [ ] `warmup_bars` on D1: 100 vs 300.
-- [ ] Build the two frequency knobs (max 2 per pair-week; pair-day lock).
+- [x] Build the two frequency knobs (2026-10-21; terminal validation pending).
 - [ ] RR comparison run: 2.5 vs 3.0 (`tp_mult`).

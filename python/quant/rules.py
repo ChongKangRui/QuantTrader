@@ -8,6 +8,10 @@ from __future__ import annotations
 
 import math
 
+# USD-account conversion feeds shared by the engine, probes and history exporter.
+USD_CONVERSION_FEEDS = {"JPY": "USDJPY", "GBP": "GBPUSD", "AUD": "AUDUSD",
+                        "NZD": "NZDUSD", "CAD": "USDCAD", "CHF": "USDCHF"}
+
 
 def step_risk(stop_dist: float, tick_size: float, tick_value: float) -> float:
     """Money at risk for one trade at 0.01 lot (account currency)."""

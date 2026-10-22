@@ -78,8 +78,18 @@ def pivot_highs(high: pd.Series, n: int) -> list[tuple[int, float]]:
     return out
 
 
-def _result(signal: bool, fail: str | None, checks: dict, level=None, atr=None) -> dict:
-    return {"signal": signal, "fail": fail, "checks": checks, "level": level, "atr": atr}
+ENTRY_REASON_LABELS = {
+    "wick_touch": "Wick touch", "cross_candle": "Cross candle",
+    "legacy_w1": "Legacy W1", "other": "Other entry rules",
+    "dice_a": "Random timing + direction", "dice_b": "Random timing / strategy direction",
+    "unknown": "Unknown",
+}
+
+
+def _result(signal: bool, fail: str | None, checks: dict, level=None, atr=None,
+            entry_reason: str = "unknown") -> dict:
+    return {"signal": signal, "fail": fail, "checks": checks, "level": level,
+            "atr": atr, "entry_reason": entry_reason}
 
 
 def check_entry(h1: pd.DataFrame, direction: str, params: dict | None = None) -> dict:
@@ -192,4 +202,13 @@ def check_entry(h1: pd.DataFrame, direction: str, params: dict | None = None) ->
     if not bool(p.get("use_w1", False)):
         checks["W1"] = True
     fail = next((code for code in FAIL_ORDER if not checks.get(code, False)), None)
-    return _result(fail is None, fail, checks, level, a)
+    reason = "unknown"
+    if fail is None:
+        if not bool(p.get("use_w1", False)):
+            reason = "other"  # A disabled W1 is not the reason this entry qualified.
+        elif not w1_patterns:
+            reason = "legacy_w1"  # Older W1 did not require the modern closing pattern.
+        else:
+            trend_side = o > fast if side == "LONG" else o < fast
+            reason = "wick_touch" if trend_side else "cross_candle"
+    return _result(fail is None, fail, checks, level, a, reason)

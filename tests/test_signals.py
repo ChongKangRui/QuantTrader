@@ -258,14 +258,18 @@ def test_w1_h4_two_patterns_work_for_buys_and_sells():
         params = dict(_W1_ISO, w1_touch_from_trend_side=True,
                       w1_cross_from_other_side=True)
         assert check_entry(_frame(bars), side, params)["signal"] is True
+        assert check_entry(_frame(bars), side, params)["entry_reason"] == "wick_touch"
 
         crossed = list(bars)
         o, hi, lo, c = crossed[-1]
         crossed[-1] = ([fast - 0.3, hi, fast - 0.4, c] if side == "LONG" else
                        [fast + 0.3, fast + 0.4, lo, c])
         assert check_entry(_frame(crossed), side, params)["signal"] is True
+        assert check_entry(_frame(crossed), side, params)["entry_reason"] == "cross_candle"
         assert check_entry(_frame(crossed), side, dict(
             params, w1_cross_from_other_side=False))["fail"] == "W1"
+        assert check_entry(_frame(crossed), side, dict(
+            params, w1_cross_from_other_side=False))["entry_reason"] == "unknown"
         assert check_entry(_frame(bars), side, dict(
             params, w1_touch_from_trend_side=False))["fail"] == "W1"
         assert check_entry(_frame(bars), side, dict(

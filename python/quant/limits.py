@@ -10,10 +10,70 @@ GMT-offset setting we do not have yet).
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 WEEKLY_LOSS_PCT_DEFAULT = 15.0
+
+
+def read_entry_hours(limits: dict) -> dict:
+    """Fixed-offset local entry window; absent settings preserve old behavior."""
+    raw = limits.get("entry_hours", {})
+    if not isinstance(raw, dict):
+        raise ValueError("entry_hours must be a mapping")
+    enabled = raw.get("enabled", False)
+    offset = raw.get("utc_offset_hours", 8)
+    if not isinstance(enabled, bool):
+        raise ValueError("entry_hours.enabled must be true or false")
+    if (isinstance(offset, bool) or not isinstance(offset, (int, float))
+            or not math.isfinite(offset) or not -24 < offset < 24):
+        raise ValueError("entry_hours.utc_offset_hours must be between -24 and 24")
+    result = {"enabled": enabled, "utc_offset_hours": offset}
+    for key, default in (("start", "09:15"), ("end", "23:00")):
+        value = raw.get(key, default)
+        if (not isinstance(value, str) or len(value) != 5 or value[2] != ":"
+                or not value[:2].isdigit() or not value[3:].isdigit()
+                or not 0 <= int(value[:2]) < 24 or not 0 <= int(value[3:]) < 60):
+            raise ValueError(f"entry_hours.{key} must be HH:MM (00:00–23:59)")
+        result[key] = value
+    if result["start"] == result["end"]:
+        raise ValueError("entry_hours start and end must differ; use enabled: false for all day")
+    return result
+
+
+def entry_time_allowed(at: datetime, hours: dict) -> bool:
+    """Check fill time, start inclusive/end exclusive; support midnight wrap."""
+    if not hours["enabled"]:
+        return True
+    if at.tzinfo is None or at.utcoffset() is None:
+        raise ValueError("entry time must be timezone-aware")
+    local = at.astimezone(timezone(timedelta(hours=hours["utc_offset_hours"])))
+    clock = local.strftime("%H:%M")
+    start, end = hours["start"], hours["end"]
+    return start <= clock < end if start < end else clock >= start or clock < end
+
+
+def read_pair_limits(limits: dict) -> dict:
+    """Validate optional pair-entry limits; old configs leave both disabled."""
+    cap = limits.get("max_trades_per_pair_per_week", 0)
+    stop = limits.get("disable_pair_after_daily_loss", False)
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
+        raise ValueError("max_trades_per_pair_per_week must be an integer >= 0")
+    if not isinstance(stop, bool):
+        raise ValueError("disable_pair_after_daily_loss must be true or false")
+    return {"max_trades_per_pair_per_week": cap,
+            "disable_pair_after_daily_loss": stop}
+
+
+def pair_entry_reason(entries: int, lost_today: bool, max_week: int,
+                      stop_after_loss: bool) -> str | None:
+    """Shared live/backtest decision; counters contain only actual entries."""
+    if stop_after_loss and lost_today:
+        return "pair_daily_loss"
+    if max_week > 0 and entries >= max_week:
+        return "pair_week_cap"
+    return None
 
 
 def parse_no_trade_ranges(cfg: dict) -> list[tuple[str, str]]:

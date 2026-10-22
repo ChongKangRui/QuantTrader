@@ -129,9 +129,24 @@ without `risk.default_lot` may still use `stop_sizing.fixed_lot` as the base.
 | `weekly_loss_pct` | % of week-start equity (live/panel halt only) |
 | `max_cost_ratio` | round-trip cost as a share of the stop distance |
 | `max_total_positions`, `max_ccy_net`, `max_trades_per_day` | counts |
+| `max_trades_per_pair_per_week` | actual entries per pair per UTC Monday-start week; 0 disables |
+| `disable_pair_after_daily_loss` | true blocks new entries for a pair after a fully closed net loss, until the next UTC day; false disables |
 | `lookback`, `pivot_n`, `warmup_bars` | bars |
 
 Cost currency: the swaps/commission unit is `account.currency` (USD).
+Pair limits count accepted entries only, not signals, rejected orders or dry-run
+plans. Partial fills of one live position count once. Losses include entry/exit
+costs and are booked on the closing day, even if opened in a previous week.
+Existing positions keep their protection; unrelated pairs may still enter.
+Live state is recovered from broker deals after restart; unavailable history
+blocks new entries without stamping the bar, so it can retry. Today's closing
+positions use full position history, including entry fees and manual closes.
+In backtests with either pair guard enabled, daily and portfolio caps run in one
+time-ordered pass: rejected trades consume no daily/weekly quota and their
+exits cannot trigger a loss block. Older configs omit both keys to disable them.
+Balance-scaling backtests with either pair guard enabled are refused for now:
+their later scaling pass can reject trades, which would invalidate guard state.
+Fixed-dollar sizing is the active plan; unified percentage sizing is deferred.
 Triple swap is 3x on the Wednesday-night rollover; the engine approximates
 it as the first bar after Wed 21:xx UTC.
 
@@ -142,6 +157,46 @@ then write the result into the pair yaml with the sample date in a comment.
 Demo spreads move; re-sample per session.
 
 ## M1 data
+
+### Active broker CSV source (offline only)
+
+`backtest_data.use_broker_csv: true` selects `backtest_data.broker_csv_dir`
+(`data/pepperstone`). `broker_server_clock: new_york_plus_7` documents/enforces
+the supported Pepperstone source clock: UTC+2 winter / UTC+3 US DST; normalized
+CSVs are UTC. `backtest_data.position_checks: H4` is the explicit coarse mode,
+overriding `timeframes.position_checks` for offline broker CSV tests only.
+Setting the switch false restores legacy selection; explicit research CLI opt-in
+overrides it. No live/strategy/cost/risk switches change.
+
+This mode uses H4/D1 only, no vendor H1/M1. Source originals are archived in
+`data/pepperstone/raw/`; normalized files and the manifest live one level above.
+Missing active pairs or failed chart checksums are errors. Broker H4 closed-price
+conversion feeds replace H1 helpers, with closes unavailable until the following
+open. Coarse exits book at candle close; H4 close marks are used for drawdown.
+Both-stop-and-target candles count as stops; trailing/BE precision is limited.
+Every pair's final 2025-12-31 20:00 server-time H4 candle is absent, explicitly
+warned, not filled. See RUNBOOK for source/timezone, coverage and run commands.
+
+An explicit **vendor-derived research** alternative now exists:
+`mkdata --research --all-existing --src data --out-dir data/vendor_derived_2015_2025`.
+It builds H4/D1 directly from M1 using stored timestamps/midnight boundaries,
+not verified broker session boundaries. It retains partial periods with observed
+minute counts, omits empty periods, and writes source/coverage/integrity metadata.
+Only `backtest --research-data-dir ...` or `dice_probe --research-data-dir ...`
+may opt into these files; broker/live defaults do not change. `--data-dir` locates
+matching original H1/M1 and conversion feeds. No strategy YAML changes are needed.
+See RUNBOOK for commands, explicit reference parity, source assumptions and the
+unseen-period warning before running the full 2015-2025 dataset.
+
+For broker-consistent history, `quant.mkdata --broker` exports the configured
+execution/regime/position-check feeds plus H1 and needed USD conversion feeds.
+It supports standard broker timeframe names without changing the engine's
+allowed strategy combinations. Use `--start`, exclusive `--end`, and either
+`--symbol` or `--batch`; `--plan` previews without connecting/writing.
+Export includes configured indicator warmup, validates candles, reports gaps,
+and writes source/export/coverage sidecars. Existing output is refused unless
+`--overwrite` is explicit. See `docs/RUNBOOK.md` before replacing vendor files;
+broker data availability and M1 retention can limit the usable date range.
 
 Open-trade checks (stop/TP/trail) run on the M1 feed when
 `timeframes.position_checks: M1`. If a pair has no M1 rows for an hour,

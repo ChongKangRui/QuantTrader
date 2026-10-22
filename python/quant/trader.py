@@ -21,11 +21,13 @@ import pandas as pd
 
 from quant import rules
 from quant.journal import append_row, build_comment
-from quant.limits import md_in_ranges
+from quant.limits import md_in_ranges, pair_entry_reason, week_start, read_entry_hours, entry_time_allowed
 from quant.live import _find_new_position, build_request, pick_filling, snap_volume
 from quant.signals import check_entry
 
 ENTRY_IN = 0        # mt5.DEAL_ENTRY_IN
+ENTRY_OUT = 1       # mt5.DEAL_ENTRY_OUT
+ENTRY_OUT_BY = 3    # mt5.DEAL_ENTRY_OUT_BY (hedged close-by)
 POSITION_BUY = 0    # mt5.POSITION_TYPE_BUY
 TIMEFRAME_H1 = 16385   # mt5.TIMEFRAME_H1 literal (tests run without the wheel)
 TIMEFRAME_H4 = 16388   # mt5.TIMEFRAME_H4 literal
@@ -111,6 +113,52 @@ def opened_positions_today(deals, magic: int, day_ts: float) -> int:
 def fill_in_window(now_utc: datetime, ranges: list) -> bool:
     """Is a fill today (UTC calendar day) inside a no-trade range?"""
     return bool(ranges) and md_in_ranges(now_utc.strftime("%m-%d"), ranges)
+
+
+def pair_history_reason(mt5, deals, magic: int, symbol: str, now: datetime,
+                        max_week: int, stop_after_loss: bool) -> str | None:
+    """Recover pair guards from deals, including entry fees and manual closes.
+
+    Query complete position histories for today's exits: a trade may have
+    opened before the rolling account-history window. Partial exits do not
+    trigger the daily stop until the position is fully closed.
+    """
+    if deals is None:
+        raise ValueError("deal history unavailable")
+    now = now.astimezone(timezone.utc)
+    day_ts = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    week_ts = week_start(now).timestamp()
+    entries = {int(d.position_id) for d in deals
+               if getattr(d, "magic", None) == magic
+               and getattr(d, "symbol", "") == symbol
+               and getattr(d, "entry", -1) == ENTRY_IN
+               and week_ts <= float(d.time) <= now.timestamp()}
+    lost_today = False
+    if stop_after_loss:
+        exits = {int(d.position_id) for d in deals
+                 if getattr(d, "symbol", "") == symbol
+                 and getattr(d, "entry", -1) in (ENTRY_OUT, ENTRY_OUT_BY)
+                 and day_ts <= float(d.time) <= now.timestamp()}
+        for pid in exits:
+            history = mt5.history_deals_get(position=pid)
+            if not history:
+                raise ValueError(f"position {pid} history unavailable")
+            ins = [d for d in history if getattr(d, "entry", -1) == ENTRY_IN]
+            if not ins:
+                raise ValueError(f"position {pid} entry history missing")
+            if not any(getattr(d, "magic", None) == magic for d in ins):
+                continue
+            outs = [d for d in history
+                    if getattr(d, "entry", -1) in (ENTRY_OUT, ENTRY_OUT_BY)]
+            if sum(float(d.volume) for d in outs) + 1e-9 < sum(
+                    float(d.volume) for d in ins):
+                continue
+            net = sum(float(getattr(d, k, 0) or 0)
+                      for d in history for k in ("profit", "commission", "swap", "fee"))
+            if net < -1e-9:
+                lost_today = True
+                break
+    return pair_entry_reason(len(entries), lost_today, max_week, stop_after_loss)
 
 
 def cost_bits(symbol: str, info, costs: dict) -> tuple[float, float]:
@@ -364,6 +412,19 @@ def trade_on_bar(mt5, broker: str, symbol: str, direction: str, bar_secs: int,
     """
     if (mem.get("bars") or {}).get(symbol) == str(bar_secs):
         return "seen"
+    now = now.astimezone(timezone.utc)
+    # History failures must not stamp the bar: retry without permitting an order.
+    max_week = int(cfg.get("max_trades_per_pair_per_week", 0) or 0)
+    stop_after_loss = bool(cfg.get("disable_pair_after_daily_loss", False))
+    pair_reason = None
+    if max_week > 0 or stop_after_loss:
+        try:
+            pair_reason = pair_history_reason(
+                mt5, deals, magic, broker, now, max_week, stop_after_loss)
+        except Exception as exc:
+            return f"DATA ERROR - pair limits: {exc}"
+    if deals is None:
+        return "DATA ERROR - deal history unavailable"
     info = mt5.symbol_info(broker)
     if info is None:
         return "DATA ERROR - no symbol info"
@@ -374,6 +435,8 @@ def trade_on_bar(mt5, broker: str, symbol: str, direction: str, bar_secs: int,
         reason = "pair-open"
     elif cfg.get("halted"):
         reason = "weekly-halt"
+    elif pair_reason:
+        reason = pair_reason
     # sequential guards (NOT an elif chain): a non-triggered cap must still
     # let the next gate run — this bug once skipped the E1 gate entirely.
     fill_day_ts = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
@@ -387,6 +450,8 @@ def trade_on_bar(mt5, broker: str, symbol: str, direction: str, bar_secs: int,
             reason = "cap-day-pair"  # structural: 1 entry/pair/day like the engine
     if not reason and fill_in_window(now, ranges):
         reason = "window"
+    if not reason and not entry_time_allowed(now, read_entry_hours(cfg)):
+        reason = "entry-hours"
     if not reason:
         breach = positions_breach(open_all, symbol, direction,
                                   int(cfg.get("max_total_positions", 0) or 0),

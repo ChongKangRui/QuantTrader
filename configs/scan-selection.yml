@@ -1,6 +1,6 @@
 # Scan selection: tick which pairs take part in monitor scans and backtest batches.
 # enabled: false skips the pair (one compact line on the console, batch continues).
-# Pairs without H1 data are skipped with a warning even when enabled.
+# Broker CSV batches require H4/D1 for every enabled pair; legacy mode skips missing H1.
 # Files ending _untrade.yml are never loaded (see NZDUSD_untrade.yml).
 pairs:
   EURUSD: {enabled: true}

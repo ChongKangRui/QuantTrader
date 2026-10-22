@@ -48,7 +48,8 @@ def _setup(**over) -> dict:
 
 
 def test_dice_passes_the_same_base_to_shared_simulation(monkeypatch):
-    setup = _setup(default_lot=0.02)
+    setup = _setup(default_lot=0.02, entry_hours={"enabled": True,
+        "utc_offset_hours": 8, "start": "09:15", "end": "23:00"})
     monkeypatch.setattr(dp, "_STATE", {"setup": setup})
     captured = {}
     def fake_simulate(*args, **kwargs):
@@ -58,6 +59,7 @@ def test_dice_passes_the_same_base_to_shared_simulation(monkeypatch):
     dp._simulate({"h1": _h1(), "symbol": "EURUSD", "costs": _zero_costs(),
                   "mapped": None, "m1": None}, [])
     assert captured["default_lot"] == 0.02
+    assert captured["entry_hours"] == setup["entry_hours"]
 
 
 def test_eligible_bars_variants():

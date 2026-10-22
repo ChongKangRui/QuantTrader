@@ -1,8 +1,8 @@
-"""Dice-entry probe (D1): do the entry rules beat random entries?
+"""Dice-entry probe: do the configured entry rules beat random entries?
 
 Same engine, same exits, same costs, same caps — only the entry moment is
-dice. Variant A draws any bar and a random direction (placebo); variant B
-draws bias-ON H1 bars and follows the mapped H4 bias (tests entry timing
+dice. Variant A draws execution bars and a random direction (placebo); variant B
+draws bias-ON execution bars and follows the configured regime bias (entry timing
 only). Per pair the dice draw in waves until the recorded trade count
 reaches the real run's pre-filter count, then thin uniformly at random to
 that target; the same daily cap and portfolio pass run in the engine's
@@ -32,13 +32,12 @@ import pandas as pd
 from quant.backtest import (WIN_BARS, _atr_wilder, _load_m1, apply_daily_cap,
                             bias_frames, build_h4, load_h1, local_stamp,
                             map_bias, portfolio_filter, scan_pair, simulate,
-                            total_row)
-from quant.limits import parse_no_trade_ranges
-from quant.monitor import flatten_strategy, load_pairs, read_selection
-from quant.rules import read_sizing
+                            total_row, load_chart_frames)
+from quant.limits import parse_no_trade_ranges, read_pair_limits, read_entry_hours
+from quant.monitor import TF_HOURS, flatten_strategy, load_pairs, read_selection, read_timeframes
+from quant.rules import USD_CONVERSION_FEEDS, read_sizing
 
-CONV_MAP = {"JPY": "USDJPY", "GBP": "GBPUSD", "AUD": "AUDUSD",
-            "NZD": "NZDUSD", "CAD": "USDCAD", "CHF": "USDCHF"}
+CONV_MAP = USD_CONVERSION_FEEDS
 
 # per-process state: parity workers build one env per task; dice workers get
 # their pair chunk via the initializer (spawn re-imports the module, so
@@ -46,7 +45,8 @@ CONV_MAP = {"JPY": "USDJPY", "GBP": "GBPUSD", "AUD": "AUDUSD",
 _STATE: dict = {}
 
 
-def resolve_setup(config_dir: str = "configs") -> dict:
+def resolve_setup(config_dir: str = "configs", data_dir: str = "data",
+                   research_data_dir: str | None = None, broker_data_dir: str | None = None) -> dict:
     """Batch-mode config exactly as backtest.main resolves it, minus CLI
     overrides: the pinned reference carries no cost flags by declaration."""
     import yaml
@@ -56,6 +56,18 @@ def resolve_setup(config_dir: str = "configs") -> dict:
     strat = flatten_strategy(base)
     limits = dict(base.get("limits") or {})
     risk = dict(base.get("risk") or {})
+    if risk.get("scale_lot_with_balance"):
+        raise ValueError("dice comparison does not support balance scaling; use fixed-dollar sizing")
+    execution, regime = read_timeframes(config_dir)
+    from quant.broker_data import resolve_broker_dir, dataset_info, chart_path, closed_converter
+    broker_root = resolve_broker_dir(base, research_data_dir, broker_data_dir)
+    broker = dataset_info(broker_root) if broker_root else None
+    if broker and (execution, regime) != ("H4", "D1"):
+        raise ValueError("broker CSV dice requires configured H4/D1 charts")
+    research = None
+    if research_data_dir:
+        from quant.mkdata import research_info
+        research = research_info(research_data_dir)
     scope = dict(risk.get("sizing_scope_usd") or {})
     selection = read_selection(config_dir)
     jobs: list[tuple[str, Path, dict]] = []
@@ -63,10 +75,15 @@ def resolve_setup(config_dir: str = "configs") -> dict:
         sym = pr["symbol"]
         if selection is not None and not selection.get(sym, True):
             continue
-        h1_path = Path("data") / f"{sym}_H1.csv"
+        h1_path = Path(broker_root or data_dir) / f"{sym}_{'H4' if broker else 'H1'}.csv"
         if not h1_path.exists():
+            if broker:
+                raise FileNotFoundError(f"missing enabled broker pair {sym}: {h1_path}")
             print(f"SKIP {sym} - no {h1_path}", flush=True)
             continue
+        if broker:
+            chart_path(broker_root, sym, "H4")
+            chart_path(broker_root, sym, "D1")
         costs = dict(base.get("costs") or {})
         costs.update(pr.get("costs") or {})
         jobs.append((sym, h1_path, costs))
@@ -80,13 +97,25 @@ def resolve_setup(config_dir: str = "configs") -> dict:
             need.setdefault(feed, []).append(sym)
     converters: dict[str, pd.Series] = {}
     for feed, syms in need.items():
-        fp = Path("data") / f"{feed}_H1.csv"
+        if broker:
+            converters[feed] = closed_converter(broker_root, feed)
+            continue
+        fp = Path(data_dir) / f"{feed}_H1.csv"
         if not fp.exists():
             raise FileNotFoundError(f"{fp}: converter feed missing for "
                                     f"{', '.join(syms)}")
+        if research_data_dir:
+            from quant.mkdata import research_chart_path
+            research_chart_path(research_data_dir, feed, regime, fp)
         converters[feed] = load_h1(fp).set_index("time")["close"]
     default_lot, stop_sizing = read_sizing(risk)
     return {
+        "broker_data_dir": broker_root, "broker_data": broker,
+        "coarse_exit_timing": "bar_close" if broker else "legacy",
+        "execution": execution, "regime": regime,
+        "exec_hours": TF_HOURS[execution], "reg_hours": TF_HOURS[regime],
+        "research_data_dir": str(Path(research_data_dir).resolve()) if research_data_dir else None,
+        "research_data": research, "data_dir": str(Path(data_dir).resolve()),
         "strategy": strat,
         "jobs": jobs,
         "converters": converters,
@@ -97,17 +126,20 @@ def resolve_setup(config_dir: str = "configs") -> dict:
         "stop_sizing": stop_sizing,
         "default_lot": default_lot,
         "max_day": int(limits.get("max_trades_per_day", 0) or 0),
+        **read_pair_limits(limits),
+        "entry_hours": read_entry_hours(limits),
         "max_open": int(risk.get("max_total_positions", 0) or 0),
         "max_ccy_net": int(risk.get("max_ccy_net", 0) or 0),
         "weekly_r": float(limits.get("weekly_loss_r", 0.0) or 0.0),
-        "position_checks": str((base.get("timeframes") or {}).get(
+        "position_checks": "H4" if broker else str((base.get("timeframes") or {}).get(
             "position_checks", "M1")).upper(),
         "no_trade_ranges": tuple(parse_no_trade_ranges(base)),
     }
 
 
 def env_from_frames(symbol: str, h1: pd.DataFrame, costs: dict, setup: dict,
-                    m1: pd.DataFrame | None) -> dict:
+                    m1: pd.DataFrame | None, *, exec_frame=None, regime_frame=None,
+                    closed_bar_mapping: bool = False) -> dict:
     """Per-pair resident state: frames + the ATR series dice candidates need.
 
     The ATR is the same Wilder formula check_entry uses. check_entry computes
@@ -116,12 +148,18 @@ def env_from_frames(symbol: str, h1: pd.DataFrame, costs: dict, setup: dict,
     float dust (candidates only ever draw at t >= WIN_BARS).
     """
     strat = setup["strategy"]
-    h4 = build_h4(h1)
-    mapped = map_bias(h1, h4, bias_frames(h4, strat))
-    atr = _atr_wilder(h1["high"], h1["low"], h1["close"],
+    eh, rh = setup.get("exec_hours", 1), setup.get("reg_hours", 4)
+    if (eh, rh) != (1, 4) and (exec_frame is None or regime_frame is None):
+        raise ValueError("configured charts must be supplied explicitly; no implicit resampling")
+    execution = h1 if exec_frame is None else exec_frame
+    h4 = build_h4(h1) if regime_frame is None else regime_frame
+    mapped = map_bias(execution, h4, bias_frames(h4, strat), reg_hours=rh,
+                      exec_hours=eh, broker_bars=closed_bar_mapping)
+    atr = _atr_wilder(execution["high"], execution["low"], execution["close"],
                        int(strat.get("entry_atr_period", strat.get("atr_n", 7)))).to_numpy()
     t0 = max(WIN_BARS, int(strat.get("warmup_bars", 300)))
-    return {"symbol": symbol, "h1": h1, "h4": h4, "mapped": mapped, "m1": m1,
+    return {"symbol": symbol, "h1": execution, "h4": h4, "mapped": mapped, "m1": m1,
+            "closed_bar_mapping": closed_bar_mapping,
             "atr": atr, "t0": t0, "costs": costs}
 
 
@@ -129,7 +167,13 @@ def build_env(symbol: str, h1_path: str | Path, costs: dict, setup: dict) -> dic
     m1 = None
     if setup["position_checks"] == "M1":
         m1 = _load_m1(h1_path, symbol)
-    return env_from_frames(symbol, load_h1(h1_path), costs, setup, m1)
+        if setup.get("research_data_dir") and m1 is None:
+            raise ValueError("research dice requires source M1; no silent fallback")
+    h1, execution, regime, closed = load_chart_frames(
+        symbol, h1_path, setup.get("exec_hours", 1), setup.get("reg_hours", 4),
+        setup.get("research_data_dir"), setup.get("broker_data_dir"))
+    return env_from_frames(symbol, h1, costs, setup, m1, exec_frame=execution,
+                           regime_frame=regime, closed_bar_mapping=closed)
 
 
 def _simulate(env: dict, cands: list[dict]) -> tuple[pd.DataFrame, dict]:
@@ -144,21 +188,30 @@ def _simulate(env: dict, cands: list[dict]) -> tuple[pd.DataFrame, dict]:
                     mapped=env["mapped"], lot=None,
                     converters=setup["converters"], m1=env["m1"],
                     no_trade_ranges=setup["no_trade_ranges"],
+                    entry_hours=setup.get("entry_hours"),
                     scope_low=setup["scope_low"],
                     scope_high=setup["scope_high"],
                     stop_sizing=setup.get("stop_sizing"),
-                    default_lot=setup.get("default_lot"))
+                    default_lot=setup.get("default_lot"),
+                    bar_hours=setup.get("exec_hours", 1),
+                    coarse_exit_at_close=bool(setup.get("broker_data_dir")))
 
 
 def eligible_bars(env: dict, variant: str) -> np.ndarray:
     """Bars a dice entry may land on: t+1 must exist (fill bar) and the ATR
     must be valid (check_entry rejects NaN/nonpositive ATR). Variant B keeps
     only bias-ON bars — NEUTRAL has no direction to align with."""
+    if variant not in ("A", "B"):
+        raise ValueError("dice mode must be A (random direction) or B (strategy direction)")
+    if variant == "B" and (env.get("mapped") is None or "direction" not in env["mapped"]):
+        raise ValueError("variant B requires a strategy direction map")
     atr = env["atr"]
     idx = np.arange(env["t0"], len(env["h1"]) - 1)
     idx = idx[np.isfinite(atr[idx]) & (atr[idx] > 0)]
     if variant == "B":
         dirs = env["mapped"]["direction"].to_numpy()[idx]
+        if not set(dirs).issubset({"LONG", "SHORT", "NEUTRAL"}):
+            raise ValueError("variant B requires LONG/SHORT/NEUTRAL strategy directions")
         idx = idx[dirs != "NEUTRAL"]
     return idx
 
@@ -170,6 +223,7 @@ class _Stream:
 
     def __init__(self, env: dict, variant: str, rng: np.random.Generator):
         self.env = env
+        self.variant = variant
         self.pool = rng.permutation(eligible_bars(env, variant))
         if variant == "A":
             self.dirs = np.where(rng.random(self.pool.size) < 0.5,
@@ -187,7 +241,8 @@ class _Stream:
         out = [{"t": int(self.pool[start + k]),
                 "direction": str(self.dirs[start + k]),
                 "atr": float(atr[self.pool[start + k]]),
-                "time": self.env["h1"]["time"].iloc[self.pool[start + k]]}
+                "time": self.env["h1"]["time"].iloc[self.pool[start + k]],
+                "entry_reason": "dice_a" if self.variant == "A" else "dice_b"}
                for k in range(count)]
         out.sort(key=lambda c: c["t"])
         return out
@@ -241,9 +296,13 @@ def dice_pair_trades(env: dict, variant: str, target: int,
 
 def apply_filters(trades_by_sym: dict[str, pd.DataFrame], setup: dict
                   ) -> tuple[dict[str, pd.DataFrame], list[dict], list[dict]]:
-    capped, cap_drops = apply_daily_cap(trades_by_sym, setup["max_day"])
+    pair_limits = read_pair_limits(setup)
+    enabled = any(pair_limits.values())
+    capped, cap_drops = (dict(trades_by_sym), []) if enabled else apply_daily_cap(
+        trades_by_sym, setup["max_day"])
     kept, pf_drops = portfolio_filter(
-        capped, setup["max_open"], setup["max_ccy_net"], setup["weekly_r"])
+        capped, setup["max_open"], setup["max_ccy_net"], setup["weekly_r"],
+        **pair_limits, max_trades_per_day=setup["max_day"] if enabled else 0)
     return kept, cap_drops, pf_drops
 
 
@@ -264,12 +323,16 @@ def _real_one(sym: str, h1_path: str, costs: dict, setup: dict
     """One pair through the real pipeline: scan -> simulate (pre-cap/pass)."""
     _STATE["setup"] = setup
     env = build_env(sym, h1_path, costs, setup)
-    _, cands = scan_pair(env["h1"], env["h4"], sym, setup["strategy"])
+    _, cands = scan_pair(env["h1"], env["h4"], sym, setup["strategy"],
+                         exec_hours=setup.get("exec_hours", 1),
+                         reg_hours=setup.get("reg_hours", 4),
+                         broker_bars=env["closed_bar_mapping"])
     trades, _ = _simulate(env, cands)
     return sym, trades, len(trades)
 
 
-def check_parity(kept_counts: dict[str, int], total: dict, reference: Path
+def check_parity(kept_counts: dict[str, int], total: dict, reference: Path,
+                  trades_by_sym: dict | None = None
                  ) -> tuple[bool, dict]:
     """Compare the real-pipeline output against the pinned reference folder."""
     ref_total = pd.read_csv(reference / "summary.csv").set_index(
@@ -281,6 +344,24 @@ def check_parity(kept_counts: dict[str, int], total: dict, reference: Path
                  if ref_csv.exists() else 0)
         if n_kept != ref_n:
             diffs.append(f"{sym}: kept {n_kept} vs {ref_n}")
+        if trades_by_sym is not None and n_kept and ref_csv.exists():
+            actual, expected = trades_by_sym[sym].reset_index(drop=True).copy(), pd.read_csv(ref_csv)
+            # Added diagnostics do not invalidate an older reference's trading parity.
+            # Every original trading column is still compared, never just totals.
+            for col in ("entry_reason", "signal_bar_time"):
+                if col not in expected:
+                    actual = actual.drop(columns=col, errors="ignore")
+                elif col == "signal_bar_time" and col in actual:
+                    actual[col] = pd.to_datetime(actual[col], utc=True)
+                    expected[col] = pd.to_datetime(expected[col], utc=True)
+            for frame in (actual, expected):
+                for col in ("entry_time", "exit_time"):
+                    frame[col] = pd.to_datetime(frame[col], utc=True)
+            try:
+                pd.testing.assert_frame_equal(actual, expected, check_dtype=False,
+                                               atol=1e-8, rtol=1e-8)
+            except AssertionError:
+                diffs.append(f"{sym}: trade-level parity failed")
     for key in ("trades", "net_usd", "expect_R", "swap_usd"):
         got, want = float(total[key]), float(ref_total[key])
         if abs(got - want) > 0.005:
@@ -288,7 +369,51 @@ def check_parity(kept_counts: dict[str, int], total: dict, reference: Path
     return not diffs, {"diffs": diffs, "total": total,
                        "reference": {"trades": int(ref_total["trades"]),
                                      "net_usd": float(ref_total["net_usd"]),
-                                     "expect_R": float(ref_total["expect_R"])}}
+                                      "expect_R": float(ref_total["expect_R"])}}
+
+
+def validate_reference_setup(setup: dict, reference: Path) -> None:
+    """Reject an unrelated reference before any simulations or random draws."""
+    params = json.loads((reference / "params.json").read_text(encoding="utf-8"))
+    reference_tf = params.get("timeframes") or {"execution": "H1", "regime": "H4"}
+    if reference_tf != {"execution": setup["execution"], "regime": setup["regime"]}:
+        raise ValueError("reference timeframes do not match current config")
+    if params.get("research_data") != setup.get("research_data"):
+        raise ValueError("reference research source/manifest does not match")
+    if params.get("broker_data") != setup.get("broker_data"):
+        raise ValueError("reference broker dataset/manifest does not match")
+    if params.get("coarse_exit_timing", "legacy") != setup.get("coarse_exit_timing", "legacy"):
+        raise ValueError("reference exit timing does not match")
+    if params.get("strategy") != setup["strategy"]:
+        raise ValueError("reference strategy does not match; use the same config")
+    if params.get("scale_lot_with_balance"):
+        raise ValueError("scaled reference is not supported by this dice comparison")
+    ref_symbols = {job[0] for job in params.get("jobs", [])}
+    if ref_symbols != {s for s, _, _ in setup["jobs"]}:
+        raise ValueError("reference pair selection does not match")
+    if params.get("lot"):
+        raise ValueError("fixed diagnostic --lot reference is not supported")
+    scope = params.get("sizing_scope_usd") or {}
+    checks = [(scope.get("low", 0), setup["scope_low"]),
+              (scope.get("high", 0), setup["scope_high"]),
+              (params.get("default_lot", 0.01), setup["default_lot"]),
+              (params.get("stop_sizing", {}), setup["stop_sizing"]),
+              (params.get("max_trades_per_day", 0), setup["max_day"]),
+              (params.get("max_cost_ratio"), setup["max_cost_ratio"]),
+              (params.get("position_checks", "M1"), setup["position_checks"]),
+              (params.get("no_trade_ranges", []), setup["no_trade_ranges"])]
+    portfolio = params.get("portfolio") or {}
+    checks.append((read_entry_hours(params), read_entry_hours(setup)))
+    for name, key in (("max_total_positions", "max_open"), ("max_ccy_net", "max_ccy_net"),
+                      ("weekly_loss_r", "weekly_r")):
+        checks.append((portfolio.get(name, 0), setup[key]))
+    for name, value in read_pair_limits(setup).items():
+        checks.append((params.get(name, 0 if isinstance(value, int) and not isinstance(value, bool) else False), value))
+    for sym, _, costs in setup["jobs"]:
+        reference_costs = {**(params.get("costs") or {}), **(params.get("pair_costs", {}).get(sym) or {})}
+        checks.append((reference_costs, costs))
+    if any(json.loads(json.dumps(a)) != json.loads(json.dumps(b)) for a, b in checks):
+        raise ValueError("reference costs, sizing or limits differ from current setup")
 
 
 # ---------------------------------------------------------------------------
@@ -375,7 +500,8 @@ def verdict_line(real_expect: float, dice_expect: np.ndarray,
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(
         description="D1 dice-entry probe (no orders): rules vs dice, same engine.")
-    ap.add_argument("--variant", choices=("A", "B"), default="B")
+    ap.add_argument("--variant", choices=("A", "B"), default="B",
+                    help="A=random timing+direction; B=random timing with strategy direction")
     ap.add_argument("--seeds", type=int, default=300)
     ap.add_argument("--first-seed", type=int, default=0,
                     help="first seed index (streams are per-index, so a "
@@ -388,16 +514,43 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-waves", type=int, default=20)
     ap.add_argument("--pct", type=float, default=0.95,
                     help="verdict percentile (pre-declared: 0.95)")
-    ap.add_argument("--reference", default="backtest_results/20261019_192501")
+    ap.add_argument("--reference", default=None, help="matching user-run backtest folder; required for non-legacy charts/research")
     ap.add_argument("--real-only", action="store_true",
                     help="parity + target counts only, no dice")
     ap.add_argument("--config-dir", default="configs")
     ap.add_argument("--results-root", default="dice_results")
+    ap.add_argument("--data-dir", default="data")
+    ap.add_argument("--research-data-dir", default=None)
+    ap.add_argument("--broker-data-dir", default=None)
     args = ap.parse_args(argv)
     if args.seeds < 1:
         ap.error("--seeds must be >= 1")
+    if args.jobs < 0 or args.first_seed < 0 or args.seed_base < 0 or args.max_waves < 1:
+        ap.error("jobs/seed indices must be >= 0 and --max-waves >= 1")
+    if not 0 < args.pct < 1 or any(not np.isfinite(v) or v <= 0 for v in (
+            args.first_wave_mult, args.topup_mult)):
+        ap.error("--pct must be between 0 and 1; wave multipliers must be finite and positive")
 
-    setup = resolve_setup(args.config_dir)
+    try:
+        setup = resolve_setup(args.config_dir, args.data_dir, args.research_data_dir, args.broker_data_dir)
+        if setup["broker_data"]:
+            from quant.broker_data import WARNING
+            print(WARNING, flush=True)
+            for warning in setup["broker_data"]["coverage_warnings"]:
+                print(f"COVERAGE WARNING: {warning}", flush=True)
+        if setup["research_data"]:
+            from quant.mkdata import RESEARCH_WARNING
+            print(RESEARCH_WARNING, flush=True)
+        if not setup["jobs"]:
+            raise ValueError("no pairs with source data")
+        if not args.reference:
+            if setup["execution"] != "H1" or setup["regime"] != "H4" or setup["research_data"] or setup["broker_data"]:
+                raise ValueError("supply --reference from your matching backtest first")
+            args.reference = "backtest_results/20261019_192501"
+        validate_reference_setup(setup, Path(args.reference))
+    except (ValueError, OSError, KeyError) as exc:
+        print(f"config/reference error: {exc}", flush=True)
+        return 2
     outdir = Path(args.results_root) / (
         f"{local_stamp()}_real" if args.real_only else local_stamp())
     outdir.mkdir(parents=True, exist_ok=True)
@@ -421,9 +574,11 @@ def main(argv: list[str] | None = None) -> int:
     kept, cap_drops, pf_drops = apply_filters(by_sym, setup)
     total = pooled_stats(kept)
     ok, detail = check_parity({s: len(t) for s, t in kept.items()}, total,
-                              Path(args.reference))
+                               Path(args.reference), kept)
     (outdir / "parity.json").write_text(
-        json.dumps({"pass": ok, **detail, "targets": targets}, indent=1),
+        json.dumps({"pass": ok, **detail, "targets": targets,
+                    "setup": {k: v for k, v in setup.items()
+                              if k not in ("jobs", "converters")}}, indent=1),
         encoding="utf-8")
     print(f"PARITY {'PASS' if ok else 'FAIL'}: trades={total['trades']} "
           f"net={total['net_usd']} expect={total['expect_R']}R "
@@ -438,6 +593,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.real_only:
         print(f"targets -> {outdir / 'parity.json'}", flush=True)
         return 0
+    if not any(targets.values()) or total["trades"] <= 0:
+        print("No real trades: random comparison is undefined; refusing dice.", flush=True)
+        return 2
 
     config = {"variant": args.variant, "seeds": args.seeds,
               "seed_base": args.seed_base, "pct": args.pct,
@@ -475,7 +633,7 @@ def main(argv: list[str] | None = None) -> int:
     money_bar = bool(total["expect_R"] >= 0.10)
     (outdir / "verdict.json").write_text(json.dumps(
         {"d1": verdict, "money_bar_0_10R": money_bar,
-         "rule": f"D1-B CONFIRMED iff real pooled expect_R > dice P{args.pct}"},
+         "rule": f"Variant {args.variant} CONFIRMED iff real pooled expect_R > dice quantile {args.pct}"},
         indent=1), encoding="utf-8")
     print(f"VERDICT D1-{args.variant}: "
           f"{'CONFIRMED' if verdict['confirmed'] else 'WITHIN DICE NOISE'} "

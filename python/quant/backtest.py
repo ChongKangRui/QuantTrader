@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 
 from quant.bias import SEP_MIN_DEFAULT, bias_periods, h4_bias
-from quant.limits import md_in_ranges, parse_no_trade_ranges
+from quant.limits import md_in_ranges, parse_no_trade_ranges, read_entry_hours, entry_time_allowed
 from quant.rules import (combine_stop, cost_ok, size_stop_to_scope, scaled_lots,
                          scope_lots, step_risk as _step_risk,
                          stop_sizing_conflict, read_sizing)
@@ -240,7 +240,8 @@ def scan_pair(h1: pd.DataFrame, h4: pd.DataFrame, symbol: str, p: dict,
                 break
         if res["signal"]:
             cands.append({"t": t, "direction": direction, "atr": res["atr"],
-                          "time": h1["time"].iloc[t]})
+                           "time": h1["time"].iloc[t],
+                           "entry_reason": res.get("entry_reason", "unknown")})
     return pd.DataFrame([funnel]), cands
 
 
@@ -271,7 +272,8 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
              no_trade_ranges: tuple = (), *,
              scope_low: float = 0.0, scope_high: float = 0.0,
              bar_hours: int = 1, stop_sizing: dict | None = None,
-             default_lot: float | None = None
+               default_lot: float | None = None, coarse_exit_at_close: bool = False,
+              entry_hours: dict | None = None
              ) -> tuple[pd.DataFrame, dict]:
     """Walk candidates in time order; 1 open/pair and 1 entry/day enforced here.
 
@@ -292,6 +294,7 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
     bar's own OHLC row. bar_hours is the execution grid's bar size (H4->D1 = 4).
     no_trade_ranges blocks entries whose fill day falls inside a MM-DD range.
     """
+    hours = read_entry_hours({"entry_hours": entry_hours} if entry_hours is not None else {})
     pip_size = 0.01 if "JPY" in symbol else 0.0001
     point = pip_size / 10.0  # 1 point = 1 tick on 5/3-digit quotes
     spread_px = float(costs.get("spread_points", 20)) * point
@@ -321,6 +324,7 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
     trades = []
     funnel_sized = 0
     window_skips = 0
+    hours_skips = 0
     # named gates so the funnel never hides WHY candidates die (the old "sized" lump)
     open_skips = day_skips = tick_skips = scope_skips = cost_skips = lot_skips = 0
     stop_cap_skips = 0
@@ -331,6 +335,9 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
         t, direction = cand["t"], cand["direction"]
         if t + 1 >= len(h1) or t <= open_until:
             open_skips += 1  # a position is still open or bars overlap
+            continue
+        if not entry_time_allowed(h1["time"].iloc[t + 1], hours):
+            hours_skips += 1
             continue
         day = h1["time"].iloc[t].date()
         if day == last_day:
@@ -455,8 +462,11 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
                 exit_px = px - slip_px if long else px + slip_px + spread_px
                 pnl_ticks = ((exit_px - entry) if long else (entry - exit_px)) / tick_size
                 pnl = pnl_ticks * tick_value * lots + swap - commission * lots * 2
+                # Whole-bar OHLC is not known at bar open; broker coarse checks
+                # must not book a loss/profit before the bar actually closes.
+                coarse_time = bar_time + pd.Timedelta(hours=bar_hours) if coarse_exit_at_close else bar_time
                 exit_time = (str(pd.Timestamp(row_when, unit="s", tz="UTC"))
-                             if row_when is not None else str(bar_time))
+                             if row_when is not None else str(coarse_time))
                 trades.append({"symbol": symbol, "direction": direction,
                                "entry_time": str(h1["time"].iloc[t + 1]),
                                "entry": round(entry, 5), "sl": round(sl, 5), "tp": round(tp, 5),
@@ -466,8 +476,10 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
                                "pnl_R": round(pnl / risk_actual, 3) if risk_actual > 0 else 0.0,
                                "swap": round(swap, 2), "atr": round(atr_f, 5),
                                "bars_held": held + 1,
-                               "risk_usd": round(risk_actual, 2),
-                               "tp_usd": round(tp_mult * risk_actual, 2)})
+                                "risk_usd": round(risk_actual, 2),
+                                "tp_usd": round(tp_mult * risk_actual, 2),
+                                "entry_reason": cand.get("entry_reason", "unknown"),
+                                "signal_bar_time": str(h1["time"].iloc[t])})
                 open_until = b
                 break
             held += 1
@@ -475,9 +487,9 @@ def simulate(h1: pd.DataFrame, symbol: str, cands: list[dict], p: dict,
             continue
     cols = ["symbol", "direction", "entry_time", "entry", "sl", "tp", "lot",
             "exit_time", "exit", "exit_type", "pnl_usd", "pnl_R", "swap", "atr",
-            "bars_held", "risk_usd", "tp_usd"]
+             "bars_held", "risk_usd", "tp_usd", "entry_reason", "signal_bar_time"]
     return pd.DataFrame(trades, columns=cols), {
-        "sized": funnel_sized, "window": window_skips, "open": open_skips,
+        "sized": funnel_sized, "window": window_skips, "entry_hours": hours_skips, "open": open_skips,
         "day": day_skips, "tick": tick_skips, "scope": scope_skips,
         "cost": cost_skips, "lot": lot_skips, "stopcap": stop_cap_skips,
         "lot_fallback": lot_fallbacks}
@@ -622,7 +634,39 @@ def _load_m1(h1_path: str | Path, symbol: str) -> pd.DataFrame | None:
 
 def _broker_bar_path(h1_path: str | Path, symbol: str, tf: str) -> Path:
     """Broker-exported higher-timeframe CSV beside the H1 input."""
-    return Path(h1_path).with_name(f"{symbol}_{tf}.csv")
+    path = Path(h1_path).with_name(f"{symbol}_{tf}.csv")
+    meta = path.with_suffix(".meta.json")
+    if meta.exists() and json.loads(meta.read_text(encoding="utf-8")).get(
+            "source_type") == "vendor_derived_research":
+        raise ValueError("derived research candles require explicit --research-data-dir")
+    return path
+
+
+def load_chart_frames(symbol: str, h1_path: str | Path, exec_hours: int = 1,
+                       reg_hours: int = 4, research_data_dir=None, broker_data_dir=None):
+    """Shared backtest/dice grids; only explicit research mode accepts derived files."""
+    if broker_data_dir:
+        from quant.broker_data import chart_path
+        if research_data_dir or (exec_hours, reg_hours) != (4, 24):
+            raise ValueError("broker CSV mode requires H4/D1 without research substitution")
+        path = chart_path(broker_data_dir, symbol, "H4")
+        if Path(h1_path).resolve() != path.resolve():
+            raise ValueError("broker-only tape must be the matching H4 export, not vendor H1")
+        execution = load_h1(path)
+        return execution, execution, load_h1(chart_path(broker_data_dir, symbol, "D1")), True
+    h1 = load_h1(h1_path)
+    if research_data_dir:
+        from quant.mkdata import research_chart_path
+        from quant.monitor import TF_HOURS
+        names = {v: k for k, v in TF_HOURS.items()}
+        def chart(hours):
+            return load_h1(research_chart_path(research_data_dir, symbol, names[hours], h1_path))
+        return h1, chart(exec_hours), chart(reg_hours), True
+    broker_bars = exec_hours == 4 and reg_hours == 24
+    if broker_bars:
+        return (h1, load_h1(_broker_bar_path(h1_path, symbol, "H4")),
+                load_h1(_broker_bar_path(h1_path, symbol, "D1")), True)
+    return h1, h1 if exec_hours == 1 else build_htf(h1, exec_hours), build_htf(h1, reg_hours), False
 
 
 def run_pair(symbol: str, h1_path: str | Path, p: dict, costs: dict, args,
@@ -630,15 +674,9 @@ def run_pair(symbol: str, h1_path: str | Path, p: dict, costs: dict, args,
     # timeframes: H1->H4 default, or the H4->D1 upscale; hours ride on args
     exec_hours = int(getattr(args, "exec_hours", 1) or 1)
     reg_hours = int(getattr(args, "reg_hours", 4) or 4)
-    h1 = load_h1(h1_path)
-    broker_bars = exec_hours == 4 and reg_hours == 24
-    if broker_bars:
-        # UTC-resampled candles do not match the broker's Daily boundaries.
-        exec_df = load_h1(_broker_bar_path(h1_path, symbol, "H4"))
-        reg_df = load_h1(_broker_bar_path(h1_path, symbol, "D1"))
-    else:
-        exec_df = h1 if exec_hours == 1 else build_htf(h1, exec_hours)
-        reg_df = build_htf(h1, reg_hours)
+    h1, exec_df, reg_df, broker_bars = load_chart_frames(
+        symbol, h1_path, exec_hours, reg_hours, getattr(args, "research_data_dir", None),
+        getattr(args, "broker_data_dir", None))
     funnel, cands = scan_pair(exec_df, reg_df, symbol, p,
                               reg_hours=reg_hours, exec_hours=exec_hours,
                               broker_bars=broker_bars)
@@ -646,22 +684,29 @@ def run_pair(symbol: str, h1_path: str | Path, p: dict, costs: dict, args,
     mapped = map_bias(exec_df, reg_df, bframes, reg_hours=reg_hours,
                       exec_hours=exec_hours, broker_bars=broker_bars)
     m1 = None
+    if getattr(args, "broker_data_dir", None) and str(args.position_checks).upper() != "H4":
+        raise ValueError("broker CSV mode forbids mixing in vendor M1/H1 checks")
     if str(getattr(args, "position_checks", "M1")).upper() == "M1":
         m1 = _load_m1(h1_path, symbol)
+        if getattr(args, "research_data_dir", None) and m1 is None:
+            raise ValueError("research mode requires the original M1 checks; no silent fallback")
     ranges = tuple(getattr(args, "no_trade_ranges", ()) or ())
     trades, extra = simulate(exec_df, symbol, cands, p, costs, args.risk_usd,
                              args.max_cost_ratio,
                              bias_flip_exit=bool(p.get("bias_flip_exit", False)),
                              weekend_flat=bool(p.get("weekend_flat", False)),
                              mapped=mapped, lot=args.lot, converters=converters,
-                             m1=m1, no_trade_ranges=ranges,
+                              m1=m1, no_trade_ranges=ranges,
+                              entry_hours=getattr(args, "entry_hours", None),
                              scope_low=getattr(args, "scope_low", 0.0),
                              scope_high=getattr(args, "scope_high", 0.0),
                              bar_hours=exec_hours,
                              stop_sizing=getattr(args, "stop_sizing", None),
-                             default_lot=getattr(args, "default_lot", None))
+                             default_lot=getattr(args, "default_lot", None),
+                             coarse_exit_at_close=bool(getattr(args, "broker_data_dir", None)))
     funnel["sized"] = extra["sized"]
     funnel["window"] = extra.get("window", 0)
+    funnel["entry_hours"] = extra.get("entry_hours", 0)
     for key in ("open", "day", "tick", "scope", "cost", "lot", "stopcap", "lot_fallback"):
         funnel[key] = extra.get(key, 0)  # every named gate lands in funnel.csv
     funnel["taken"] = len(trades)
@@ -757,7 +802,7 @@ def _epoch_s(col: pd.Series) -> np.ndarray:
 def mtm_equity(trades_by_sym: dict[str, pd.DataFrame],
                h1_by_sym: dict[str, pd.DataFrame],
                account_usd: float) -> pd.DataFrame:
-    """Hourly mark-to-market account curve over ALL shared-account positions.
+    """Mark-to-market over supplied closed-price tapes (H1 legacy, H4 broker).
 
     Open positions are marked at the pair's last closed H1 bar: unrealized P/L =
     R-multiple (close vs entry over the initial stop distance) x the trade's
@@ -811,7 +856,10 @@ def mtm_equity(trades_by_sym: dict[str, pd.DataFrame],
 
 
 def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
-                     max_ccy_net: int, weekly_r: float
+                     max_ccy_net: int, weekly_r: float, *,
+                     max_trades_per_pair_per_week: int = 0,
+                     disable_pair_after_daily_loss: bool = False,
+                     max_trades_per_day: int = 0
                      ) -> tuple[dict[str, pd.DataFrame], list[dict]]:
     """Portfolio pass over the per-pair trade lists (time-ordered, all pairs).
 
@@ -825,6 +873,9 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
         8A weekly_loss_r — R, NOT % of equity: the %-equity form flips sign
         once closed equity hits zero (the threshold turns positive), so the
         account state can never reach this rule.
+      - optional pair weekly entry cap and daily net-loss block (UTC calendar).
+        Only accepted entries count; only their exits can trigger a loss block.
+      - optional daily portfolio cap, in this same pass so rejects cost no quota.
     Deterministic: candidates by (entry_time, symbol); an exit at the same
     timestamp is applied BEFORE entries (frees the slot). Exits book R to the
     week of their own timestamp (deal-time booking, like live counts deals
@@ -832,7 +883,11 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
     into the discarded previous week.
     Returns (kept frames by symbol, dropped records).
     """
-    if max_open <= 0 and max_ccy_net <= 0 and weekly_r <= 0:
+    from quant.limits import pair_entry_reason
+
+    if max_open <= 0 and max_ccy_net <= 0 and weekly_r <= 0 \
+            and max_trades_per_pair_per_week <= 0 \
+            and not disable_pair_after_daily_loss and max_trades_per_day <= 0:
         return dict(trades_by_sym), []
     cands = []
     for sym, df in trades_by_sym.items():
@@ -855,6 +910,9 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
     week_key = None
     week_r = 0.0                # CLOSED R booked this week (exits only)
     halted = False
+    pair_counts: dict = {}
+    loss_days: set = set()
+    day_counts: dict = {}
 
     def _drop(sym, idx, tin, reason):
         dropped.append({"symbol": sym, "entry_time": tin[:16], "reason": reason})
@@ -869,6 +927,7 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
             week_key = wk
             week_r = 0.0
             halted = False
+            pair_counts.clear()
         if kind == 0:  # exit: free the slot, book the R, run the halt check
             direction = active.pop((sym, idx), None)
             if direction is None:
@@ -878,13 +937,26 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
             ccy[base] = ccy.get(base, 0) - sgn
             ccy[quote] = ccy.get(quote, 0) + sgn
             week_r += pnl_r
+            # Only accepted, closed trades can block their pair; USD includes costs.
+            if disable_pair_after_daily_loss and float(
+                    trades_by_sym[sym].at[idx, "pnl_usd"]) < 0:
+                loss_days.add((sym, t.date()))
             if weekly_r > 0 and week_r <= -weekly_r:
                 halted = True
             continue
         # entry decision (exits at the same timestamp have already run)
         hh_mm = t.strftime("%Y-%m-%d %H:%M")
+        reason = pair_entry_reason(
+            pair_counts.get(sym, 0), (sym, t.date()) in loss_days,
+            max_trades_per_pair_per_week, disable_pair_after_daily_loss)
+        if reason:
+            _drop(sym, idx, hh_mm, reason)
+            continue
         if halted:
             _drop(sym, idx, hh_mm, "weekly_halt")
+            continue
+        if max_trades_per_day > 0 and day_counts.get(t.date(), 0) >= max_trades_per_day:
+            _drop(sym, idx, hh_mm, "cap_day")
             continue
         if max_open > 0 and len(active) >= max_open:
             _drop(sym, idx, hh_mm, "open_max")
@@ -897,6 +969,8 @@ def portfolio_filter(trades_by_sym: dict[str, pd.DataFrame], max_open: int,
             continue
         active[(sym, idx)] = direction
         kept.setdefault(sym, []).append(idx)
+        pair_counts[sym] = pair_counts.get(sym, 0) + 1
+        day_counts[t.date()] = day_counts.get(t.date(), 0) + 1
         ccy[base], ccy[quote] = d_base, d_quote
     out_frames = {}
     for sym, df in trades_by_sym.items():
@@ -1077,6 +1151,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--weekend-flat", action="store_true")
     ap.add_argument("--jobs", type=int, default=10,
                     help="pairs run in parallel (capped at pair count); 1 = linear, 0 = all cores")
+    ap.add_argument("--data-dir", default="data", help="batch H1/M1 and converter source directory")
+    ap.add_argument("--research-data-dir", default=None,
+                    help="explicit opt-in to a labelled vendor-derived research manifest")
+    ap.add_argument("--broker-data-dir", default=None, help="override backtest_data.broker_csv_dir")
     args = ap.parse_args(argv)
     if args.jobs < 0:
         ap.error("--jobs must be >= 0")
@@ -1089,6 +1167,10 @@ def main(argv: list[str] | None = None) -> int:
     strat = flatten_strategy(base)
     costs = dict((base.get("costs") or {}))
     max_day = int((base.get("limits") or {}).get("max_trades_per_day", 0) or 0)
+    from quant.limits import read_pair_limits
+    pair_limits = read_pair_limits(base.get("limits") or {})
+    args.entry_hours = read_entry_hours(base.get("limits") or {})
+    pair_limits_on = any(pair_limits.values())
     bench = dict(base.get("benchmarks") or {})
     # portfolio-pass knobs (locked rules the per-pair sim cannot see); 0 = off
     risk_cfg = dict(base.get("risk") or {})
@@ -1117,6 +1199,12 @@ def main(argv: list[str] | None = None) -> int:
         args.scale_lots = True
     if args.scale_lots and args.balance_risk_pct <= 0:
         print("config error: scale_lot_with_balance needs risk.balance_risk_pct > 0",
+              flush=True)
+        return 2
+    if args.scale_lots and pair_limits_on:
+        # Scaling currently drops trades AFTER this pass, invalidating pair state.
+        print("config error: balance scaling with pair-entry limits needs a unified "
+              "sizing/admission pass; use fixed-dollar sizing or disable both pair limits",
               flush=True)
         return 2
     # stop sizing: widen the stop instead of trading more lots (off by default)
@@ -1153,6 +1241,29 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     args.exec_hours = TF_HOURS[args.exec_tf]
     args.reg_hours = TF_HOURS[args.reg_tf]
+    from quant.broker_data import resolve_broker_dir, dataset_info, chart_path, closed_converter, WARNING
+    try:
+        args.broker_data_dir = resolve_broker_dir(base, args.research_data_dir, args.broker_data_dir)
+        broker = dataset_info(args.broker_data_dir) if args.broker_data_dir else None
+        if broker:
+            if (args.exec_tf, args.reg_tf) != ("H4", "D1"):
+                raise ValueError("broker CSV mode requires configured H4/D1 charts")
+            args.position_checks = "H4"
+            print(WARNING, flush=True)
+            for warning in broker["coverage_warnings"]:
+                print(f"COVERAGE WARNING: {warning}", flush=True)
+    except (ValueError, OSError, KeyError) as exc:
+        print(f"broker data error: {exc}", flush=True)
+        return 2
+    research = None
+    if args.research_data_dir:
+        from quant.mkdata import research_info, RESEARCH_WARNING
+        try:
+            research = research_info(args.research_data_dir)
+        except (ValueError, OSError, KeyError) as exc:
+            print(f"research data error: {exc}", flush=True)
+            return 2
+        print(RESEARCH_WARNING, flush=True)
     if args.bias_flip_exit:
         strat["bias_flip_exit"] = True  # CLI flag forces on; config holds the default
     if args.weekend_flat:
@@ -1177,8 +1288,11 @@ def main(argv: list[str] | None = None) -> int:
             if selection is not None and not selection.get(sym, True):
                 disabled.append(sym)
                 continue
-            h1_path = Path(f"data/{sym}_H1.csv")
+            h1_path = Path(args.broker_data_dir or args.data_dir) / f"{sym}_{'H4' if broker else 'H1'}.csv"
             if not h1_path.exists():
+                if broker:
+                    print(f"broker data error: missing enabled pair {sym}: {h1_path}", flush=True)
+                    return 2
                 print(f"SKIP {sym} - no {h1_path}", flush=True)
                 continue
             pc = dict(costs)
@@ -1190,7 +1304,7 @@ def main(argv: list[str] | None = None) -> int:
         if disabled:
             print(f"disabled in scan-selection.yml: {', '.join(disabled)}", flush=True)
     else:
-        if not args.config or not args.data:
+        if not args.config or (not args.data and not broker):
             print("Need --config + --data, or --batch.", flush=True)
             return 2
         cfg = yaml.safe_load(open(args.config, encoding="utf-8")) or {}
@@ -1200,12 +1314,30 @@ def main(argv: list[str] | None = None) -> int:
         pc.update(_cli_costs(args))
         if cfg.get("costs"):
             pair_costs_recorded[sym] = dict(cfg["costs"])
-        jobs.append((sym, Path(args.data), pc))
+        jobs.append((sym, Path(args.data) if args.data else Path(args.broker_data_dir) / f"{sym}_H4.csv", pc))
     if not jobs:
         print("Nothing to run.", flush=True)
         return 1
 
-    if args.exec_tf == "H4":
+    if broker:
+        try:
+            for sym, tape, _ in jobs:
+                if tape.resolve() != chart_path(args.broker_data_dir, sym, "H4").resolve():
+                    raise ValueError(f"{sym}: broker mode requires its H4 file, not another source")
+                chart_path(args.broker_data_dir, sym, "D1")
+        except (ValueError, OSError, KeyError) as exc:
+            print(f"broker data error: {exc}", flush=True)
+            return 2
+    elif args.research_data_dir:
+        from quant.mkdata import research_chart_path
+        try:
+            for sym, h1_path, _ in jobs:
+                for tf in {args.exec_tf, args.reg_tf}:
+                    research_chart_path(args.research_data_dir, sym, tf, h1_path)
+        except (ValueError, OSError, KeyError) as exc:
+            print(f"research data error: {exc}", flush=True)
+            return 2
+    elif args.exec_tf == "H4":
         missing = [str(path) for sym, h1_path, _ in jobs
                    for tf in ("H4", "D1")
                    if not (path := _broker_bar_path(h1_path, sym, tf)).exists()]
@@ -1216,8 +1348,8 @@ def main(argv: list[str] | None = None) -> int:
 
     # Quote-foreign pairs convert through a converter feed (JPY via USDJPY,
     # GBP via GBPUSD, ...). USD-quoted and USD-base pairs convert themselves.
-    conv_map = {"JPY": "USDJPY", "GBP": "GBPUSD", "AUD": "AUDUSD",
-                "NZD": "NZDUSD", "CAD": "USDCAD", "CHF": "USDCHF"}
+    from quant.rules import USD_CONVERSION_FEEDS
+    conv_map = USD_CONVERSION_FEEDS
     need: dict[str, list[str]] = {}
     for s, _, _ in jobs:
         if s[3:] == "USD" or s.startswith("USD"):
@@ -1231,12 +1363,25 @@ def main(argv: list[str] | None = None) -> int:
             or s in [x for v in need.values() for x in v]]
     converters: dict[str, pd.Series] = {}
     for feed, syms in need.items():
-        fp = Path(f"data/{feed}_H1.csv")
+        if broker:
+            try:
+                converters[feed] = closed_converter(args.broker_data_dir, feed)
+            except (ValueError, OSError, KeyError) as exc:
+                print(f"broker converter error: {exc}", flush=True)
+                return 2
+            continue
+        fp = Path(args.data_dir) / f"{feed}_H1.csv"
         if not fp.exists():
             for s in syms:
                 print(f"SKIP {s} - no {feed} converter feed", flush=True)
             jobs = [(s, p, c) for s, p, c in jobs if s not in syms]
             continue
+        if args.research_data_dir:
+            try:
+                research_chart_path(args.research_data_dir, feed, args.reg_tf, fp)
+            except (ValueError, OSError, KeyError) as exc:
+                print(f"research converter error: {exc}", flush=True)
+                return 2
         converters[feed] = load_h1(fp).set_index("time")["close"]
     if not jobs:
         print("Nothing to run.", flush=True)
@@ -1246,6 +1391,9 @@ def main(argv: list[str] | None = None) -> int:
     outdir.mkdir(parents=True, exist_ok=True)
     workers = resolve_workers(args.jobs, len(jobs))
     params = {
+        "broker_data": broker, "raw_tape_tf": "H4" if broker else "H1",
+        "coarse_exit_timing": "bar_close" if broker else "legacy",
+        "research_data": research, "data_dir": str(Path(args.data_dir).resolve()),
         "strategy": strat, "costs": costs, "risk_usd": args.risk_usd,
         "max_cost_ratio": args.max_cost_ratio,
         "sizing_scope_usd": {"low": args.scope_low, "high": args.scope_high},
@@ -1255,7 +1403,9 @@ def main(argv: list[str] | None = None) -> int:
         "default_lot": args.default_lot,
         "lot": args.lot,
         "max_trades_per_day": max_day, "workers": workers,
+        **pair_limits,
         "no_trade_ranges": args.no_trade_ranges,
+        "entry_hours": args.entry_hours,
         "position_checks": args.position_checks,
         "timeframes": {"execution": args.exec_tf, "regime": args.reg_tf},
         "benchmarks": bench,
@@ -1271,7 +1421,7 @@ def main(argv: list[str] | None = None) -> int:
     results, failures = run_all(jobs, strat, args, converters, workers)
     write_bias_maps(outdir, results)  # per-run shading artifact for the report
     dropped: list[dict] = []
-    if max_day > 0 and results:
+    if max_day > 0 and results and not pair_limits_on:
         capped, dropped = apply_daily_cap({s: r["trades"] for s, r in results.items()}, max_day)
         for sym, kept in capped.items():
             if len(kept) == len(results[sym]["trades"]):
@@ -1292,10 +1442,12 @@ def main(argv: list[str] | None = None) -> int:
         "max_total_positions": max(args.max_total_positions, 0),
         "max_ccy_net": max(args.max_ccy_net, 0),
         "weekly_loss_r": max(args.weekly_loss_r, 0.0)}
+    params["portfolio"].update(pair_limits)
     kept_pf, pf_dropped = portfolio_filter(
         {s: r["trades"] for s, r in results.items()},
         params["portfolio"]["max_total_positions"], params["portfolio"]["max_ccy_net"],
-        params["portfolio"]["weekly_loss_r"])
+        params["portfolio"]["weekly_loss_r"], **pair_limits,
+        max_trades_per_day=max_day if pair_limits_on else 0)
     changed: set[str] = set()
     if pf_dropped:
         params["portfolio"]["dropped"] = pf_dropped
@@ -1320,7 +1472,8 @@ def main(argv: list[str] | None = None) -> int:
     if failures or dropped or pf_dropped:
         params["failed"] = failures
         params["daily_cap_dropped"] = dropped
-        params_path.write_text(json.dumps(params, indent=1), encoding="utf-8")
+    # Always persist the portfolio settings, including when no entries were dropped.
+    params_path.write_text(json.dumps(params, indent=1), encoding="utf-8")
 
     # scaled sizing pass (risk.scale_lot_with_balance ON): re-lot everything
     # from the account equity timeline AFTER the daily cap + portfolio rules,
@@ -1362,6 +1515,9 @@ def main(argv: list[str] | None = None) -> int:
             if sym in taken:
                 try:
                     h1_by_sym[sym] = load_h1(h1_path)
+                    if broker:
+                        # H4 CLOSE marks become available at the end, not the open.
+                        h1_by_sym[sym]["time"] += pd.Timedelta(hours=args.exec_hours)
                 except Exception:
                     pass
         usable = {s: taken[s] for s in taken if s in h1_by_sym}

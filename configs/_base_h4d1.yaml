@@ -17,7 +17,7 @@
 #     -> signal on closed H4; enter at the next H4 open
 #   RR 1:2.5 -> tp_mult 2.5;  trailing -> off, evaluated as its own run later
 #   Max 2/pair/week + loss disables the pair for the day
-#     -> NOT BUILT yet: no such knobs exist; runs cannot enforce them (limits note below)
+#     -> limits.max_trades_per_pair_per_week / disable_pair_after_daily_loss
 
 # Shared defaults for every pair. Pair files set: symbol + costs ONLY.
 # Strategy/risk all live here; pair-level copies of those blocks are ignored
@@ -32,7 +32,14 @@ timeframes:
   regime: D1             # use the last closed Daily candle for trend direction
                          # backtest needs broker-exported <symbol>_H4.csv and
                          # <symbol>_D1.csv beside H1; live fetches broker bars
-  position_checks: M1    # stop/TP/trail checked on M1 feed, H4 when M1 missing
+  position_checks: M1    # legacy/research feed; broker CSV override below uses explicit H4 checks
+
+# OFFLINE DATA ONLY · never changes the live trader's broker fetches.
+backtest_data:
+  use_broker_csv: true         # false = legacy inputs; explicit --research-data-dir selects research instead
+  broker_csv_dir: data/pepperstone  # normalized H4/D1 with archived original MT5 exports
+  broker_server_clock: new_york_plus_7  # source GMT+2 winter/GMT+3 US DST; imported CSVs are UTC
+  position_checks: H4          # broker-only coarse checks; no vendor H1/M1 mixing
 
 # ────────────────────────────────────────────────────────────────────────
 # EXECUTION · documentation only; these keys do not change the engine
@@ -203,9 +210,13 @@ account:
 # (0 on any limit = that rule off)
 # ────────────────────────────────────────────────────────────────────────
 limits:
-  # SPEC "max 2 per pair per week" + "a loss disables the pair for the day"
-  # are NOT ENFORCED anywhere — no such knobs exist yet. This preset runs
-  # without them; the engine caps only what is listed below.
+  entry_hours:
+    enabled: true             # new entries only; open positions remain managed
+    utc_offset_hours: 8       # Malaysia fixed UTC+8, not the broker chart clock
+    start: "09:15"            # inclusive local fill time
+    end: "23:00"              # exclusive; skipped signals are not queued
+  max_trades_per_pair_per_week: 2  # actual entries per pair, UTC Monday week; 0 = off
+  disable_pair_after_daily_loss: true  # closed loss after costs blocks this pair until next UTC day; false = off
   weekly_loss_r: 3.0          # BACKTEST weekly halt: week's CLOSED R total <= -this (8A; 0 = off)
   weekly_loss_pct: 15.0       # LIVE/panel weekly halt: % of week-start equity (live only)
   max_trades_per_day: 20      # portfolio-wide, per day
