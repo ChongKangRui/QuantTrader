@@ -87,8 +87,8 @@ def _market_close(mt5, *, broker: str, pos_ticket: int, lot: float, magic: int,
 
 
 def roundtrip(mt5, *, symbol: str, side: str, volume: float, magic: int,
-              dry_run: bool, journal_path: str | Path) -> int:
-    """Open at market, close immediately. 0 ok, 1 send failed, 2 close failed."""
+              dry_run: bool, journal_path: str | Path, account_store=None) -> int:
+    """Open then close. 0 ok, 1 open failed, 2 needs closing, 3 closed/log incomplete."""
     broker = resolve_symbol(mt5, symbol)
     if broker is None:
         print(f"DATA ERROR - symbol not found: {symbol}", flush=True)
@@ -128,9 +128,13 @@ def roundtrip(mt5, *, symbol: str, side: str, volume: float, magic: int,
 
     before = {p.ticket for p in (mt5.positions_get(symbol=broker) or ())}
     open_px = round(float(tick.ask if open_side == "BUY" else tick.bid), digits)
-    result = mt5.order_send(build_request(mt5, symbol=broker, side=open_side, volume=lot,
-                                          price=open_px, magic=magic, filling=filling,
-                                          comment=comment))
+    request = build_request(mt5, symbol=broker, side=open_side, volume=lot,
+                            price=open_px, magic=magic, filling=filling, comment=comment)
+    if account_store is not None:
+        from quant.account_store import recorded_open
+        result = recorded_open(mt5, account_store, request)
+    else:
+        result = mt5.order_send(request)
     if result is None or int(getattr(result, "retcode", -1)) != mt5.TRADE_RETCODE_DONE:
         print(f"OPEN FAILED: {result} last_error={mt5.last_error()}", flush=True)
         return 1
@@ -142,7 +146,13 @@ def roundtrip(mt5, *, symbol: str, side: str, volume: float, magic: int,
     row = _journal_base(broker, open_side, lot, magic, comment, False)
     row.update({"entry": getattr(result, "price", open_px), "ticket": getattr(result, "deal", ""),
                 "reason": f"roundtrip-open pos={pos.ticket}", "trigger": "roundtrip"})
-    append_row(journal_path, row)
+    recording_failed = False
+    try:
+        append_row(journal_path, row)
+    except Exception as exc:
+        # A filled position must still be closed when journaling fails.
+        recording_failed = True
+        print(f"RECORDING ALERT - open journal failed: {exc}; attempting close", flush=True)
 
     ok, close_px, result2 = _market_close(mt5, broker=broker, pos_ticket=pos.ticket, lot=lot,
                                          magic=magic, filling=filling, digits=digits,
@@ -154,7 +164,14 @@ def roundtrip(mt5, *, symbol: str, side: str, volume: float, magic: int,
     row = _journal_base(broker, close_side, lot, magic, comment, False)
     row.update({"entry": getattr(result2, "price", close_px), "ticket": getattr(result2, "deal", ""),
                 "reason": f"roundtrip-close pos={pos.ticket}", "trigger": "roundtrip"})
-    append_row(journal_path, row)
+    try:
+        append_row(journal_path, row)
+    except Exception as exc:
+        recording_failed = True
+        print(f"RECORDING ALERT - close journal failed: {exc}; broker sync required", flush=True)
+    if recording_failed:
+        print(f"ROUNDTRIP closed pos={pos.ticket}; RECORDING INCOMPLETE - verify broker history", flush=True)
+        return 3
     print(f"ROUNDTRIP ok: opened and closed pos={pos.ticket} {lot:g} {broker}", flush=True)
     return 0
 
@@ -185,7 +202,7 @@ def _touch_winner(mt5, pos_ticket: int, entry_side: str, entry_px: float) -> str
 
 def touch_close(mt5, *, symbol: str, side: str, volume: float, magic: int,
                 dry_run: bool, journal_path: str | Path, distance_points: int,
-                timeout: float, poll_secs: float) -> int:
+                timeout: float, poll_secs: float, account_store=None) -> int:
     """Open with close SL+TP attached; broker closes on first touch.
 
     0 closed (by touch or timeout fallback), 1 open failed, 2 needs manual close.
@@ -239,7 +256,11 @@ def touch_close(mt5, *, symbol: str, side: str, volume: float, magic: int,
     req = build_request(mt5, symbol=broker, side=open_side, volume=lot,
                         price=ref, magic=magic, filling=filling, comment=comment)
     req["sl"], req["tp"] = sl, tp
-    result = mt5.order_send(req)
+    if account_store is not None:
+        from quant.account_store import recorded_open
+        result = recorded_open(mt5, account_store, req)
+    else:
+        result = mt5.order_send(req)
     if result is None or int(getattr(result, "retcode", -1)) != mt5.TRADE_RETCODE_DONE:
         print(f"OPEN FAILED: {result} last_error={mt5.last_error()}{clamp}", flush=True)
         return 1
@@ -303,6 +324,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--volume", type=float, default=0.01)
     ap.add_argument("--magic", type=int, default=MAGIC_DEFAULT)
     ap.add_argument("--journal", default=JOURNAL_DEFAULT)
+    ap.add_argument("--records-dir", default="trades")
     ap.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=True)
     args = ap.parse_args(argv)
 
@@ -336,23 +358,52 @@ def main(argv: list[str] | None = None) -> int:
     if mt5 is None:
         print("DATA ERROR - MetaTrader5 unavailable (needs Windows + open terminal)", flush=True)
         return 2
+    from contextlib import ExitStack
+
+    resources = ExitStack()
     try:
+        if not args.dry_run:
+            from quant.monitor import _terminal_lock
+            resources.enter_context(_terminal_lock(Path(__file__).resolve().parents[2] / "memory" / "monitor.lock"))
         if not mt5.initialize(login=acct.login, password=acct.password, server=acct.server):
             print(f"DATA ERROR - initialize failed: {mt5.last_error()}", flush=True)
             return 1
         try:
             common = dict(symbol=symbol, side=args.side.upper(), volume=args.volume,
                           magic=args.magic, dry_run=args.dry_run, journal_path=args.journal)
-            if args.touch_close:
-                return touch_close(mt5, distance_points=args.distance_points,
-                                   timeout=args.timeout, poll_secs=args.poll, **common)
-            return roundtrip(mt5, **common)
+            store = None
+            if not args.dry_run:
+                from quant.account_store import AccountStore, write_performance
+
+                info = mt5.account_info()
+                if (info is None or int(info.login) != acct.login or str(info.server) != acct.server
+                        or int(info.trade_mode) != (2 if acct.live else 0)):
+                    print("DATA ERROR - account identity mismatch; nothing sent", flush=True)
+                    return 2
+                store = AccountStore(Path(args.records_dir) / "accounts", info)
+                common["account_store"] = store
+            if store is not None:
+                store.sync_from_broker(mt5)
+            try:
+                if args.touch_close:
+                    return touch_close(mt5, distance_points=args.distance_points,
+                                       timeout=args.timeout, poll_secs=args.poll, **common)
+                return roundtrip(mt5, **common)
+            finally:
+                if store is not None:
+                    try:
+                        store.sync_from_broker(mt5)
+                        write_performance(store, magic=args.magic)
+                    except Exception as exc:
+                        print(f"RECORDING ALERT - broker sync failed: {exc}; CHECK TERMINAL", flush=True)
         finally:
             mt5.shutdown()
     except KeyboardInterrupt:
         print("Interrupted: check the terminal for any open position of our magic and close it "
               "manually if the close leg never printed ok.", flush=True)
         return 130
+    finally:
+        resources.close()
 
 
 if __name__ == "__main__":

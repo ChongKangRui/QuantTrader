@@ -73,6 +73,7 @@ def _summary_table(summary: pd.DataFrame) -> str:
     LABELS = {
         "symbol": "Pair", "trades": "Trades", "net_usd": "Net P/L (USD)",
         "swap_usd": "Swap (USD)",
+        "commission_usd": "Commission charged (USD)",
         "net_R": "Net R", "expect_R": "Avg P/L per trade (R)",
         "win_rate": "Win rate (%)", "profit_factor": "Profit factor",
         "max_dd": "Max drawdown (USD)", "max_dd_pct": "Max drawdown (% of account)",
@@ -91,7 +92,51 @@ def _summary_table(summary: pd.DataFrame) -> str:
         cells = "".join(f"<td>{_esc(row[c])}</td>" for c in cols)
         body.append(f"<tr{cls}>{cells}</tr>")
     return ("<table class=\"summary\"><thead><tr>" + head + "</tr></thead><tbody>"
-            + "".join(body) + "</tbody></table>")
+             + "".join(body) + "</tbody></table>")
+
+
+def _comparison_html(run_dir: Path) -> str:
+    """Render a saved comparison snapshot; rebuilding HTML never changes best markers."""
+    try:
+        saved = json.loads((run_dir / "comparison.json").read_text(encoding="utf-8"))
+        if saved.get("status") != "compared":
+            return ('<section id="run-comparison"><h2>Run comparison</h2><p>'
+                    + _esc(saved.get("reason", "Comparison unavailable.")) + '</p></section>')
+        columns = {"net_usd": "Net P/L (USD)", "max_dd_pct": "Max MTM drawdown (%)",
+                   "win_rate_pct": "Win rate (%)", "profit_factor": "Profit factor",
+                   "trades": "Trades"}
+        header = "<th>Result</th><th>Run folder</th>" + "".join(f"<th>{v}</th>" for v in columns.values())
+        rows = []
+        for label, key in (("Current", "current"), ("Previous comparable", "previous"),
+                            ("Previous best", "previous_best"), ("Best at comparison time", "best")):
+            item = saved.get(key)
+            if item is None:
+                continue
+            cells = "".join(f"<td>{_esc(item['metrics'].get(k, 'N/A'))}</td>" for k in columns)
+            rows.append(f"<tr><td>{label}</td><td>{_esc(item['run'])}</td>{cells}</tr>")
+        for label, key in (("Change vs previous", "delta_vs_previous"),
+                            ("Change vs previous best", "delta_vs_previous_best")):
+            delta = saved.get(key)
+            if delta is not None:
+                cells = "".join(f"<td>{_esc(format(delta[k], '+.4g') if delta.get(k) is not None else 'N/A')}</td>"
+                                for k in columns)
+                rows.append(f"<tr><td>{label}</td><td>—</td>{cells}</tr>")
+        badge = "BEST SO FAR at comparison time" if saved.get("is_best") else "Not the best qualifying run"
+        ceiling = saved["current"].get("max_drawdown_pct")
+        policy = f"{_esc(ceiling)}% of starting balance" if ceiling is not None else "a ceiling that has not been configured"
+        return ('<section id="run-comparison"><h2>Run comparison</h2>'
+                f'<p><b>{badge}</b>. Highest net profit within a maximum MTM drawdown of '
+                f'{policy}. '
+                f'{_esc(saved["comparable_runs"])} comparable completed run(s); '
+                f'{_esc(saved["excluded_runs"])} other folder(s) excluded.</p>'
+                '<table class="summary"><thead><tr>' + header + '</tr></thead><tbody>'
+                + "".join(rows) + '</tbody></table>'
+                '<p>Percentage changes are percentage points; lower drawdown is better. '
+                'No previous row means this is the first comparable run. N/A means no finite delta. '
+                'This is a saved snapshot; BEST.txt identifies the current winner in this group. '
+                'Best historical results do not prove future performance.</p></section>')
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        return ""
 
 
 def _load_trades(run_dir: Path) -> list[tuple[str, pd.DataFrame]]:
@@ -122,8 +167,9 @@ def annotate_entry_reasons(run_dir: Path, loaded: list) -> list:
     except (OSError, ValueError):
         params = {}
     strategy = params.get("strategy") or {}
-    modern = (bool(strategy.get("use_w1")) and
-              any(k in strategy for k in ("w1_touch_from_trend_side", "w1_cross_from_other_side")) and
+    modern = ((bool(strategy.get("use_recovery_entry")) or bool(strategy.get("use_w1"))) and
+               (any(k in strategy for k in ("w1_touch_from_trend_side", "w1_cross_from_other_side"))
+                or bool(strategy.get("w1_cross_into_gap")) or bool(strategy.get("use_recovery_entry"))) and
               all(k in strategy for k in ("entry_ema_fast_period", "entry_ema_slow_period", "entry_atr_period")))
     jobs = {item[0]: item[1] for item in params.get("jobs", [])}
     out = []
@@ -140,7 +186,7 @@ def annotate_entry_reasons(run_dir: Path, loaded: list) -> list:
                 if params.get("broker_data"):
                     from quant.broker_data import dataset_info, chart_path
                     identity = params["broker_data"]
-                    if dataset_info(identity["directory"]) != identity:
+                    if dataset_info(identity["directory"], tf, identity.get("position_checks")) != identity:
                         raise ValueError("broker source identity changed")
                     path = chart_path(identity["directory"], symbol, tf)
                 elif params.get("research_data"):
@@ -170,7 +216,7 @@ def annotate_entry_reasons(run_dir: Path, loaded: list) -> list:
                             float(row["atr"]) - float(result["atr"])) > 0.000005 + 1e-12:
                         continue
                     reason = result.get("entry_reason", "unknown")
-                    if reason in ("wick_touch", "cross_candle"):
+                    if reason in ("wick_touch", "cross_candle", "pullback_cross", "recovery_break"):
                         df.at[idx, "entry_reason"] = reason
                         df.at[idx, "_entry_reason_source"] = "reconstructed"
             except (OSError, ValueError, KeyError, TypeError) as exc:
@@ -470,7 +516,7 @@ def _bundle(run_dir: Path, data_dir: Path, trades: list[tuple[str, pd.DataFrame]
         if cfg.get("broker_data"):
             from quant.broker_data import chart_path
             data_dir = Path(cfg["broker_data"]["directory"])
-        h1_path = data_dir / f"{sym}_{'H4' if cfg.get('broker_data') else 'H1'}.csv"
+        h1_path = data_dir / f"{sym}_{cfg['exec'] if cfg.get('broker_data') else 'H1'}.csv"
         if not h1_path.exists():
             continue
         try:
@@ -484,7 +530,7 @@ def _bundle(run_dir: Path, data_dir: Path, trades: list[tuple[str, pd.DataFrame]
                 if cfg.get("broker_data"):
                     from quant.broker_data import chart_path, dataset_info
                     root = cfg["broker_data"]["directory"]
-                    if dataset_info(root) != cfg["broker_data"]:
+                    if dataset_info(root, cfg["exec"], cfg["broker_data"].get("position_checks")) != cfg["broker_data"]:
                         raise ValueError("broker dataset changed; refusing substitute charts")
                     bars = load_h1(chart_path(root, sym, tf))
                 elif cfg.get("research_data"):
@@ -520,6 +566,26 @@ def write_report(run_dir: Path, data_dir: Path) -> bool:
     from plotly.offline import get_plotlyjs
 
     summary = pd.read_csv(s_path)
+    from quant.performance import PerformanceSettings, account_performance, performance_html
+
+    params_path = run_dir / "params.json"
+    params = json.loads(params_path.read_text(encoding="utf-8")) if params_path.exists() else {}
+    performance_settings = PerformanceSettings.from_dict(params.get("performance"))
+    ratios_html = ""
+    if performance_settings.enabled:
+        curve_path = run_dir / "equity_curve.csv"
+        valid = (params.get("equity_cost_timing") == "accrued"
+                 and params.get("performance_equity_complete") is True and curve_path.exists())
+        curve = pd.read_csv(curve_path) if valid else pd.DataFrame()
+        performance = account_performance(curve, performance_settings)
+        if not valid:
+            performance["reason"] = "Complete cost-timed equity unavailable (legacy or incomplete run)"
+        (run_dir / "performance.json").write_text(
+            json.dumps(performance, indent=1, allow_nan=False), encoding="utf-8")
+        ratios_html = performance_html(performance,
+            "TOTAL portfolio only. Configured spread/slippage are in fills; entry commission and "
+            "overnight swap accrue while positions are open; closing costs apply on exit. "
+            "Open positions use the available bar-close price marks, not tick-by-tick equity.")
     loaded = annotate_entry_reasons(run_dir, _load_trades(run_dir))
     all_trades = (pd.concat([df for _, df in loaded], ignore_index=True)
                    if loaded else pd.DataFrame())
@@ -547,8 +613,7 @@ def write_report(run_dir: Path, data_dir: Path) -> bool:
 
     verdict_cell = ""
     if cfg.get("broker_data"):
-        from quant.broker_data import WARNING
-        text = WARNING + " " + " ".join(cfg["broker_data"].get("coverage_warnings", []))
+        text = cfg["broker_data"]["warning"] + " " + " ".join(cfg["broker_data"].get("coverage_warnings", []))
         verdict_cell = f'<div id="broker-data-warning">{_esc(text)}</div>'
     if cfg.get("research_data"):
         from quant.mkdata import RESEARCH_WARNING
@@ -561,16 +626,21 @@ def write_report(run_dir: Path, data_dir: Path) -> bool:
 
     figs = {"equity": _equity_spec(all_trades, run_dir), "yearly": _yearly_spec(run_dir)}
     if cfg.get("broker_data") and figs["equity"]:
-        figs["equity"]["layout"]["title"] = "equity (all pairs, exit order; MTM = H4-close marks)"
+        figs["equity"]["layout"]["title"] = f"equity (all pairs, exit order; MTM = {cfg['exec']}-close marks)"
     no_nan = lambda d: json.dumps(d, separators=(",", ":")).replace("</", "<\\/")
-    html = _html(run_dir.name, get_plotlyjs(), _summary_table(summary), verdict_cell,
+    html = _html(run_dir.name, get_plotlyjs(), _summary_table(summary) + ratios_html, verdict_cell,
                  no_nan(figs),
                  no_nan({"embedded": embedded, "meta": meta,
                          "tf": {"exec": _tf_label(cfg["exec"], False),
                                 "reg": _tf_label(cfg["reg"], True)},
                           "emaExec": cfg["entry"], "emaRegime": cfg["regime"]}),
-                 coarse_marks=bool(cfg.get("broker_data")),
-                 entry_summary_html=_entry_summary_html(entry_summary))
+                  coarse_marks=bool(cfg.get("broker_data")),
+                  mark_tf=cfg["exec"],
+                  entry_summary_html=_entry_summary_html(entry_summary),
+                  exposure_note=("Time in market = held seconds / observed execution-candle seconds; "
+                                 "gaps excluded, short sessions clipped." if params.get("exposure_timing") ==
+                                 "observed_execution_seconds" else "Time in market is a legacy bar-count estimate."),
+                  comparison_html=_comparison_html(run_dir))
     out = run_dir / "report.html"
     out.write_text(html, encoding="utf-8")
     print(f"report -> {out}", flush=True)
@@ -647,6 +717,7 @@ function drawList() {
         '</td><td>' + usd(r.tpUsd) + '</td><td>' +
         (r.swap == null ? '-' : usd(r.swap)) + '</td></tr>';
     }).join('');
+  syncChartSelection(rows);
 }
 pairSel.onchange = drawList;
 filterSel.onchange = drawList;
@@ -659,11 +730,45 @@ rowsEl.onclick = function (e) {
 var curTf = 'exec';  // sticks across trades while browsing (execution view first)
 var chartWin = null;
 var POP_CSS = "body{font:13px system-ui,sans-serif;margin:6px;background:#111;color:#ddd}" +
-  "#tfbtns button{background:#222;color:#ddd;border:1px solid #555;padding:3px 14px;cursor:pointer}" +
+  "button{background:#222;color:#ddd;border:1px solid #555;padding:3px 14px;cursor:pointer}" +
+  "button:disabled{opacity:0.4;cursor:default}" +
+  "#tradenav{display:flex;align-items:center;gap:8px;margin-bottom:8px}" +
+  "#tradedetail{margin-bottom:8px;color:#aaa}" +
   "#tfbtns button.on{background:#4a6cf7;border-color:#4a6cf7}" +
   "#tfnote{color:#888;margin-left:8px}";
+function chartNavigation(w, rows) {
+  var index = rows.findIndex(function (r) { return r.id === w.__tid; });
+  w.document.getElementById('tradecount').textContent =
+    'Trade ' + (index < 0 ? 0 : index + 1) + ' of ' + rows.length;
+  w.document.getElementById('prevtrade').disabled = index <= 0;
+  w.document.getElementById('nexttrade').disabled = index < 0 || index >= rows.length - 1;
+}
+function clearChart(w, message) {
+  var plot = w.document.getElementById('pop-chart');
+  w.Plotly.purge(plot);
+  plot.textContent = message;
+  w.document.getElementById('tfbtns').innerHTML = '';
+}
+function syncChartSelection(rows) {
+  if (!chartWin || chartWin.closed) return;
+  if (!rows.some(function (r) { return r.id === chartWin.__tid; })) {
+    if (rows.length) { openChart(rows[0].id); return; }
+    chartWin.__tid = null;
+    chartWin.document.getElementById('tradedetail').textContent = '';
+    clearChart(chartWin, 'No trades match the current report filters.');
+  }
+  chartNavigation(chartWin, rows);
+}
+function navigateTrade(step) {
+  if (!chartWin || chartWin.closed) return;
+  var rows = listTrades();
+  var index = rows.findIndex(function (r) { return r.id === chartWin.__tid; });
+  var next = index + step;
+  if (index >= 0 && next >= 0 && next < rows.length) openChart(rows[next].id);
+}
 function chartWindow() {
-  var w = window.open('', 'tradechart', 'width=1080,height=720');
+  var w = chartWin && !chartWin.closed ? chartWin :
+    window.open('', 'tradechart', 'width=1080,height=720');
   if (!w) { msgEl.textContent = 'popup blocked — allow popups for this file'; return null; }
   msgEl.textContent = '';
   if (!w.__init) {
@@ -674,26 +779,52 @@ function chartWindow() {
     w.document.open();
     w.document.write('<!doctype html><html><head><title>Trade chart</title><style>' + POP_CSS +
       '</style><scr' + 'ipt>' + lib + '</scr' + 'ipt></head><body>' +
-      '<div id="tfbtns"></div><div id="pop-chart" style="margin-top:6px"></div></body></html>');
+      '<div id="tradenav"><button id="prevtrade" type="button">&#8592; Previous trade</button>' +
+      '<span id="tradecount" aria-live="polite"></span>' +
+      '<button id="nexttrade" type="button">Next trade &#8594;</button></div>' +
+      '<div id="tradedetail"></div><div id="tfbtns"></div>' +
+      '<div id="pop-chart" style="margin-top:6px"></div></body></html>');
     w.document.close();
     w.document.getElementById('tfbtns').onclick = function (e) {
       var b = e.target.closest('button');
       // chartWin always holds the live popup; __tid is that window's trade
       if (b && chartWin && chartWin.__tid) openChart(chartWin.__tid, b.getAttribute('data-tf'));
     };
+    w.document.getElementById('prevtrade').onclick = function () { navigateTrade(-1); };
+    w.document.getElementById('nexttrade').onclick = function () { navigateTrade(1); };
+    w.document.addEventListener('keydown', function (e) {
+      if (e.defaultPrevented || e.ctrlKey || e.altKey || e.metaKey || e.shiftKey) return;
+      var target = e.target;
+      if (target && (target.isContentEditable || (target.closest &&
+          target.closest('input, textarea, select, [contenteditable="true"]')))) return;
+      if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+      e.preventDefault();
+      navigateTrade(e.key === 'ArrowLeft' ? -1 : 1);
+    });
     w.__init = true;
   }
   chartWin = w;
   return w;
 }
 function openChart(id, forceTf) {
+  var row = TB.meta.find(function (r) { return r.id === id; });
+  if (!row) return;
   var ctx = TB.embedded[id];
-  if (!ctx) { msgEl.textContent = 'chart not embedded (no quote data for that trade)'; return; }
   if (forceTf) curTf = forceTf;
-  if (!ctx[curTf]) curTf = 'exec';
+  if (ctx && !ctx[curTf]) curTf = 'exec';
   var w = chartWindow();
   if (!w) return;
   w.__tid = id;
+  chartNavigation(w, listTrades());
+  w.document.getElementById('tradedetail').textContent =
+    row.sym + ' ' + row.side + ' | Entry: ' + row.entry + ' UTC | ' +
+    row.entryReasonLabel + ' | ' + usd(row.pnlUsd) + ' (' + row.pnlR + 'R)';
+  w.document.title = row.sym + ' ' + row.side + ' - Trade chart';
+  if (!ctx) {
+    clearChart(w, 'Chart not embedded (no quote data for this trade). Use Previous/Next to continue.');
+    return;
+  }
+  w.document.getElementById('pop-chart').textContent = '';
   function btn(key, label) {
     return ctx[key] ? ('<button data-tf="' + key + '"' +
       (curTf === key ? ' class="on"' : '') + '>' + label + '</button>') : '';
@@ -809,20 +940,21 @@ h1 { font-size: 18px; }
 
 
 def _html(title: str, plotlyjs: str, summary_html: str, verdict_cell: str,
-          figs_json: str, trades_json: str, coarse_marks: bool = False,
-          entry_summary_html: str = "") -> str:
-    mark_timing = "at H4 candle closes" if coarse_marks else "hourly at each pair's close"
+           figs_json: str, trades_json: str, coarse_marks: bool = False,
+           entry_summary_html: str = "", mark_tf: str = "H4", comparison_html: str = "",
+           exposure_note: str = "") -> str:
+    mark_timing = f"at {_esc(mark_tf)} candle closes" if coarse_marks else "hourly at each pair's close"
     glossary = ('<div id="glossary">R = distance from entry to the initial stop. '
                 "1R = account currency at risk on that trade (net of spread, slippage "
                 f"and swap). MTM = mark-to-market: open positions are valued {mark_timing}, "
                 "so drawdown on the TOTAL row includes open "
                 "floating losses. All pairs share ONE account, so per-pair drawdowns "
-                "are not additive. Acceptance bands live in <code>configs/_base.yaml"
+                f"are not additive. {_esc(exposure_note)} Acceptance bands live in <code>configs/_base.yaml"
                 "</code>, section <code>benchmarks:</code>.</div>")
     return ("<!doctype html>\n<html><head><meta charset=\"utf-8\">"
             f"<title>run report - {escape(title)}</title>"
             f"<style>{_CSS}</style><script id=\"plotly-lib\">{plotlyjs}</script></head>\n<body>\n"
-            f"<h1>run report - {escape(title)}</h1>\n{glossary}\n{verdict_cell}\n{summary_html}\n{entry_summary_html}\n"
+            f"<h1>run report - {escape(title)}</h1>\n{glossary}\n{verdict_cell}\n{summary_html}\n{comparison_html}\n{entry_summary_html}\n"
             '<section id="overview"><div class="fig" id="fig-equity"></div>'
             '<div class="fig" id="fig-yearly"></div></section>\n'
             '<section id="browser">\n<select id="pair"></select>\n'
@@ -833,7 +965,7 @@ def _html(title: str, plotlyjs: str, summary_html: str, verdict_cell: str,
             '<select id="reasonFilter"><option value="all">All entry reasons</option></select>\n'
             '<span id="count"></span>\n'
             '<table id="rows"></table>\n'
-            '<span id="hint">click a row → chart opens in its own window</span>\n'
+            '<span id="hint">click a row → chart opens in its own window; use Previous/Next or Left/Right arrows to browse trades</span>\n'
             '<div id="msg"></div>\n'
             "</section>\n"
             f'<script id="figs-json" type="application/json">{figs_json}</script>\n'

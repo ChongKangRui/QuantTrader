@@ -100,23 +100,37 @@ def test_load_pairs_strategy_comes_only_from_base(tmp_path):
     assert p["params"]["hr1"] == "b"
 
 
-def test_role_based_periods_in_active_and_both_presets():
+def test_role_based_periods_in_active_and_both_presets_follow_config():
     import yaml
 
     from pathlib import Path
     from quant.monitor import flatten_strategy
 
     names = ("_base.yaml", "_base_h4d1.yaml", "_base_h1h4.yaml")
-    expected = (20, 100, 14, 20)
+    role_keys = {
+        "bias": ("bias_ema_fast_period", "bias_ema_slow_period", "bias_atr_period"),
+        "entry": ("entry_ema_fast_period", "entry_ema_slow_period", "entry_atr_period"),
+    }
     for name in names:
         cfg = yaml.safe_load((Path("configs") / name).read_text(encoding="utf-8"))
         p = flatten_strategy(cfg)
-        assert (p["bias_ema_fast_period"], p["bias_ema_slow_period"],
-                p["bias_atr_period"], p["entry_ema_fast_period"]) == expected
-        assert p["entry_atr_period"] == 7
-        assert p["entry_ema_slow_period"] == (50 if name == "_base_h1h4.yaml" else 100)
+        # Editable strategy values are inputs, not fixed acceptance expectations.
+        for role, keys in role_keys.items():
+            for key in keys:
+                value = cfg["strategy"][role][key]
+                assert type(value) is int and value > 0, (name, key)
+                assert p[key] == value, (name, key)
         assert not {"h1_ema_fast", "h1_ema_slow", "h4_ema_fast",
                     "h4_ema_slow", "h4_atr_n", "atr_n"} & p.keys()
+
+
+def test_nondefault_role_periods_reach_flat_strategy_without_collisions():
+    from quant.monitor import flatten_strategy
+
+    bias = {"bias_ema_fast_period": 12, "bias_ema_slow_period": 80, "bias_atr_period": 17}
+    entry = {"entry_ema_fast_period": 9, "entry_ema_slow_period": 35, "entry_atr_period": 11}
+    cfg = {"strategy": {"bias": bias, "entry": entry}}
+    assert flatten_strategy(cfg) == {**bias, **entry}
 
 
 def test_stop_sizing_block_present_in_presets_and_read_by_the_trader():
@@ -189,6 +203,9 @@ def test_read_timeframes_default_and_upscale(tmp_path):
     (d / "_base.yaml").write_text(
         "timeframes: {execution: H4, regime: D1}\n", encoding="utf-8")
     assert read_timeframes(d) == ("H4", "D1")           # the allowed upscale
+    (d / "_base.yaml").write_text(
+        "timeframes: {execution: H1, regime: D1}\n", encoding="utf-8")
+    assert read_timeframes(d) == ("H1", "D1")
     assert read_timeframes(d / "nodir") == ("H1", "H4")  # no file = default pair
 
 
@@ -197,12 +214,19 @@ def test_read_timeframes_rejects_unknown_and_unlocked(tmp_path):
 
     d = tmp_path / "configs"
     d.mkdir()
-    for yml in ("timeframes: {execution: H1, regime: D1}\n",   # un-locked combo
-                "timeframes: {execution: H4, regime: H4}\n",   # regime == execution
+    for yml in ("timeframes: {execution: D1, regime: H4}\n",   # reversed chart roles
+                "timeframes: {execution: H4, regime: H1}\n",   # reversed chart roles
                 "timeframes: {execution: W1, regime: D1}\n"):  # unknown TF
         (d / "_base.yaml").write_text(yml, encoding="utf-8")
         with pytest.raises(ValueError):
             read_timeframes(d)
+
+
+def test_read_timeframes_same_chart(tmp_path):
+    for tf in ("H1", "H4", "D1"):
+        (tmp_path / "_base.yaml").write_text(
+            f"timeframes: {{execution: {tf}, regime: {tf}}}\n", encoding="utf-8")
+        assert read_timeframes(tmp_path) == (tf, tf)
 
 
 def test_poll_resolves_tf_names_via_getattr():
@@ -225,6 +249,7 @@ def test_poll_resolves_tf_names_via_getattr():
             return []
 
         def copy_rates_from_pos(self, symbol, tf, start, n):
+            assert start == 1  # H1 and D1 both fetch closed broker candles only.
             self.used.append(tf)
             return None  # poll reports "no closed-bar data"; the codes are the point
 
@@ -232,6 +257,10 @@ def test_poll_resolves_tf_names_via_getattr():
     poll(mt5, [{"name": "EURUSD", "symbol": "EURUSD"}],
          exec_tf="TIMEFRAME_H1", reg_tf="TIMEFRAME_D1")
     assert mt5.used == [11, 13]
+    for tf, code in (("TIMEFRAME_H1", 11), ("TIMEFRAME_H4", 12), ("TIMEFRAME_D1", 13)):
+        mt5.used.clear()
+        poll(mt5, [{"name": "EURUSD", "symbol": "EURUSD"}], exec_tf=tf, reg_tf=tf)
+        assert mt5.used == [code, code]
 
 
 def test_render_shows_ma_only_mode():

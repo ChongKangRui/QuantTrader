@@ -29,10 +29,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from quant.backtest import (WIN_BARS, _atr_wilder, _load_m1, apply_daily_cap,
+from quant.backtest import (SIMULATION_TIMING, WIN_BARS, _atr_wilder, _load_m1,
                             bias_frames, build_h4, load_h1, local_stamp,
                             map_bias, portfolio_filter, scan_pair, simulate,
-                            total_row, load_chart_frames)
+                            total_row, load_chart_frames, read_evaluation_window,
+                            evaluation_tape, validate_preparation, candidate_in_evaluation)
 from quant.limits import parse_no_trade_ranges, read_pair_limits, read_entry_hours
 from quant.monitor import TF_HOURS, flatten_strategy, load_pairs, read_selection, read_timeframes
 from quant.rules import USD_CONVERSION_FEEDS, read_sizing
@@ -54,16 +55,18 @@ def resolve_setup(config_dir: str = "configs", data_dir: str = "data",
     with open(Path(config_dir) / "_base.yaml", encoding="utf-8") as fh:
         base = yaml.safe_load(fh) or {}
     strat = flatten_strategy(base)
+    window = read_evaluation_window(base)
     limits = dict(base.get("limits") or {})
     risk = dict(base.get("risk") or {})
     if risk.get("scale_lot_with_balance"):
         raise ValueError("dice comparison does not support balance scaling; use fixed-dollar sizing")
     execution, regime = read_timeframes(config_dir)
     from quant.broker_data import resolve_broker_dir, dataset_info, chart_path, closed_converter
+    from quant.broker_data import resolve_position_checks
     broker_root = resolve_broker_dir(base, research_data_dir, broker_data_dir)
-    broker = dataset_info(broker_root) if broker_root else None
-    if broker and (execution, regime) != ("H4", "D1"):
-        raise ValueError("broker CSV dice requires configured H4/D1 charts")
+    checks = resolve_position_checks(base, execution) if broker_root else str(
+        (base.get("timeframes") or {}).get("position_checks", "M1")).upper()
+    broker = dataset_info(broker_root, execution, checks) if broker_root else None
     research = None
     if research_data_dir:
         from quant.mkdata import research_info
@@ -75,15 +78,16 @@ def resolve_setup(config_dir: str = "configs", data_dir: str = "data",
         sym = pr["symbol"]
         if selection is not None and not selection.get(sym, True):
             continue
-        h1_path = Path(broker_root or data_dir) / f"{sym}_{'H4' if broker else 'H1'}.csv"
+        h1_path = Path(broker_root or data_dir) / f"{sym}_{execution if broker else 'H1'}.csv"
         if not h1_path.exists():
             if broker:
                 raise FileNotFoundError(f"missing enabled broker pair {sym}: {h1_path}")
             print(f"SKIP {sym} - no {h1_path}", flush=True)
             continue
         if broker:
-            chart_path(broker_root, sym, "H4")
-            chart_path(broker_root, sym, "D1")
+            chart_path(broker_root, sym, execution)
+            chart_path(broker_root, sym, regime)
+            chart_path(broker_root, sym, checks)
         costs = dict(base.get("costs") or {})
         costs.update(pr.get("costs") or {})
         jobs.append((sym, h1_path, costs))
@@ -98,7 +102,7 @@ def resolve_setup(config_dir: str = "configs", data_dir: str = "data",
     converters: dict[str, pd.Series] = {}
     for feed, syms in need.items():
         if broker:
-            converters[feed] = closed_converter(broker_root, feed)
+            converters[feed] = closed_converter(broker_root, feed, checks)
             continue
         fp = Path(data_dir) / f"{feed}_H1.csv"
         if not fp.exists():
@@ -107,11 +111,15 @@ def resolve_setup(config_dir: str = "configs", data_dir: str = "data",
         if research_data_dir:
             from quant.mkdata import research_chart_path
             research_chart_path(research_data_dir, feed, regime, fp)
-        converters[feed] = load_h1(fp).set_index("time")["close"]
+        converter = load_h1(fp)
+        converters[feed] = pd.Series(converter["close"].to_numpy(),
+                                     index=converter["time"] + pd.Timedelta(hours=1))
     default_lot, stop_sizing = read_sizing(risk)
     return {
         "broker_data_dir": broker_root, "broker_data": broker,
-        "coarse_exit_timing": "bar_close" if broker else "legacy",
+        "coarse_exit_timing": "bar_close",
+        "simulation_timing": SIMULATION_TIMING,
+        "evaluation_window": window,
         "execution": execution, "regime": regime,
         "exec_hours": TF_HOURS[execution], "reg_hours": TF_HOURS[regime],
         "research_data_dir": str(Path(research_data_dir).resolve()) if research_data_dir else None,
@@ -131,8 +139,7 @@ def resolve_setup(config_dir: str = "configs", data_dir: str = "data",
         "max_open": int(risk.get("max_total_positions", 0) or 0),
         "max_ccy_net": int(risk.get("max_ccy_net", 0) or 0),
         "weekly_r": float(limits.get("weekly_loss_r", 0.0) or 0.0),
-        "position_checks": "H4" if broker else str((base.get("timeframes") or {}).get(
-            "position_checks", "M1")).upper(),
+        "position_checks": checks,
         "no_trade_ranges": tuple(parse_no_trade_ranges(base)),
     }
 
@@ -153,12 +160,16 @@ def env_from_frames(symbol: str, h1: pd.DataFrame, costs: dict, setup: dict,
         raise ValueError("configured charts must be supplied explicitly; no implicit resampling")
     execution = h1 if exec_frame is None else exec_frame
     h4 = build_h4(h1) if regime_frame is None else regime_frame
+    window = setup.get("evaluation_window")
+    execution = evaluation_tape(execution, window, eh)
+    validate_preparation(execution, h4, strat, window)
     mapped = map_bias(execution, h4, bias_frames(h4, strat), reg_hours=rh,
                       exec_hours=eh, broker_bars=closed_bar_mapping)
     atr = _atr_wilder(execution["high"], execution["low"], execution["close"],
                        int(strat.get("entry_atr_period", strat.get("atr_n", 7)))).to_numpy()
     t0 = max(WIN_BARS, int(strat.get("warmup_bars", 300)))
     return {"symbol": symbol, "h1": execution, "h4": h4, "mapped": mapped, "m1": m1,
+            "evaluation_window": window,
             "closed_bar_mapping": closed_bar_mapping,
             "atr": atr, "t0": t0, "costs": costs}
 
@@ -172,8 +183,12 @@ def build_env(symbol: str, h1_path: str | Path, costs: dict, setup: dict) -> dic
     h1, execution, regime, closed = load_chart_frames(
         symbol, h1_path, setup.get("exec_hours", 1), setup.get("reg_hours", 4),
         setup.get("research_data_dir"), setup.get("broker_data_dir"))
-    return env_from_frames(symbol, h1, costs, setup, m1, exec_frame=execution,
-                           regime_frame=regime, closed_bar_mapping=closed)
+    from quant.backtest import load_position_bars
+    env = env_from_frames(symbol, h1, costs, setup, m1, exec_frame=execution,
+                          regime_frame=regime, closed_bar_mapping=closed)
+    env["position_bars"] = load_position_bars(symbol, env["h1"], setup.get("broker_data_dir"),
+                                              setup["position_checks"], setup.get("exec_hours", 1))
+    return env
 
 
 def _simulate(env: dict, cands: list[dict]) -> tuple[pd.DataFrame, dict]:
@@ -194,7 +209,9 @@ def _simulate(env: dict, cands: list[dict]) -> tuple[pd.DataFrame, dict]:
                     stop_sizing=setup.get("stop_sizing"),
                     default_lot=setup.get("default_lot"),
                     bar_hours=setup.get("exec_hours", 1),
-                    coarse_exit_at_close=bool(setup.get("broker_data_dir")))
+                    coarse_exit_at_close=bool(setup.get("broker_data_dir")),
+                     independent_candidates=True, position_bars=env.get("position_bars"),
+                     evaluation_window=setup.get("evaluation_window"))
 
 
 def eligible_bars(env: dict, variant: str) -> np.ndarray:
@@ -208,6 +225,9 @@ def eligible_bars(env: dict, variant: str) -> np.ndarray:
     atr = env["atr"]
     idx = np.arange(env["t0"], len(env["h1"]) - 1)
     idx = idx[np.isfinite(atr[idx]) & (atr[idx] > 0)]
+    if (env.get("evaluation_window") or {}).get("enabled"):
+        idx = np.asarray([t for t in idx if candidate_in_evaluation(
+            env["h1"], int(t), env["evaluation_window"])], dtype=int)
     if variant == "B":
         dirs = env["mapped"]["direction"].to_numpy()[idx]
         if not set(dirs).issubset({"LONG", "SHORT", "NEUTRAL"}):
@@ -256,11 +276,11 @@ def dice_pair_trades(env: dict, variant: str, target: int,
                      rng: np.random.Generator, first_wave_mult: float = 4.0,
                      topup_mult: float = 2.0,
                      max_waves: int = 20) -> tuple[pd.DataFrame, dict]:
-    """Adaptive waves: draw -> simulate the full cumulative candidate set
-    from scratch (the open-position rule interleaves, so each new candidate
-    can change which earlier ones get skipped) -> repeat until the recorded
-    trade count reaches the target, then thin uniformly at random to the
-    target (never first-in-time: that would favour early years)."""
+    """Draw independent lifecycles to the reference's pre-admission count.
+
+    Thin uniformly to the target, then let the shared chronological admission
+    pass enforce overlap and quotas. Rejected attempts consume no slots.
+    """
     stream = _Stream(env, variant, rng)
     cands: list[dict] = []
     trades = pd.DataFrame()
@@ -297,13 +317,11 @@ def dice_pair_trades(env: dict, variant: str, target: int,
 def apply_filters(trades_by_sym: dict[str, pd.DataFrame], setup: dict
                   ) -> tuple[dict[str, pd.DataFrame], list[dict], list[dict]]:
     pair_limits = read_pair_limits(setup)
-    enabled = any(pair_limits.values())
-    capped, cap_drops = (dict(trades_by_sym), []) if enabled else apply_daily_cap(
-        trades_by_sym, setup["max_day"])
     kept, pf_drops = portfolio_filter(
-        capped, setup["max_open"], setup["max_ccy_net"], setup["weekly_r"],
-        **pair_limits, max_trades_per_day=setup["max_day"] if enabled else 0)
-    return kept, cap_drops, pf_drops
+        trades_by_sym, setup["max_open"], setup["max_ccy_net"], setup["weekly_r"],
+        **pair_limits, max_trades_per_day=setup["max_day"],
+        one_entry_per_pair_per_day=True)
+    return kept, [], pf_drops
 
 
 def pooled_stats(trades_by_sym: dict[str, pd.DataFrame]) -> dict:
@@ -326,7 +344,8 @@ def _real_one(sym: str, h1_path: str, costs: dict, setup: dict
     _, cands = scan_pair(env["h1"], env["h4"], sym, setup["strategy"],
                          exec_hours=setup.get("exec_hours", 1),
                          reg_hours=setup.get("reg_hours", 4),
-                         broker_bars=env["closed_bar_mapping"])
+                         broker_bars=env["closed_bar_mapping"],
+                         evaluation_window=setup.get("evaluation_window"))
     trades, _ = _simulate(env, cands)
     return sym, trades, len(trades)
 
@@ -384,6 +403,10 @@ def validate_reference_setup(setup: dict, reference: Path) -> None:
         raise ValueError("reference broker dataset/manifest does not match")
     if params.get("coarse_exit_timing", "legacy") != setup.get("coarse_exit_timing", "legacy"):
         raise ValueError("reference exit timing does not match")
+    if params.get("simulation_timing") != setup.get("simulation_timing"):
+        raise ValueError("reference simulation timing does not match; create a new reference")
+    if (params.get("evaluation_window") or {"enabled": False}) != (setup.get("evaluation_window") or {"enabled": False}):
+        raise ValueError("reference evaluation window does not match")
     if params.get("strategy") != setup["strategy"]:
         raise ValueError("reference strategy does not match; use the same config")
     if params.get("scale_lot_with_balance"):
@@ -534,8 +557,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         setup = resolve_setup(args.config_dir, args.data_dir, args.research_data_dir, args.broker_data_dir)
         if setup["broker_data"]:
-            from quant.broker_data import WARNING
-            print(WARNING, flush=True)
+            print(setup["broker_data"]["warning"], flush=True)
             for warning in setup["broker_data"]["coverage_warnings"]:
                 print(f"COVERAGE WARNING: {warning}", flush=True)
         if setup["research_data"]:

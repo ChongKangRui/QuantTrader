@@ -18,6 +18,16 @@ def test_summary_table_readable_labels():
     assert "Avg P/L per trade (R)" in html and "Trades per month" in html
 
 
+@pytest.mark.parametrize("timing", [None, "observed_execution_seconds"])
+def test_report_labels_exposure_definition(tmp_path, timing):
+    run, data, _ = _run_dir(tmp_path)
+    (run / "params.json").write_text(json.dumps({"exposure_timing": timing}), encoding="utf-8")
+    assert write_report(run, data)
+    html = (run / "report.html").read_text(encoding="utf-8")
+    assert ("held seconds / observed execution-candle seconds" if timing else
+            "legacy bar-count estimate") in html
+
+
 def _h1(n: int = 300) -> pd.DataFrame:
     rng = np.random.default_rng(7)
     times = pd.date_range("2020-01-01", periods=n, freq="1h", tz="UTC")

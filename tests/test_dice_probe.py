@@ -76,6 +76,32 @@ def test_eligible_bars_variants():
     assert (env["mapped"]["direction"].to_numpy()[b] != "NEUTRAL").all()
 
 
+@pytest.mark.parametrize("variant", ["A", "B"])
+def test_dice_never_draws_preparation_or_exclusive_end_bars(variant):
+    from quant.backtest import read_evaluation_window
+    frame = _h1()
+    window = read_evaluation_window({"backtest_evaluation": {"enabled": True,
+        "start": str(frame.time.iloc[500]), "end": str(frame.time.iloc[600]), "require_preparation": False}})
+    env = {"symbol": "EURUSD", "h1": frame, "mapped": _mapped(800), "t0": 400,
+           "atr": np.full(800, .0002), "evaluation_window": window}
+    indices = eligible_bars(env, variant)
+    assert indices.min() == 499 and indices.max() == 598
+    fill_times = frame.time.iloc[indices + 1]
+    assert (fill_times >= pd.Timestamp(window["start"])).all()
+    assert (fill_times < pd.Timestamp(window["end"])).all()
+
+
+def test_reference_window_mismatch_rejected_before_any_simulation(tmp_path):
+    import json
+    from quant.backtest import SIMULATION_TIMING
+    setup = _setup(execution="H1", regime="H4", simulation_timing=SIMULATION_TIMING,
+                   evaluation_window={"enabled": True, "start": "2020-01-01", "end": "2021-01-01"})
+    (tmp_path / "params.json").write_text(json.dumps({"simulation_timing": SIMULATION_TIMING,
+        "strategy": setup["strategy"], "evaluation_window": {"enabled": False}}))
+    with pytest.raises(ValueError, match="evaluation window"):
+        dp.validate_reference_setup(setup, tmp_path)
+
+
 def test_stream_draw_sorted_reproducible_exhausts():
     n = 800
     env = {"symbol": "EURUSD", "h1": _h1(n), "mapped": _mapped(n), "t0": 400,

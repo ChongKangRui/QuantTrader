@@ -7,9 +7,22 @@ import pytest
 
 from quant import trader as tr
 from tests.test_signals import _go_bars, _mirror
+from tests.test_signals import _pullback_bars, _W1_ISO
 
 NOW = datetime(2026, 10, 12, 14, 30, tzinfo=timezone.utc)
 MAGIC = 100001
+
+
+@pytest.mark.parametrize("side", ["LONG", "SHORT"])
+def test_live_gate_uses_shared_pullback_pattern(side):
+    mt5 = _FakeMT5()
+    mt5._bars = _scale(_pullback_bars(side))
+    params = dict(_W1_ISO, entry_ema_slow_period=100,
+                  w1_touch_from_trend_side=False, w1_cross_from_other_side=False)
+    assert tr._gate_check(mt5, "EURUSD", side, params)[0] is False
+    enabled = dict(params, w1_cross_into_gap=True)
+    assert tr._gate_check(mt5, "EURUSD", side, enabled)[0] is True
+    assert mt5.sent == []
 
 
 def cfg(**over):
@@ -300,14 +313,26 @@ def test_trail_arms_on_trigger_and_only_improves():
 
 def test_trail_be_overlay():
     p = {"use_trail": True, "use_be": True, "trail_r": 1.0,
-         "be_trigger_r": 1.0, "be_buffer": 0.0001}
+         "be_trigger_r": 1.0, "be_buffer": 1.0}
     new, best, act = tr.trail_decision(_ctx(), 1.1100, p, 1.0900)
     assert new == 1.1001  # BE floor lifts the stop while the trail cannot yet
     new, best, act = tr.trail_decision(_ctx(), 1.1150, p, 1.0900)
     assert new == 1.1050  # trail overtakes BE once far enough
     # no BE/trail configured (config off) -> the system never touches stops
     assert tr.trail_decision(_ctx(), 1.1999, {"use_trail": False, "use_be": False,
-                                              "trail_r": 1.0}, 1.09)[0] is None
+                                               "trail_r": 1.0}, 1.09)[0] is None
+
+
+@pytest.mark.parametrize("symbol,entry,stop,pip", [("EURUSD", 1.1, .01, .0001), ("USDJPY", 150., 1., .01)])
+@pytest.mark.parametrize("direction", ["BUY", "SELL"])
+def test_live_breakeven_buffer_uses_symbol_pips_without_sending(symbol, entry, stop, pip, direction):
+    ctx = _ctx(direction, entry, stop)
+    ctx["symbol"] = symbol
+    sign = 1 if direction == "BUY" else -1
+    new, _, active = tr.trail_decision(ctx, entry + sign * 2 * stop,
+                                      {"use_be": True, "use_trail": False,
+                                       "be_trigger_r": 1, "be_buffer": 1}, ctx["init_sl"])
+    assert active and new == pytest.approx(entry + sign * pip)
 
 
 def test_manage_book_trails_and_journals(tmp_path):

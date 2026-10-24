@@ -1,83 +1,729 @@
-# Dev Log (newest first)
+# Dev Log (TODO first; records newest first)
 
-## TODO (living checklist — strike the line when done; finished work goes into the dated log below)
+## TODO (unfinished work only; finished work goes into the dated log below)
 
-### Now (housekeeping, no backtest needed)
+Current focus: find and validate the system's edge. The prepared four-pair
+backtest is deferred, not the next action. No backtest is authorized now.
+Completed setup tasks are recorded in the dated history, not in this checklist.
 
-- [x] ~~Sizing decision~~ (2026-10-21): keep fixed-dollar scope and balance
-  scaling OFF. User manually adjusts USD scope/base lot as the account grows.
-  $200 is under consideration, not confirmed: benchmark remains $100.
-- [x] ~~Pair-frequency protections~~ (2026-10-21): configurable max 2 actual
-  entries/pair/week and pair-day block after a fully closed net loss, enabled
-  in active `_base.yaml` and the H4/D1 preset; terminal validation pending.
-- [x] ~~History export tooling~~ (2026-10-21): existing `mkdata --broker` follows
-  configured chart/check timeframes and includes H1 + USD conversion feeds,
-  warmup, validation and metadata. API pulls stalled; manual chart exports now imported below.
-- [x] ~~Vendor-derived research dataset~~ (user-approved alternative): all 11
-  existing M1 pairs converted directly to H4/D1 in
-  `data/vendor_derived_2015_2025/`, 232037 derived candles. Source files unchanged;
-  source timezone is unverified; partial periods retained, empty periods omitted.
-  Normal broker/live data contract unchanged; research requires explicit CLI opt-in.
-- [x] ~~Configured dice tooling~~: shared H1/H4 or H4/D1 frames, A/B entry modes,
-  shared exits/costs/sizing/limits, source/config and full-trade parity gates.
-  Synthetic H4/D1 real-path parity passed; no actual-history parity/dice run yet.
-- [x] ~~User's Pepperstone MT5 chart exports organized~~: all 10 enabled pairs
-  have H4+D1 in `data/pepperstone/`; 20 originals preserved under `raw/`.
-  UTC-normalized actual broker candles, 2020-2025; no H1/M1/vendor mixing.
-  `backtest_data` in active YAML now selects this offline default with H4 checks.
-- [x] ~~User-run H4/D1 broker baseline~~: `20261021_202430` exists; user reports
-  poor results. Source/config and all enabled-pair coverage match current setup
-  (read-only validation; no actual-history parity run by the agent).
-- [x] ~~Entry-reason diagnostics~~: future trades record wick-touch/cross-candle
-  reasons from the signal candle. Latest report rebuilt without a backtest:
-  all 786 existing trades classified from verified saved config/source; original
-  trades, totals and params unchanged. Pattern summary/filter and CSV available.
-- [x] ~~Malaysia entry window and lot display~~: configurable new entries only,
-  09:15 inclusive–23:00 exclusive UTC+8; lots and UTC/Malaysia times in report.
-- [ ] DICE REMINDER — entry-hours rule changes the baseline. User must first
-  produce a NEW reference with current config; `20261021_202430` has no hours
-  filter and is no longer compatible with the active setup. Then run
+### Next (pending work; experiments need separate authorization)
+
+- [ ] Separately verify live API clock semantics before claiming live/offline
+  timing parity. `trader._gate_check` / `_refresh_crossover` still label broker
+  rate epochs UTC; `monitor._utc` formats raw epochs as UTC. Deal timestamps in
+  `records` / `account_store` need independent verification, not an assumed
+  candle-clock shift. Read-only code review identified these consumers; their
+  runtime/deal-clock impact remains unverified. No live code changed here.
+
+- [ ] DICE REMINDER — obtain a NEW reference with current config, broker H1
+  checks and `simulation_timing: position_accounting_v3`. The 31 saved runs
+  checked on 2026-10-24 predate that accounting marker. Then run
   `quant.dice_probe --real-only --reference backtest_results/<NEW_RUN>`.
   Only after full trade parity PASSES, proceed to the pre-declared B comparison.
-  No parity/random experiment run yet. Keep the reference/config fixed; choosing
+  No matching current-model parity/random result found; old dice A/B results
+  exist but use the superseded 2026-10-18 reference. Keep the reference/config fixed; choosing
   a pattern to disable is a new idea and requires separate validation.
   Full-range results have been inspected; 2023-2025 cannot now be called unseen
-  for ideas chosen from these reports. Risk/cost/account settings unchanged.
-- [ ] Widened-stop mode (code done 2026-10-20, ships OFF): `risk.stop_sizing`
-  trades a FIXED lot and widens the stop (and the target) until that lot
-  reaches `sizing_scope_usd.low`, instead of trading more lots. Next: write
-  the TESTLOG pre-declaration, then run the batch with `--widen-stop` and
-  compare against the same run without it (one change per run).
-- [x] ~~Optional lot increase when stop widening hits its cap~~ — implemented under
-  `risk.stop_sizing.increase_lots_if_widening_fails` (default OFF).
-- [] Add an entry logic of when cross from trend to opposite direction between EMA 20 and EMA 100
-- [] Can we have a way to detect flat market? flat market make me lose a lot, literally just keep losing for flat, consolidation market where ranging just happen like crazy
+  for ideas chosen from these reports.
+- [ ] Compare widened stops against a matching baseline.
+  No widened-stop-enabled run was found in the 31 saved params files checked.
+  Write the TESTLOG pre-declaration, then obtain matching user-run results
+  with and without `--widen-stop` (one change per run).
+- [ ] Research better protection against flat/ranging execution markets.
+  Execution-chart consolidation detection and its benefit remain unvalidated;
+  the existing bias-chart filter is not proof of execution-chart protection.
+
+### Cross-sectional momentum — core first, comparison later
+
+- [ ] Finalize the currency-ranking specification before implementation: fixed
+  currency universe (including USD), scoring method/common reference, ranking
+  timeframe, lookback, update schedule, strongest/weakest group sizes and
+  optional minimum score gap. Define ties, disjoint groups, insufficient history
+  and stale/missing data handling. Top 3 versus bottom 3 is an example, not a
+  locked setting. Keep ranking timing independent of execution/EMA-bias timing.
+- [ ] Implement a shared offline/live ranking and bias decision with selectable
+  `ema_only`, `ema_and_ranking`, and `ranking_only` modes. Ranking disabled must
+  preserve the existing baseline. Agreement mode blocks conflicting/neutral
+  directions; ranking-only replaces EMA bias, not entry-chart EMA requirements.
+  Keep the same bounce/recovery entry, exits, costs, sizing and risk guards;
+  support all existing execution/bias timeframe combinations. New controls
+  must be switchable and numeric settings editable. Use synchronized completed
+  broker candles available at decision time, never future prices. Invalid
+  ranking data blocks dependent entries, not open-position management. Save
+  decision-time scores, ranks, source timestamps, EMA/final direction and
+  rejection reasons now; build comparison reporting only after this core.
+- [ ] After the core, extend existing reporting to compare EMA-only baseline,
+  EMA + ranking agreement, and ranking-only direction. Show baseline trades
+  kept/removed, after-cost profit forgone and loss avoided (amounts, not merely
+  winner/loser counts), expectancy in R/USD, profit factor, portfolio maximum
+  drawdown, net profit, exposure and trade count. Also compare full variant
+  portfolio results: changed admissions affect later quotas/opportunities, so
+  deleting trades from a baseline is only a diagnostic, not a complete replay.
+  Optional separate comparison: prioritize simultaneous eligible candidates by
+  largest currency-strength score gap when slots are scarce, not by bid-ask
+  spread or eventual profit. Keep other settings/data/costs matched.
+- [ ] Before separately authorized experiments, freeze variants, parameter
+  ranges, sample requirements and pass/fail rules in TESTLOG. Check neighboring
+  lookbacks and cost sensitivity; flag INSUFFICIENT samples, including when
+  configured pair/portfolio entry caps and strict ranking shrink trade counts.
+  Agree genuinely unseen validation data: previously inspected 2023-2025,
+  including 2024-2025, cannot be relabelled an unseen holdout. No backtest is
+  authorized by this design or by adding comparison tooling.
 
 ### Verdict track (timebox: 2-3 more experiments, then decide)
 
-- [ ] Write the variance-ratio / Hurst script (spec §11.3). Never done.
-- [ ] Run both, record results in `docs/TESTLOG.md` (user runs them). Variance-ratio
-  remains unbuilt. For current broker H4/D1, use the matching user-run pin,
-  real-only parity then B comparison. `20261019_192501` is legacy H1/H4 only.
+- [ ] Write the variance-ratio / Hurst script (spec §11.3). No implementation found.
+- [ ] Run the variance-ratio / Hurst check after implementation and record its
+  results alongside the current-model dice comparison in `docs/TESTLOG.md`.
+  The dice baseline/parity/B steps are tracked above; old A/B runs do not
+  complete this current-model validation. Experiments require a user request.
 - [ ] Decide from the results:
-  - real result inside the random cloud AND variance ratio ≈ 1 → no edge from these entry rules / no trend to harvest on these pairs at H1/H4 → change market, timeframe or edge type — or stop.
-  - real result clearly above the cloud, or gross > 0 but costs kill it → structural (spread/swap is a big share of 15-20 pip stops) → wider stops via a longer timeframe, or a cent account.
+  - real result inside the random cloud AND variance ratio ≈ 1 → no convincing trend/entry edge found for the tested pairs and configured timeframes → consider another market, timeframe or edge type — or stop.
+  - real result clearly above the cloud, or gross > 0 but costs kill it → investigate the measured spread/swap burden and stop distances before proposing a separately tested change.
 - Standing rules:
   - each hypothesis → `docs/TESTLOG.md` BEFORE running, one change per run
   - keep the last ~3 years unseen for any new idea
   - do NOT drop or keep pairs based on this run (about 200 trades per pair; the best/worst pairs are within noise)
   - stopping is a valid result; the tooling/engine/ledger/report are reusable; keep it demo-only
 
+### Next research directions — recorded 2026-10-24 (ideas only)
+
+- [ ] Research Donchian breakout trend following as a separate, simple
+  benchmark against the current strategy. Define breakout windows, exits and
+  sizing before testing; use completed candles and no future-price information.
+- [ ] Research FX carry: investigate holding currencies with higher carry
+  against those with lower carry. Check historical carry data and actual broker
+  financing costs; today's swap rates cannot establish historical carry returns.
+  Include the risk of sharp losses when crowded carry positions unwind.
+- [ ] Research standalone cross-sectional momentum separately from the
+  ranking/bias integration tracked above: rank a pre-declared set of currencies
+  or instruments by past performance, then study stronger versus weaker ones.
+  Keep this distinct from trend following on each instrument's own price history.
+  Define ranking dates, holding periods and currency exposure before testing.
+- [ ] Compare different strategy families across different markets, not only
+  variations of the existing entry rules. Agree instruments, suitable data and
+  realistic costs first; broader market support is a research idea, not built.
+- [ ] Longer-term idea: a multi-strategy risk-premia system with **carry,
+  value and trend as separate components**, included in one overall portfolio.
+  Research value measures and their publication dates before designing signals.
+  Each component would have its own rules, enable/disable switch, editable
+  parameters, risk budget and standalone results before considering combinations.
+  Study combined exposure, correlations and drawdowns; separate strategies can
+  still lose together. Cross-sectional momentum is a further research candidate,
+  not automatically a fourth component or a replacement for trend.
+- Research process: consult relevant material in `resources/`, record source
+  and page/chapter, and distinguish published ideas from locally validated results.
+  Pre-declare each experiment in `docs/TESTLOG.md`, including the market universe,
+  costs, comparison baseline, pass/fail rules and genuinely unseen data. Previously
+  inspected 2023-2025 results are not an unseen holdout for these new ideas.
+- Status: future research only, not evidence of an edge or an approved redesign.
+  No strategy/config changes, data collection, backtests or trading authorized
+  by this note; experiments require a separate user request.
+
+### Methods for finding an edge LONG TERM
+- Start with a reason, not a pattern. Write down why the edge should exist and who is on the other side. Typical reasons are risk premia (trend, carry, value), behavioral biases (slow reaction, herding), and forced flows (hedging, rebalancing, session liquidity). If you can’t state the reason, expect noise.
+- Replicate published edges first. Reproduce known strategies like Donchian breakout trend following, carry, and cross-sectional momentum before inventing your own. - Good sources include Robert Carver’s Systematic Trading, Andreas Clenow’s trend-following books, AQR’s papers, and SSRN. Your first goal is to see whether a documented edge survives your costs and data.
+- Explore data with simple, conditional questions. For example: what is the average forward return after a 20-day breakout, by session, or by day of week? Measure effect size and sample size, not just whether it looks good. Hold out data you don’t touch.
+- Go for breadth. Run the same idea across many instruments (FX, gold, indices, oil, crypto) and timeframes. An edge that appears in many markets is far more credible than one that appears in a single pair.
+- Decompose the system. Test entry, exit, and sizing separately. A random-entry benchmark with your exits shows whether the entry adds anything. In most trend systems the exits, sizing, and diversification matter more than the entry signal.
+- Validate for robustness.
+1 Look for a parameter plateau, not a single peak.
+2 Use walk-forward or out-of-sample testing.
+3 Stress-test costs at 2× and 3×.
+4 Bootstrap your trades for a confidence range.
+5 Log every variant you try, because the more you try, the more your best result is inflated.
+6 Look where you can compete. Slow, small-capacity strategies and less-crowded markets suit an individual, as long as liquidity and costs are manageable.
+Forward-test small. Demo or tiny size checks that the live system behaves like the backtest. It is slow evidence, not proof.
+
 ### Parked until the verdict is in
 
+- [ ] Deferred four-pair evaluation — revisit only after the edge research
+  and a separate user backtest request. Follow the frozen TESTLOG design and
+  `data/four_pair_evaluation_20261024/evaluation_plan.json`: 2019 preparation,
+  score 2020-2025, minimum-trade/INSUFFICIENT gate before benchmark PASS, and
+  leave EURNZD/GBPCHF strategy results untouched. No experiment run yet.
 - [ ] Percentage-based sizing scope (future, not built): user envisages a
   configurable band such as 2%-3% instead of a fixed USD band, with dynamic
   lots. No automatic balance threshold or percentage-band implementation now.
   The old 1/3/5% lot-scale sweep is deferred. Existing balance scaling still
   checks a fixed USD band; it does NOT implement percentage bounds.
-- [ ] Go-live demo smoke: 0.01 lots EURUSD + one JPY pair → all 10; compare fills vs backtest. Rotate the demo password (it appeared in chat).
+- [ ] Complete strategy demo smoke: 0.01 lots EURUSD + one JPY pair → all 10;
+  compare fills vs backtest. Existing local demo records contain EURUSD/GBPUSD,
+  but do not verify the JPY/all-pair strategy check or fill comparison.
+  Demo password rotation remains unverified (it appeared in chat); do not
+  assume it is complete or inspect credentials to check it.
 
+## 2026-10-24 — Ranking/bias design agreed; comparison work deferred
 
+- Recorded the agreed flexible bias modes: existing EMA-only baseline, EMA and
+  ranking agreement, or ranking-only direction with the same entry trigger.
+  Entry-chart EMA rules remain separate from the optional EMA bias. Scoring,
+  universe, timing and data-failure details still need agreement; no ranking
+  implementation or performance validation is claimed.
+- Added core-first and deferred comparison TODOs. User confirmed that filter
+  quality must compare after-cost amounts, not just avoided losers versus
+  removed winners by count. Full portfolio comparisons and baseline-trade
+  diagnostics are distinct; strength-gap candidate priority is optional.
+- Retained standalone momentum research and all other unfinished tasks. Prior
+  inspected dates are not a fresh holdout; experiments need separate approval.
+- Documentation only. No code, configs or data changed. Tests, backtests,
+  terminal requests and orders not run.
+
+## 2026-10-24 — TODO cleanup; four-pair evaluation deferred
+
+- User deferred the prepared four-pair backtest while finding and validating
+  the system's edge. Moved that experiment from Next to Parked; it is unfinished,
+  not cancelled or completed. Any later run still needs a separate user request.
+- Completed collection, calibration, evaluation setup, exporter repair and
+  launcher tasks were already removed from TODO and recorded below. Removed
+  completed-implementation detail from remaining research/experiment items;
+  retained all unfinished validation, research and safety work.
+- Documentation only. No code, configs or data changed. Tests, backtests,
+  terminal requests and orders not run.
+
+## 2026-10-24 — Dedicated four-pair evaluation launcher added
+
+- Added `run-backtest-unseen.bat` for the frozen EURAUD/GBPCAD/AUDCAD/CADJPY
+  profile and isolated results folder. It refuses missing local profile files,
+  accepts no overrides, and preserves the backtest exit status after pausing.
+- `configs/scan-selection.yml` is unchanged. The launcher uses the separate
+  selection under `data/four_pair_evaluation_20261024/configs/`; 2019 preparation,
+  2020-2025 dates and costs remain those of the frozen profile.
+- Added `tests/test_backtest_launchers.py` using a substituted command and
+  synthetic profile files only; documented the launcher in `docs/RUNBOOK.md`.
+  Actual evaluation remains pending. No backtest, signals, terminal or orders run.
+- Validation: `uv run pytest -q tests/test_backtest_launchers.py` -> 15 passed.
+  `git diff --check` for the changed docs passed. Full suite not rerun.
+
+## 2026-10-24 — Evaluation setup, 2019 wiring and exporter clock fix completed
+
+- Completed and removed the three setup TODOs: isolated evaluation preparation,
+  preparation-year wiring, and the shared API history exporter's clock repair.
+  Actual evaluation is a separate pending experiment, not a result of this work.
+- `python/quant/mkdata.py`: verified Pepperstone API labels now normalize to UTC
+  consistently for date queries, warmup/coverage anchors, closed-candle checks
+  and CSV output. US DST, not fixed offsets or Europe DST. Auto selection has
+  explicit config/CLI overrides (`broker_api_clock`, `--broker-clock`); metadata
+  distinguishes original query labels from actual UTC. Live consumers unchanged.
+- `python/quant/broker_data.py`: offline verified-source bundles pin H1/H4/D1
+  and converters with checksums, preserve provenance/warnings, deduplicate only
+  identical OHLC/volume overlaps, and fail on conflicts/unverified inputs.
+  Added `mkdata --bundle-broker`; no dependency or new shared entry-point file.
+- New local-only bundle: `data/pepperstone_prepared_2019_2025_20261024/`.
+  All 17 pairs have 2019 preparation charts. Sixteen have evaluation history;
+  AUDJPY has only preparation history and remains parked. Original inputs were
+  not overwritten; no vendor substitution, gap fill or price resampling.
+- `python/quant/backtest.py`: optional configurable/disableable evaluation
+  boundaries retain indicator preparation but exclude earlier trades, sizing,
+  position/loss/quota state and scored equity/exposure. Validate closed prefix
+  candles on both chart roles; reject an end cutting an execution candle. CLI
+  supports explicit start/end and enable/disable. Terminal-boundary yearly marks
+  belong to the interval just ended; preparation never enters monthly metrics.
+  Final regression: enabled-window fills use their trading day, not the prior
+  preparation signal day, for daily admission. Engine hashes refreshed before
+  any actual-history experiment; frozen strategy/costs/verdict rules unchanged.
+- `python/quant/dice_probe.py` shares the same window/eligible fills and keeps
+  parity/reference window checks. `python/quant/ledger.py` includes the window
+  in comparison groups. Synthetic real/dice full-trade parity passes; no actual
+  parity/dice run. All six supported chart combinations have window coverage.
+- Frozen isolated four-pair configs: `data/four_pair_evaluation_20261024/configs/`.
+  Current strategy, risk, limits, benchmark, timeframes and base-cost assumptions
+  copied unchanged; only offline data/window settings and the four calibrated
+  pair costs differ. EURAUD/GBPCAD/AUDCAD/CADJPY only. Source/config/code/cost
+  hashes and fixed sample/pass/fail rules are in `evaluation_plan.json` / TESTLOG.
+  EURNZD/GBPCHF strategy results remain untouched; active settings are unchanged.
+- Input-only audit blocked scan/simulation functions and verified 51 charts,
+  104 unchanged source price files, exact price/volume union (zero roundtrip
+  price difference), all six profile files, 22 code hashes, converter closure
+  and preparation/position-feed coverage. No actual-history signals or results.
+- Validation: initial focused exporter/intake/backtest/dice/comparison tests
+  363 passed. Final full suite, including DST/report-bundle and boundary-fill-day
+  regressions: 877 passed, two pre-existing weekly-cap assertions failed (expect
+  5; active editable value is 0); no values reset to satisfy them. Command:
+  `$env:PYTHONPATH="python"; uv run pytest -q`.
+  `git diff --check` passed. No actual-history backtest, terminal connection,
+  orders, credential reads, report rebuild or strategy-result inspection.
+- Remaining risks: recent demo cost/current swap assumptions are not historical
+  financing or fill proof; observed-UTC swaps and H1 ordering remain approximate.
+  Known source/session/final-day warnings are retained. Separate live API clock
+  consumers were reviewed (trader.py 428/443, monitor.py 293, records.py 36,
+  account_store.py 146-147) but not modified or runtime-validated; tracked above.
+
+## 2026-10-24 — Four-pair broker cost calibration proposal completed
+
+- User chose broker calibration rather than shared defaults. Current Saturday
+  reads gave 12 stale pair snapshots; zero were accepted as live calibration.
+  Recorded current POINTS swaps and quote-clock uncertainty without promoting
+  stale spreads or stale USD conversion references into configuration.
+- Used recent broker tick history instead, with sampling/method declared in
+  TESTLOG before requests: Oct 21-23, 02:00 / 08:00 / 14:00 UTC, five minutes
+  per window. All 36 pair windows and three converter windows passed minimum
+  quote counts and tick/H1 clock-price consistency. 24179 pair observations,
+  26712 including converters. No strategy signals/returns or reserve results.
+- Method fixed beforehand: highest per-window P95, using the higher observed
+  value, rounded up to broker points. Proposed spreads: EURAUD 15 points / 1.5
+  pips; GBPCAD 18 / 1.8; AUDCAD 7 / 0.7; CADJPY 14 / 1.4. These estimates do
+  not cover every session, stress event or the full historical trading period.
+- Proposed ordinary-night swaps in USD per 0.01 lot (long / short):
+  EURAUD -0.090788284 / +0.035443296; GBPCAD +0.026260429 / -0.092161942;
+  AUDCAD +0.029051047 / -0.064899752; CADJPY -0.020989639 / -0.037449599.
+  Current published terms, converted with the last declared historical quote
+  window; not a reconstruction of 2020-2025 financing. Triple-day code 3 from
+  the broker is preserved. Commission 0 and slippage 0 remain explicit existing
+  Standard-account assumptions, not tick measurements or a new execution claim.
+- Local records: `data/pepperstone_cost_calibration_20261024/`, including raw
+  quotes, H1 clock checks, proposals, units, source hashes and an unchanged base
+  config snapshot. No active pair configs/costs/selection or shared code changed.
+- Validation: `$env:PYTHONPATH="python"; uv run pytest -q tests/test_spreadcheck.py`
+  -> 8 passed (existing synthetic cost conversion tests). Independent collected
+  data audit recomputed all 39 window statistics, clock/range checks, swap-unit
+  conversions, complete window sets and 80 evidence-file checksums; passed.
+  No full suite, backtest, dice, orders, credentials or account switches.
+- Cost sampling/proposal subtask complete. Isolated evaluation freeze/intake,
+  2019 preparation boundaries and shared exporter clock repair remain TODO;
+  the three broader tasks are not marked complete just because sampling passed.
+
+## 2026-10-24 — Standing rule for completed TODO tasks
+
+- Added persistent project instructions in `AGENTS.md`: whenever a listed TODO
+  task is completed, remove it from TODO and record completion in the dated log
+  below the full TODO section in the same change. Partial tasks retain only
+  unfinished work; unverified/pending tasks must not be marked complete.
+- Data collection is complete and already archived. Dataset intake and the
+  2019-preparation / 2020-2025 evaluation boundary are not wired yet, so those
+  TODO items remain. No trading code, configs or data changed.
+- Documentation only. No tests, backtests, terminal requests or orders run.
+
+## 2026-10-24 — Full 2019 preparation history collected for all 17 known pairs
+
+- User confirmed all 17 known pairs, including parked AUDJPY, not every broker
+  FX symbol. Collected direct Pepperstone-Demo H1/H4/D1 for actual UTC calendar
+  2019 into `data/pepperstone_all17_2019_export_20261024/`: 51 feeds, 136492
+  candles. All required USD conversion feeds are already among the 17 pairs.
+- Per pair: 259 Daily, 1554 H4 and 6216 H1 candles, except NZDUSD H1 has 6215.
+  Actual common first open: 2019-01-01 22:00 UTC (Jan 2 server time). Last H1
+  open: Dec 31 21:00 UTC; H4 Dec 31 18:00 UTC; D1 Dec 30 22:00 UTC.
+- Applied the verified broker-clock conversion only in this new collection.
+  API query labels were shifted to match actual UTC bounds before requesting
+  history. Preserved 102 original CSV/metadata files; corrected 51 feeds'
+  timestamps without changing price/volume strings. All 30906 candles shared
+  with the previous corrected dataset match OHLC and volume. No resampling,
+  filling, overwriting existing datasets or shared-source/config changes.
+- Candle consistency/coverage audit has no OHLC mismatches or uncovered higher
+  candles. One NZDUSD H1 open, 2019-01-28 18:00 UTC, remains absent after three
+  additional broker reads; surrounding hours return normally. H4/D1 OHLC still
+  matches. Recorded the warning and recheck evidence; no replacement invented.
+- This collection requests zero EXTRA pre-2019 warmup bars. Strategy warmup
+  guards/settings remain unchanged. Full 2019 is preparation data for a future
+  2020-2025 evaluation, not permission to score 2019 trades. Explicit intake and
+  evaluation-start enforcement remain TODO; no files were merged or promoted.
+- Validation: `$env:PYTHONPATH="python"; uv run pytest -q tests/test_mkdata.py tests/test_broker_data.py`
+  -> 61 passed. Independently checked all 204 normalized/raw feed checksums,
+  unchanged price/volume fields, 2019 UTC limits and clock/overlap evidence.
+  No full suite, backtest, dice, strategy-result inspection, orders, account
+  switches, trading-flag changes or credential reads. AUDJPY stays parked;
+  EURNZD/GBPCHF strategy results remain untouched. Initial requests needed no
+  automatic retry; three targeted missing-hour reads are recorded separately.
+
+## 2026-10-24 — Six additional FX pairs collected; broker clock verified
+
+- Completed the user-authorized data collection after TESTLOG pre-declaration:
+  EURAUD, GBPCAD, AUDCAD and CADJPY first group; EURNZD and GBPCHF reserved.
+  Pepperstone-Demo supplied direct H1/H4/D1 plus five required H1 converters:
+  23 feeds, 507109 candles, requested 2020-2025 with 100-bar configured warmup.
+  Actual common prefix starts 2019-08-11 21:00 UTC (2019-08-12 server time).
+- Local-only folder: `data/pepperstone_unseen_fx_2020_2025_export_20261024/`.
+  Source/export dates, raw bytes, SHA256 checksums, collection config snapshot,
+  timestamp evidence and quality audit are retained. Bounded retry handling was
+  used, but every history request succeeded without an additional attempt.
+- Caught incorrect UTC labels in the API exporter. Interpreting its epoch labels
+  as broker server clock, then using the existing New York + 7h / US DST rule,
+  matches all 186728 existing converter H1 candles; treating labels as UTC
+  matches zero. Corrected timestamps only in this new dataset. All 23 feeds'
+  original price/volume fields and all 46 raw files were verified unchanged.
+- Final quality audit: no cross-timeframe OHLC mismatches or uncovered higher
+  candles; all requested calendar years and required warmup present. Short
+  sessions/possible missing hours remain reported, never filled. EURNZD has
+  one fewer H4 candle than the other pairs; matching Daily OHLC does not prove
+  all hours are present. No claim of exact broker execution parity.
+- Validation: `$env:PYTHONPATH="python"; uv run pytest -q tests/test_mkdata.py tests/test_broker_data.py`
+  -> 61 passed (existing synthetic exporter/intake tests). Actual collected-file
+  checksum, unchanged-price, warmup and cross-chart audits also passed, with
+  session warnings. No full suite, backtest, dice experiment, strategy-result
+  inspection, orders or credential reads. No active source/config/data changes.
+- Collection is complete, not an approved experiment or ready-wired backtest.
+  Costs, evaluation design, explicit intake/pair setup and the shared exporter
+  clock repair remain pending. Reserve pairs have no strategy results inspected.
+
+## 2026-10-24 — TODO audit and completed TP experiment archived
+
+- Rechecked all 15 checklist tasks against code, TESTLOG, saved run metadata,
+  local data inventory and demo trade/journal summaries. Removed one completed
+  task; 14 remain open. TODO stays above every dated record.
+- No-fixed-TP experiment: user explicitly confirmed completion during this
+  audit; removed its checked TODO. Local reproduction is not verified: all 31
+  available saved runs still record positive fixed targets (2R–10R), and current
+  simulation code still creates a target. No TP-free result or comparison was
+  found locally. This is a user-confirmed completion, not a validated benefit
+  or a claim that the active strategy has no fixed TP.
+- Additional unseen-pair collection remains pending; broker H1/H4/D1 files
+  cover the same ten selected pairs. No new current-accounting dice reference
+  or parity/B result found; existing dice artifacts are from the old model.
+- Widened-stop implementation is complete, but no enabled saved experiment
+  was found. Basic bias flat filtering exists; improved execution-chart ranging
+  protection remains research. Variance-ratio/Hurst implementation, execution
+  and the resulting current-model verdict remain pending.
+- All five research directions remain open: Donchian, carry, cross-sectional
+  momentum, cross-market strategy-family comparison and combined carry/value/
+  trend. No completed study or implementation was found. General research
+  methods remain guidance, not completed tasks.
+- Percentage sizing bands remain unbuilt; existing percent-target sizing still
+  checks a USD band. Full demo strategy/fill validation and password rotation
+  remain unverified; partial demo records do not complete either task.
+- Documentation only. No tests, backtest/parity/dice process, data collection,
+  terminal connection, orders or credential reads performed.
+
+## 2026-10-24 — Check-time swap, duration exposure and broker export wiring
+
+- Fixed missed overnight charges when an H1/M1 exit crosses a UTC date within
+  an execution candle. Charges/events now follow observed check dates and the
+  recorded exit boundary, once per date transition. Midnight entries do not pay
+  the prior night. The existing Thursday triple and approximate UTC/gap model
+  remain; exact broker rollover/session/DST financing is not implemented.
+- New trades record exposure seconds within observed execution intervals.
+  Metrics use the full tape's available seconds, excluding gaps and clipping
+  short sessions. Portfolio filtering keeps this denominator; chart `bars_held`
+  stays unchanged. Reports distinguish duration exposure from legacy estimates.
+- Broker export planning respects the effective broker position-check setting:
+  active H1 checks no longer request unnecessary M1. Legacy settings and generic
+  exporter timeframe support remain. Strategy/config values and live code unchanged.
+- `simulation_timing: position_accounting_v3` prevents old accounting references
+  from validating new costs/admission outcomes. Saved runs are not rewritten.
+- Validation: `$env:PYTHONPATH="python"; uv run pytest -q` -> 837 passed,
+  two existing editable weekly-cap assertions failed (expect 5, active value 0).
+  Added 25 regression cases; `git diff --check` passed. Synthetic/fake MT5 only;
+  no actual-history backtest, dice experiment, report rebuild, data collection,
+  terminal connection or orders run.
+
+## 2026-10-24 — Broker H1 position checks, independent of entry/bias
+
+- Active `configs/_base.yaml` now uses broker H1 stops/targets/BE/trailing for
+  every selected pair, retaining H4 entries and D1 bias. No costs, sizing, live
+  management or inert preset settings changed. Legacy/research M1 stays intact.
+- Backtest and dice share the same verified H1 feed. Completed H1 extremes only
+  update the next hour's stop; ambiguous stop/target ties choose the stop.
+  Hourly range exits book at H1 close; gap exits retain the known open timestamp.
+  Missing H1 files/checksum mismatches/empty execution intervals fail instead of
+  silently using H4. Known partial sessions remain warned, not filled.
+- Runs pin the H1 extension and loaded check prices; converters use closed H1
+  rates. Old H4-only references require a new user-run baseline/parity check.
+  Reports distinguish H1 checks from unchanged execution-tape equity marks
+  (currently H4). Live trailing still uses current quotes; H1 is approximate.
+- Validation: `uv run pytest -q` with `PYTHONPATH=python`: 812 passed, two
+  pre-existing editable weekly-cap assertions failed (expect 5, active value 0).
+  Final focused backtest/broker/dice/report/comparison/performance/crossover
+  checks: 345 passed; `git diff --check` passed.
+  Synthetic fixtures only. No actual-history backtest, dice experiment, report
+  rebuild, data collection, terminal connection or orders run.
+
+## 2026-10-24 — Follow-up accounting and order-safety fixes
+
+- Cash flows use broker milliseconds when available. Broker collection brackets
+  history with account reads and skips inconsistent balance/credit snapshots.
+- Local entry refusals are recorded as `not_sent`, not uncertain broker sends.
+  Definite refusals/rejections may retry on the same bar; previous attempts stay
+  in the local audit. Unknown/partial/placed responses still block duplicate sends.
+- Roundtrip journaling failures no longer prevent its close attempt. Exit code 3
+  means the position closed but the journal is incomplete; code 2 still needs
+  operator attention for an open/uncertain position.
+- Validation: 219 related tests passed; full suite: 805 passed, two existing
+  config-value assertions failed. Active configuration values were not changed.
+  No backtests, MT5 connections or real orders run. Old uncertain records still
+  need broker verification; they cannot safely be assumed to be unsent.
+
+## 2026-10-24 — Local net performance and broker fill memory
+
+- Added shared Sharpe/Sortino/Calmar calculations and Sharpe interpretation bands.
+  Settings are optional/editable; no active configuration values changed.
+- Added account/server/type-separated JSON storage (no database/dependency),
+  broker deal reconciliation, snapshots, and JSON/CSV/HTML exports. Actual entry
+  intents are flushed before send; uncertainty blocks new entries, not management.
+- Net live equity includes broker costs without deducting spread/slippage twice;
+  external capital is separated using labelled cash-flow-adjusted estimates.
+  Strategy deal totals are separate; strategy ratios are not invented.
+- New backtest marks accrue entry commission, short spread valuation, and swaps;
+  old or incomplete cost-timed equity remains N/A. Unit tests use controlled data
+  and mocked MT5 only. No backtest process or terminal trading was launched.
+- Validation at initial implementation: 224 related tests passed; full suite: 710 passed,
+  six failures outside this feature (two active-config value assertions and
+  four exit-timing assertions following separate edits during this session).
+  Those settings/timing edits were not reverted to satisfy tests.
+
+## 2026-10-24 — Execution-price, conversion and admission repairs
+
+- Fixed normal/M1 gap stops to use the available opening bid/ask plus configured
+  slippage, never an unreachable stop price. Known execution opens are checked
+  even if the first M1 candle is absent. Gap targets conservatively fill at TP;
+  ambiguous range stop/target ties still choose the stop.
+- Short protective orders now trigger on ask, with spread charged exactly once.
+  Breakeven buffers remain configured in pips and are converted to price units
+  in both backtest and live trailing decisions. Live order/restart plumbing unchanged.
+- Entry risk uses rates available at entry; realized USD profit uses rates known
+  at exit. Legacy H1 converter closes are availability-stamped, and new open
+  positions are valued with current known conversion rates, spread and timed costs.
+  Missing cross-conversion marks fail instead of inventing account values.
+- Equity uses known opening prices at gaps, not pre-entry closes. A new open
+  supersedes the previous close at a shared boundary. Converter updates can move
+  USD equity independently of the traded pair's price. Legacy rows keep their
+  initial-risk mark fallback; old saved artifacts are not rewritten.
+- Main backtest/dice paths simulate independent candidate lifecycles and then
+  admit entries chronologically. Rejected attempts consume no pair slots, fill-day
+  allowance, portfolio quota or loss state. Optional balance sizing is performed
+  inside admission using only accepted realized exits; sizing rejects use no quota.
+  Previously gated scaling/strategy combinations remain gated, not enabled here.
+  Unfinished lifecycles stay visible through tape end, labelled `end-of-data`;
+  this is a terminal valuation, not a claim of an actual broker close.
+- `simulation_timing: execution_prices_v2` separates these runs from earlier
+  baselines and dice references. User must produce a new matching baseline;
+  old results cannot validate the corrected fills/admission/account calculations.
+  Coarse candles still cannot establish actual within-candle ordering/fills.
+- Validation: 784 passed, two existing editable-config cap assertions failed
+  (expect 5, active setting 0). Config values unchanged. Command:
+  `$env:PYTHONPATH="python"; uv run pytest -q --tb=short`.
+  Synthetic candles, calculation fixtures and mocked MT5 only; no actual-history
+  backtest, data download, terminal connection, orders or report rebuild run.
+  Full-history performance of independent-candidate replay is not benchmarked.
+
+## 2026-10-24 — Look-ahead timing repairs
+
+- Backtest trailing stops now use only previously completed check rows.
+  Current-row highs/lows update the next row's stop, for both sides and
+  H1/H4/Daily execution with coarse or M1 checks. Ambiguous stop/target ties
+  still choose the stop. Signals, strategy settings and configured costs unchanged.
+- Range-based exits book at check-row completion in every source mode;
+  confirmed crossover/open-price exits retain their open timestamp. Legacy
+  equity close marks are delayed to candle completion like broker marks.
+- Balance scaling uses recorded initial risk/lot, never the eventual P/L or
+  another trade's risk. Old rows without valid initial risk remain unscaled
+  with a warning. Existing live execution/restart safeguards were not changed.
+- New `simulation_timing: closed_rows_v1` metadata separates corrected runs
+  in saved comparisons and rejects older dice references. Old artifacts remain
+  untouched; a new user-run baseline and parity check are required. Candle
+  checks still cannot recover true intrabar price order or exact fill times.
+- Validation: 751 passed, two existing tests still pin editable weekly caps to
+  5 while current settings use 0; configs left untouched. Command:
+  `$env:PYTHONPATH="python"; uv run pytest -q`. `git diff --check` passed.
+  No actual-history backtest, data download, terminal request or orders run.
+  Additional-pair out-of-sample collection is recorded above as pending only.
+
+## 2026-10-23
+
+- Added `strategy.open_trade.use_crossover_exit` (off when absent; enabled in
+  the active base and crossover preset without changing other tunable settings).
+  A confirmed opposite entry-EMA cross exits at the next backtest open with
+  costs, or next available live quote, independent of filtered bias/entry guards.
+  Earlier protective exits take priority. No immediate reverse entry on a close
+  pass. Live closes target the hedging ticket and current remaining volume;
+  pending sends are persisted and uncertain outcomes require reconciliation.
+  Existing SL/TP/trailing remain the fallback; no terminal or actual backtest run.
+  Validation: 294 targeted tests passed, one obsolete repository-config equality
+  assertion excluded. Tests use synthetic candles/fake MT5; `git diff --check` passed.
+
+- Automatic post-backtest comparison: highest final net profit within a configurable
+  MTM drawdown ceiling (defaults to the existing benchmark ceiling, currently 50%).
+  `backtest_comparison.enabled` and CLI switches control reporting only; no signal,
+  cost, sizing or live-trading rules changed. Actual loaded price fingerprints,
+  requested pairs, feeds/chart roles, starting balance, effective costs and sizing
+  budgets define comparable groups. Failed/partial/legacy unverified runs cannot win.
+- `comparison.json`, console deltas and an HTML comparison section show the
+  previous comparable run and previous best. A managed `BEST.txt` marks the current
+  qualifying winner in each group, without renaming folders or rewriting old HTML.
+  Marker publication is locked/atomic and never overwrites user-authored markers.
+  New comparisons establish a verified baseline; no old runs were reprocessed.
+  Validation uses synthetic saved artifacts and mocked execution, not market data.
+- Validation: 146 comparison/ledger/report/backtest tests passed; full suite
+  619 passed, with three existing repository-config assumptions failing (preset
+  equality and fixed caps). These do not indicate invalid user-tuned settings.
+  Config values were not reset. No actual-history backtest or live process run.
+- Recorded the user's config policy in AGENTS.md: settings may change anytime;
+  exact-value tests belong in controlled fixtures, not active repository configs.
+
+- Added opt-in `_base_crossover.yaml` and `--base-config` in backtest/monitor;
+  existing active/preset settings were not edited. H4/H4 EMA20/100 memory,
+  two actual fills per cross (configurable), identical fresh recovery entries,
+  no same-pair overlap, stop 1.5 ATR / trail 1.5R / target 10R. Hours, blackout,
+  daily-loss and weekly loss guards retained; entry/portfolio caps off.
+- Shared closed-bar incremental indicators and recovery memory survive rolling
+  history/restarts. Live counts broker-confirmed distinct positions since the
+  cross, uses isolated magic/memory, and writes pending sends before ordering.
+  Missing history/ambiguous sends fail closed; the panel shows cross time/usage.
+- Crossover backtests simulate independent candidate lifecycles, then admit
+  actual fills globally (including weekly halts) before using attempts/slots.
+  Remaining positions are marked at tape end, labelled `end-of-data`.
+  Existing strategy paths retain their old behavior. Scaling+crossover refused.
+- Tests: full suite 571 passed, two existing config assertions expect weekly
+  cap 5 while the active/older presets contain 0; left those files unchanged.
+  No backtest or terminal/live process run. H4-only trailing remains coarse.
+
+## 2026-10-22
+
+- **Portfolio weekly entry cap: 5 across all pairs.** Added configurable
+  `limits.max_trades_per_week` to active config and both presets; 0 disables it,
+  absent keys preserve old behavior. UTC Monday 00:00 resets the quota (08:00
+  Malaysia). Accepted entries consume slots; closes do not return slots and
+  existing positions remain managed. Backtest/dice use the same chronological
+  admission pass, so rejected candidates consume neither daily nor weekly quota.
+  Saved run params and reference validation include the cap. Balance scaling
+  with admission limits remains refused until a unified sizing pass exists.
+  - Live recovers our-magic counts from broker history and saved confirmed-entry
+    state. Successful sends update quota immediately, including missing-position
+    discovery, before another pair reuses the history snapshot. Decisions persist
+    per pair; unavailable history blocks entries, plans/failed sends consume no
+    slots. Restart, UTC rollover, validation, presets, quota interactions, dice
+    reference mismatch and continued management covered by synthetic tests.
+  - **496 passed** with `$env:PYTHONPATH="python"; uv run pytest -q`;
+    `git diff --check` passed. No actual-history backtest, report rebuild,
+    terminal connection or orders run. No costs, signal timing or sizing changed.
+  - Separate pre-existing execution risk left unchanged: `trader.send_entry`
+    recognizes DONE only, not DONE_PARTIAL; a partial fill can be reported as a
+    failure and retried. Partial-fill handling needs its own execution fix.
+
+- **Removed stale strategy-value assumptions from the role-period test.**
+  `tests/test_panel.py` now verifies positive integer periods and exact propagation
+  from each config's bias/entry sections instead of pinning editable EMA/ATR
+  settings (including the obsolete H1 preset EMA50 expectation). Kept legacy-key
+  checks and added a synthetic nondefault-period collision regression; no tests
+  deleted. Strategy, configs and trading code unchanged. **479 passed** with
+  `$env:PYTHONPATH="python"; uv run pytest -q`; `git diff --check` passed.
+  No backtest, report rebuild, terminal calls or orders run.
+
+- **D1 bias / H1 execution supported.** Added H1->D1 to shared timeframe
+  validation and actual broker-chart selection, including the legacy-source
+  requirement for an exported Daily chart (no Daily resampling fallback).
+  Existing H1 checks, closed converters, marks, costs, sizing, recovery entry,
+  limits and restart protections remain. New folders label this combo `_D_H1`.
+  Active config and presets were not changed. Report/dice/live chart selection
+  follows the same roles; saved references still require exact timeframe parity.
+  - Synthetic tests cover Daily completion boundaries, future-candle isolation,
+    short/DST day availability, Daily warmup, missing Daily refusal, no resampling,
+    H1/D1 real-path trade parity, report charts, naming and ledger compatibility.
+    No actual-history backtest, parity/dice experiment, report rebuild, terminal
+    connection or orders run. Full suite: **477 passed, 1 unrelated failure** with
+    `$env:PYTHONPATH="python"; uv run pytest -q`. The unchanged assertion at
+    `tests/test_panel.py:117` expects slow EMA50 in `_base_h1h4.yaml`, which now
+    contains EMA100; that preset and assertion were left untouched by this change.
+    All new-combination tests passed; `git diff --check` passed.
+
+- **Timeframe-labelled backtest folders.** New runs append `_H4_H1` (H4 bias,
+  H1 entry) or `_D_H4` (Daily bias, H4 entry) to the existing Malaysia timestamp,
+  automatically from resolved timeframes. Existing directories and dice stamps
+  untouched; config continues to record Daily as D1. Naming/ledger regression
+  tests added. No strategy, costs, sizing, order behavior or saved results changed.
+  No backtest, report/ledger rebuild over saved runs, terminal calls or orders run.
+  Verification: **469 passed** (`$env:PYTHONPATH="python"; uv run pytest -q`);
+  `git diff --check` passed.
+
+- **Report chart Previous/Next navigation.** Popup buttons and Left/Right keys
+  follow the current filtered table order, update trade details/counter, retain
+  the selected timeframe when available, and disable at first/last trade.
+  Existing popup reused; missing charts and empty/changed filters clear stale
+  charts safely. Keyboard shortcuts leave inputs and modifier shortcuts alone.
+  - Added Node fake-DOM/Plotly runtime tests for navigation, filters, boundaries,
+    missing charts, blocked/closed/reopened windows and timeframe fallback, plus
+    report-input preservation. **466 tests passed** with
+    `$env:PYTHONPATH="python"; uv run pytest -q`. Not visually browser-tested.
+  - Rebuilt only `backtest_results/20261022_205535/report.html`; verified all
+    original non-HTML artifact SHA256 hashes unchanged, including trade CSVs,
+    params, summaries and equity. No strategy, costs, sizing or execution change.
+    No backtest, terminal connection or orders run. Other reports stay unchanged.
+
+- **Separate demo/real order launchers; generic launcher retired.** Added
+  `start-trader-demo.bat` / `start-trader-real.bat`, each opting into orders for
+  exactly its selected account. `--dry-run` can override for plans only; final
+  account/journal arguments cannot be redirected by forwarded flags. Global
+  dry-run default, USE_REAL, strategy/cost/risk settings and `.env` untouched.
+  - Account selection narrows existing enabled flags, never enables an account
+    or falls back to the other account. Both may be enabled without loading or
+    trading the unselected one. Login, server and actual MT5 demo/real mode are
+    verified after initialize and immediately before entries/SL modifications;
+    unavailable/mismatched information fails closed, without stamping an entry.
+  - Separate demo/real journals; existing per-tag restart and weekly state kept.
+    A workspace OS lock prevents two panel/trader instances. Stop one before
+    starting another; other workspaces/tools/manual terminal switches remain
+    outside this lock and must not share the active terminal.
+  - Synthetic tests suppress dotenv loading; account selection, disabled flags,
+    broker-type mismatch, account switching during request construction, no-send/
+    no-stamp behavior, CLI dry override, lock release and static launcher flags
+    are covered. No launcher, terminal/API connection, orders, backtest or report
+    rebuild run by the agent. Verification: **460 passed** with
+    `$env:PYTHONPATH="python"; uv run pytest -q`; `git diff --check` passed.
+
+- **Separate wick switch for remembered entry.** `strategy.entry.recovery_use_wick`
+  defaults true in all three base configs, preserving existing behavior. False
+  disables touch-based arming and refresh only; qualifying closes below EMA20
+  (LONG) / above EMA20 (SHORT) still qualify. Trigger, expiry, crossover/EMA100
+  cancellation, costs, risk and restart guards unchanged. Shared core covers all
+  callers. Tests: **432 passed** (`$env:PYTHONPATH="python"; uv run pytest -q`),
+  including mirrored wick enable/disable, close-only setups, disabled refresh and
+  invalid boolean. No backtest, terminal call, orders or report rebuild run.
+
+- **Remembered-pullback entry + Pepperstone H1 extension.** New optional
+  `use_recovery_entry` mode (OFF) replaces other entry-candle gates. Configurable
+  expiry defaults to four subsequent candles; fresh touches/closes reset it.
+  A later close beyond the immediately previous high/low triggers, with no extra
+  EMA-position/body filter. Entry-EMA cross/tie clears pending state; configurable
+  `recovery_cancel_beyond_slow` controls slow-EMA-close cancellation (default ON).
+  Closed-history replay consumes each trigger and is shared by offline, dice real,
+  panel and live gate. Existing risk/cost/next-open/limits/restart guards unchanged;
+  pending cancellation never closes open trades. New report reason: recovery_break.
+  - Imported all ten selected Pepperstone H1 exports, normalized with the existing
+    US-DST server-clock rule. Originals archived byte-for-byte; vendor data and
+    original H4/D1 manifest untouched. Separate `manifest_h1.json` pins H1 to the
+    base dataset, preserving saved H4 identities. Per pair 37346 H1 bars, except
+    NZDUSD/USDCHF 37345, 2020-01-02 through 2025-12-31 server dates.
+  - H1 matches every supplied H4 OHLC exactly. 13 partial H4 periods per pair
+    (14 NZDUSD/USDCHF) have fewer than four hourly candles; recorded as warnings,
+    not assumed to be missing trading hours. No filling/resampling/trimming.
+    Initial strict import refused partial periods before publishing/moving inputs;
+    the final import retains them with explicit coverage warnings.
+  - Broker offline H1/H4 uses actual exported charts, H1 checks/closed converters/
+    drawdown marks and bar-close exit booking, with no vendor/M1 substitution.
+    Reports and dice source/parity checks pin the extra H1 manifest. Active
+    timeframes, old strategy switches, sizing and costs were not changed.
+  - Synthetic tests cover mirrored setups/triggers, delayed/latest-edge breaks,
+    strict boundaries, refresh/expiry/consumption, crossover and cancellation,
+    legacy-off equivalence, fake-MT5 shared gate, H1 archive/identity/failure/gaps,
+    actual-chart loading, H1 real-path parity and report labels/charts.
+    No actual-history backtest, parity/dice experiment, report rebuild, terminal
+    call or orders run. Verification: **427 passed** with
+    `$env:PYTHONPATH="python"; uv run pytest -q`; `git diff --check` passed.
+    Input-only validation verified all 373458 normalized H1 bars' file hashes,
+    raw archive hashes, required charts/converters, unchanged base manifest and
+    inactive recovery switch. H1 extension SHA256:
+    `8628b43cc3287df371c6dc2bc2aeec1ab344e99fb2708b0ebbf5a2b90aef50ba`.
+
+- **Optional pullback cross into the EMA gap added; ships OFF.**
+  `strategy.entry.w1_cross_into_gap: false` in active `_base.yaml` and the
+  H4/D1 preset. SHORT: aligned downtrend, candle opens below EMA20 and closes
+  strictly above EMA20/below EMA100; LONG mirrors it. Closed signal candle,
+  existing next-bar offline execution and live closed-bar gate. Any enabled
+  W1 pattern qualifies; existing pattern switches are preserved. Uses configured
+  EMA periods. Wick-only touches and equality do not qualify; wick-depth setting
+  applies only to the original patterns. Other gates remain enforced; HR2
+  conflicts with the pullback candle direction and must remain off to use it.
+  - Shared signal core serves backtest, dice real path, panel and live gate.
+    Reports recognize `pullback_cross` as Pullback cross into EMA gap, including
+    summary/filter and verified historical reconstruction. SL/TP, costs, sizing,
+    entry hours, trade limits and restart guards unchanged. No claimed improvement.
+  - Tests: **397 passed** (`$env:PYTHONPATH="python"; uv run pytest -q`).
+    Synthetic LONG/SHORT, strict boundaries/alignment, optional and combined
+    switches, legacy-off equivalence, HR2 conflict, report label and fake-MT5
+    shared gate checked. No actual-history backtest, parity/dice experiment,
+    report rebuild, browser test, terminal call or orders run.
+  - Enabling is a new experiment: pre-declare before a new user-run baseline
+    and matching parity gate. Dice compares exact saved strategy settings;
+    adding even a false key can require a new matching reference. Flat-market
+    detection remains pending research, not part of this change.
 
 ## 2026-10-21
 

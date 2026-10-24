@@ -2,6 +2,20 @@
 
 Status: DRAFT v1.0. Every rule below is a **hypothesis to be tested**, not a proven edge.
 
+Opt-in crossover variant (2026-10-23): `configs/_base_crossover.yaml`, selected
+explicitly with `--base-config` in backtest/monitor; `_base.yaml` is unchanged.
+Both bias and signals use closed broker H4 candles and EMA20/100. A genuine
+post-warmup crossover starts a remembered direction and two actual-fill attempts
+(configurable), reset by an opposite cross even while a trade is open. Initial
+alignment and a temporary neutral bias do not grant/reset attempts. Each fill
+needs a fresh existing recovery setup; same-pair overlap is forbidden. Stops
+start at 1.5 x ATR7, trail at 1.5R, and target 10R. Hours, blackout and loss guards
+remain; entry-count and portfolio/currency caps are off. Live state persists
+indicators/pullbacks/crosses and reconciles actual entries since the cross;
+unknown history/order outcomes block entries. Offline candidates are admitted
+together so rejects consume no allowance. Tape-end positions are explicitly
+marked `end-of-data`; H4 trailing is coarse. No performance verdict yet.
+
 Active offline source (2026-10-21): user-supplied Pepperstone MT5 H4/D1 chart
 exports in `data/pepperstone`, broker dates 2020-2025. Server timestamps are
 normalized using Pepperstone's US-DST clock; broker OHLC is not resampled.
@@ -358,6 +372,13 @@ Demo forward test (2-3 months) checks plumbing (fills, timing, slippage, swaps) 
 
 ## 13. Execution notes (later)
 
+- Launcher update (2026-10-22): the generic `start-trader.bat` referenced in the
+  historical implementation note below is retired. Use `start-trader-demo.bat`
+  for demo orders, or `start-trader-real.bat` for real-money orders, one at a time.
+  Both select/check one enabled account without changing enable flags. They
+  disable dry-run only for that invocation; direct CLI/config remain dry-run.
+  Per-account journals and a workspace single-instance lock separate execution.
+  See RUNBOOK before starting; no actual terminal/order verification is claimed.
 - Python on Windows with the MT5 terminal open and logged in. Evaluate once per H1 bar close for all pairs.
 - Every order carries a server-side SL and TP. The trailing stop is applied by modifying the SL each bar. On startup, reconcile open positions with system state.
 - Log every decision with its reason (including which rule vetoed a candidate). Kill switch: the daily, weekly and drawdown limits in 8A, plus a manual stop file.
@@ -397,6 +418,35 @@ Demo forward test (2-3 months) checks plumbing (fills, timing, slippage, swaps) 
 
 ---
 
+## Optional remembered-pullback entry (2026-10-22; ships OFF)
+
+`strategy.entry.use_recovery_entry` selects a separate entry mode replacing the
+other entry-candle gates. Existing regime bias, costs, risk, next-open execution
+and admission limits remain. It uses the configured entry fast/slow EMAs; the
+active config is 20/100. LONG requires fast above slow; SHORT mirrors it.
+
+1. A close below fast EMA or a wick touching/crossing fast EMA arms LONG; reverse
+   for SHORT. Opening side is unrestricted. A setup cannot trigger on itself.
+   `recovery_use_wick` defaults true; false disables touch-based arming/refresh
+   only, preserving qualifying close-based setups in both directions.
+2. While armed, a later closed candle strictly exceeding the immediately prior
+   candle's high (LONG) or low (SHORT) triggers, regardless of its EMA position.
+   A next-candle trigger is allowed. Always compare to the latest prior candle.
+3. `recovery_expiry_bars` is configurable, default four subsequent candles.
+   A fresh qualifying candle refreshes expiry. It must be a positive integer
+   smaller than available entry history. A trigger consumes the setup, including
+   when subsequent execution/admission guards refuse that signal; no queue.
+4. Entry EMA crossover/tie clears pending setups. Realignment requires a fresh
+   setup. `recovery_cancel_beyond_slow` (default true) also clears a setup on a
+   close strictly past slow EMA against the trade; false disables that condition.
+5. Execution is at the next candle open, not at the breakout threshold or the
+   signal close. Pending cancellation does not liquidate open positions. Existing
+   restart bar stamps remain responsible for double-send prevention.
+
+Shared closed-history replay serves offline, dice real-entry, panel and live
+checks. Reports label these signals `recovery_break`. This is an experimental
+entry alternative, not a validated flat-market filter or profitability claim.
+
 ## 16. Variant strategy V-D1: Daily bias / H4 sweep entry ("H4/Days")
 
 Recorded 2026-10-19, **not yet backtested**. A second strategy spec on the SAME
@@ -425,13 +475,28 @@ one is active — the engine reads `configs/_base.yaml` ONLY:
 - H4 EMA20/EMA100 must agree with the Daily bias: W1's alignment check — the
   entry chart's fast/slow EMA relation must point the same way as the regime
   bias (`entry_ema_fast_period`/`entry_ema_slow_period` set the H4 EMA lengths here: 20/100).
-- Setup + trigger in one: the last CLOSED H4 candle must close on the trade
-  side of EMA20 (above for long; below for short). Enable either or both:
+- Setup + trigger in one: the last CLOSED H4 candle qualifies through any
+  enabled W1 pattern. The original two close on the trade side of EMA20:
   `w1_touch_from_trend_side` = open on the trade side, wick touches across
   EMA20; `w1_cross_from_other_side` = open on the opposite side and close back
   on the trade side. Each switch applies to both buys and sells. An exact
   touch counts with `w1_pen_atr: 0.0`; raise it to demand a deeper reach.
   EMA100 matters for H4 alignment, not for the candle's touch.
+- Optional third pattern: `w1_cross_into_gap` (default false). SHORT: EMA20
+  below EMA100, candle opens strictly below EMA20 and closes strictly between
+  EMA20 and EMA100. LONG: EMA20 above EMA100, candle opens strictly above EMA20
+  and closes strictly between EMA100 and EMA20. Sell/buy in the existing bias
+  direction; no wait for a return across EMA20. A wick alone or equality at
+  either closing boundary does not qualify. Uses the configured entry EMA
+  periods and their signal-close values, not hardcoded lengths. `w1_pen_atr`
+  does not apply to this pattern. All three pattern switches are independent;
+  with `use_w1: true` and all patterns off, W1 blocks entries.
+  Other enabled gates still apply: HR2's candle-direction requirement conflicts
+  with this pullback candle; keep HR2 off to use it. `use_w1: false` bypasses
+  the entire W1 gate, not just this new pattern.
+  Diagnostic label: Pullback cross into EMA gap. No SL/TP, cost or limit changes;
+  an earlier entry does not guarantee a better result. Research is unvalidated;
+  enabling it requires a new declared comparison and matching dice reference.
 - Entry order: enter in the Daily bias direction at the NEXT H4 bar open after
   the candle closes — the execution model is unchanged (signal on bar t, fill
   at t+1, costs on top; sections 3, 6, 9, 10 apply as written, with all ATR
@@ -453,6 +518,16 @@ one is active — the engine reads `configs/_base.yaml` ONLY:
   `limits.max_trades_per_pair_per_week: 2` (0 = off), UTC Monday-start week.
   Rejected signals/orders and dry-run plans do not count; partial fills of
   one live position count once. Counts recover from broker history on restart.
+- **Max 5 actual entries per week across ALL pairs:**
+  `limits.max_trades_per_week: 5` in active config and both presets (0 = off).
+  UTC Monday 00:00 resets the quota (08:00 Malaysia). Only accepted entries
+  consume slots; closing a trade does not return its slot. Open positions
+  continue SL/TP/trailing management after the cap. Live counts only our magic
+  on the selected account, using broker history plus saved confirmed fills so
+  a shared history snapshot cannot let several pairs take the last slot.
+  Backtest daily/weekly/pair/portfolio guards share chronological admission;
+  rejected candidates consume no quota. Balance-scaling backtests with this
+  cap enabled are refused until sizing and admission share one pass.
 - **A loss disables further trading for that pair for the rest of the day:**
   `limits.disable_pair_after_daily_loss: true` (false = off). A fully closed
   position's net loss after costs blocks its pair until the next UTC day.

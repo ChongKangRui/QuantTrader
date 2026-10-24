@@ -1,21 +1,13 @@
-# ── PRESET · H4->D1 (the "new strategy": Daily bias, H4 sweep entry) ─────
-# Copy of configs/_base.yaml, retuned 2026-10-19. NOT active while named
-# `_base_*` (the engine reads `configs/_base.yaml` only).
-# NOTE: this preset still uses percent sizing (true); the active _base.yaml
-# currently uses fixed-fence sizing (false). Check this before copying it.
-# Apply:   Copy-Item configs/_base_h4d1.yaml configs/_base.yaml -Force
-# Revert:  Copy-Item configs/_base_h1h4.yaml configs/_base.yaml -Force
+# PRESET: Daily trend, H4 recovery entry. Active config: configs/_base.yaml.
+# Parameters copied from backtest_results/20261022_234758_D_H4_best_result_so_far/params.json.
+# Older H1/H4 preset: configs/_base_h1h4.yaml.
 #
-# How the spec maps to these knobs:
-#   Daily bias (EMA20 vs EMA100, flat if close crosses EMA100 against it)
-#     -> B1 on the D1 regime chart + HR1 (close-based, 0.3 ATR band) ≈ flat rule
-#   H4 EMA 20/100 must align with the Daily bias
-#     -> W1's alignment check (entry chart fast/slow must agree with regime bias)
-#   On a closed H4 candle, price touches EMA20 and closes back on the trend
-#   side. Either opening side may qualify; each pattern has its own switch.
-#   Enter in the Daily bias direction after the H4 candle closes
-#     -> signal on closed H4; enter at the next H4 open
-#   RR 1:2.5 -> tp_mult 2.5;  trailing -> off, evaluated as its own run later
+# Saved setup:
+#   Daily EMA20/100 bias with HR1 and 0.3 Daily ATR minimum EMA separation.
+#   H4 EMA20/100 alignment; remember a close inside the EMA gap, then
+#   trigger when a later closed H4 candle breaks the previous candle's edge.
+#   Signal on closed H4; enter at the next H4 open in the Daily bias direction.
+#   Target 4R; breakeven at +1R with zero buffer; trailing off.
 #   Max 2/pair/week + loss disables the pair for the day
 #     -> limits.max_trades_per_pair_per_week / disable_pair_after_daily_loss
 
@@ -72,13 +64,20 @@ strategy:
                                # 100 Daily bars may not fully settle EMA100
 
   # ════════════════════════════════════════════════════════════════════
-  # ENTRY · H4 candle touches/crosses EMA20, then closes on the trend side
+  # ENTRY · remember an H4 close in the EMA gap, then recover past the prior edge
   # ════════════════════════════════════════════════════════════════════
   entry:
     # These periods always apply to timeframes.execution (H4 here).
     entry_atr_period: 7         # H4 ATR period for entry checks and stop size
     entry_ema_fast_period: 20   # EMA touched/crossed by the entry candle
     entry_ema_slow_period: 100  # H4 trend alignment: fast below slow = sell
+
+    # Separate mode: remember a pullback, then close past the previous candle's edge.
+    use_recovery_entry: true       # replaces W1/E1/HR/EXT entry filters, not risk/bias guards
+    recovery_use_zone_memory: true  # remember closes in EMA gap; false = timed mode
+    recovery_use_wick: false        # timed mode only: allow wick touches to arm/refresh
+    recovery_expiry_bars: 5         # timed mode only: subsequent candles allowed; fresh setups reset expiry
+    recovery_cancel_beyond_slow: false  # both modes: keep existing setups beyond slow EMA
 
     # ── E1-setup · older pullback rule: NOT in this spec -> OFF ───
     use_e1_setup: false     # auto-passes; knobs below stay live (never delete)
@@ -87,7 +86,7 @@ strategy:
     breakdown_atr: 1.0      # (unused while off)
 
     # ── E1-trigger · older entry trigger: NOT in this spec -> OFF ─
-    use_e1_trigger: false   # entries fire on the W1 sweep instead
+    use_e1_trigger: false   # entries use recovery mode instead
 
     # ── HR2 · candle conviction: not in the spec -> OFF ─────────────
     # Re-enable to require the right color + min body share on the sweep candle.
@@ -109,24 +108,26 @@ strategy:
     pivot_n: 3              # pivot confirmation bars, left + right
     hl_guard: false         # HR4 extra: no NEW lower-low (LONG) since the swing
 
-    # W1: H4 EMA20/EMA100 must agree with Daily trend. The CLOSED H4 candle
-    # must end back on the trend side of EMA20. SHORT: below; LONG: above.
-    # Turn either pattern on/off separately. With both off, W1 blocks entries.
-    use_w1: true                      # false = skip this entry check entirely
+    # W1: H4 EMA20/EMA100 must agree with Daily trend. Any enabled pattern qualifies.
+    # First two close on the trend side; pullback cross closes between the EMAs.
+    # With all three patterns off, W1 blocks entries.
+    use_w1: false                      # false = skip this entry check entirely
     w1_touch_from_trend_side: true   # open on trend side, wick touches EMA20
-    w1_cross_from_other_side: true   # open opposite, close on trend side of EMA20
+    w1_cross_from_other_side: false   # open opposite, close on trend side of EMA20
+    w1_cross_into_gap: true         # open trend side, close strictly between EMA20/100
     w1_pen_atr: 0.0                  # 0 = touch counts; larger = deeper wick (x H4 ATR)
-    # Older W1 uses w1_open_side; it is not used when the two switches above exist.
+    # w1_pen_atr applies to the first two patterns, not the pullback cross.
+    # Older W1 uses w1_open_side; it is not used with these pattern switches.
 
   # ════════════════════════════════════════════════════════════════════
   # OPEN TRADE · after the fill (live attaches SL/TP on the broker)
   # ════════════════════════════════════════════════════════════════════
   open_trade:
     stop_atr: 1.5           # stop distance at fill (H4 ATR at t; S1 style)
-    tp_mult: 2.5            # spec RR 1:2.5 (1:3 = the alternative to test later)
+    tp_mult: 4              # target = 4 x initial stop distance, before costs
     use_trail: false        # trailing = a SEPARATE exit model, its own run later
-    trail_r: 1.5            # (unused while off)
-    use_be: false           # breakeven lift: stop -> entry (+buffer) when armed
+    trail_r: 1              # (unused while off)
+    use_be: true            # breakeven lift: stop -> entry (+buffer) when armed
     be_trigger_r: 1.0       # R of profit that arms BE (or the trail) (R)
     be_buffer: 0            # extra pips beyond entry on the BE stop (pips)
 
@@ -144,11 +145,8 @@ strategy:
 risk:
   default_lot: 0.01           # base size for every trade; add 0.01 lots until risk reaches low; skip above high
   max_total_positions: 5      # max open trades, all pairs combined (0 = off)
-  max_ccy_net: 2              # max NET positions per currency (0 = off)
-                              # long EURUSD = +EUR/-USD; hedging nets to ~0
-                              # basically determine how many same direction of trade to pair
-                              # like EURUSD and GBPUSD both bet for buy, but not USDCHF for sell
-                              # if example is 2
+  max_ccy_net: 1              # max net bets on one currency (0 = off)
+                              # buy EURUSD = buy EUR and sell USD; opposite bets offset
   # SIZING MODE SWITCH · the switch decides WHO sets the 1R target; the
   # fence (sizing_scope_usd) judges the RESULT in both modes.
   # false = FENCE sizing: the floor IS the target — buy the smallest
@@ -161,7 +159,7 @@ risk:
   #   MT5 balance). The fence then only guards — keep the aim at or above
   #   the floor (pct x balance >= low), else entries refuse as scale-low.
   #   Wins grow the aim, losses shrink it: compounding, never martingale.
-  scale_lot_with_balance: true  # ON in this preset: percent sizing (the compounding experiment)
+  scale_lot_with_balance: false  # OFF here = fence sizing (the section-8 rule)
   balance_risk_pct: 3.0          # read only when the switch above is ON
   # STOP SIZING · how a trade reaches the minimum risk (sizing_scope_usd.low)
   # OFF (default): trade MORE lots on the ATR stop (the section-8 rule).
@@ -173,7 +171,7 @@ risk:
   stop_sizing:
     widen_stop_to_scope: false  # true = widen the stop instead of adding lots
     increase_lots_if_widening_fails: false  # [widen_stop_to_scope] cap hit: size more lots at the original stop; keep risk limits
-    max_stop_atr: 3.0           # never widen the stop beyond this x ATR
+    max_stop_atr: 3.0           # never widen beyond this x ATR; skip unless lot fallback is enabled
   sizing_scope_usd:           # every trade's 1R must land inside (USD)
     low: 4                  # minimum 1R (USD; 0 = no minimum)
     high: 5.5                 # maximum 1R (USD; 0 = no maximum)
@@ -182,9 +180,10 @@ risk:
                               # 2.2-4.9 per pair, so no lot fits where 1 brick is
                               # below `low` and 2 bricks exceed `high` (bricks
                               # USD 2.75-4.00 at 4/5.5) — EURUSD, USDJPY, USDCHF,
-                              # EURJPY typically refuse every entry. Widening
-                              # `high` (e.g. 8) revives them: a deliberate run
-                              # decision, logged as its own change.
+                              # EURJPY typically refuse every entry. Two ways out:
+                              # widen `high` (e.g. 8) OR turn on
+                              # stop_sizing.widen_stop_to_scope (fixed lot, wider
+                              # stop). Both are deliberate run decisions.
 
 # ────────────────────────────────────────────────────────────────────────
 # COSTS · backtest assumptions; pair files override with sampled values
@@ -210,16 +209,17 @@ account:
 # (0 on any limit = that rule off)
 # ────────────────────────────────────────────────────────────────────────
 limits:
+  max_trades_per_week: 0       # actual entries across ALL pairs, UTC Monday week; 0 = off
   entry_hours:
     enabled: true             # new entries only; open positions remain managed
     utc_offset_hours: 8       # Malaysia fixed UTC+8, not the broker chart clock
     start: "09:15"            # inclusive local fill time
-    end: "23:00"              # exclusive; skipped signals are not queued
+    end: "23:30"              # exclusive; skipped signals are not queued
   max_trades_per_pair_per_week: 2  # actual entries per pair, UTC Monday week; 0 = off
   disable_pair_after_daily_loss: true  # closed loss after costs blocks this pair until next UTC day; false = off
   weekly_loss_r: 3.0          # BACKTEST weekly halt: week's CLOSED R total <= -this (8A; 0 = off)
   weekly_loss_pct: 15.0       # LIVE/panel weekly halt: % of week-start equity (live only)
-  max_trades_per_day: 20      # portfolio-wide, per day
+  max_trades_per_day: 10      # portfolio-wide, per day
   max_cost_ratio: 0.10        # round-trip cost < this share of stop distance
   no_trade_ranges:            # {start,end} = MM-DD UTC; wraps the New Year
     - { start: "12-15", end: "01-01" }   # no NEW fills inside; open trades keep SL/TP/trail
@@ -233,7 +233,7 @@ live:
 # BENCHMARKS · backtest grading only: PASS/WARN/FAIL bands per metric
 # ────────────────────────────────────────────────────────────────────────
 benchmarks:
-  account_usd: 100            # drawdown % is graded against this equity
+  account_usd: 200            # drawdown % is graded against this equity
   max_dd_pct: { good: 30.0, ok: 50.0 }
   profit_factor: { good: 1.50, ok: 1.00 }
   expect_r: { good: 0.10, ok: 0.00 }

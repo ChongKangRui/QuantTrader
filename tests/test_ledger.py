@@ -122,3 +122,16 @@ def test_rebuild_covers_all_runs_drops_broken(tmp_path):
     assert rows[1]["run_time"] == "2026-02-03 04:05:06"  # time parsed from prefix
     assert len(rows) == len({r["run_folder"] for r in rows})  # one row per folder
     assert set(rows[0]) == set(COLUMNS)  # schema is the single source of truth
+
+
+def test_timeframe_suffixes_keep_ledger_append_and_rebuild_compatible(tmp_path):
+    names = ["20261022_213000_H4_H1", "20261022_213001_D_H4", "20261022_213002_D_H1"]
+    for name in names:
+        root, run = _run_dir(tmp_path, name)
+        append(run)
+    original = _rows(root / "_ledger.csv")
+    assert [row["run_folder"] for row in original] == names
+    assert [row["run_time"] for row in original] == [
+        "2026-10-22 21:30:00", "2026-10-22 21:30:01", "2026-10-22 21:30:02"]
+    path, count = rebuild(root)
+    assert count == 3 and _rows(path) == original

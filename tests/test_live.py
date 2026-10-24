@@ -113,6 +113,50 @@ def test_real_roundtrip_opens_then_closes(tmp_path):
     assert "roundtrip-open" in rows[0]["reason"] and "roundtrip-close" in rows[1]["reason"]
 
 
+@pytest.mark.parametrize("fail_close", [False, True])
+def test_roundtrip_attempts_close_even_when_open_journal_write_fails(tmp_path, monkeypatch, capsys, fail_close):
+    from quant import live
+
+    mt5 = _FakeMT5(fail_close=fail_close)
+
+    def fail_journal(*args):
+        raise OSError("mock disk full")
+
+    monkeypatch.setattr(live, "append_row", fail_journal)
+    monkeypatch.setattr(live.time, "sleep", lambda *a: None)
+    code = roundtrip(mt5, symbol="EURUSD", side="BUY", volume=.01, magic=100001,
+                     dry_run=False, journal_path=tmp_path / "journal.csv")
+    assert len(mt5.sent) == 2
+    assert mt5.sent[1]["position_id"] == 100
+    assert code == (2 if fail_close else 3)
+    assert bool(mt5.positions_get()) == fail_close
+    output = capsys.readouterr().out
+    assert "RECORDING ALERT" in output
+    assert "CLOSE FAILED" in output if fail_close else "RECORDING INCOMPLETE" in output
+
+
+def test_roundtrip_close_journal_failure_does_not_hide_successful_close(tmp_path, monkeypatch, capsys):
+    from quant import live
+
+    mt5 = _FakeMT5()
+    original = live.append_row
+    count = 0
+
+    def write(path, row):
+        nonlocal count
+        count += 1
+        if count == 2:
+            raise OSError("mock close log failure")
+        original(path, row)
+
+    monkeypatch.setattr(live, "append_row", write)
+    monkeypatch.setattr(live.time, "sleep", lambda *a: None)
+    code = roundtrip(mt5, symbol="EURUSD", side="BUY", volume=.01, magic=100001,
+                     dry_run=False, journal_path=tmp_path / "journal.csv")
+    assert code == 3 and mt5.positions_get() == ()
+    assert "ROUNDTRIP closed" in capsys.readouterr().out
+
+
 def test_open_failure_sends_no_close(tmp_path):
     mt5 = _FakeMT5(fail_open=True)
     rc = roundtrip(mt5, symbol="EURUSD", side="BUY", volume=0.01,

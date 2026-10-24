@@ -240,7 +240,11 @@ def broker_plan(config_dir: str | Path, symbol: str | None, batch: bool,
     tf = base.get("timeframes") or {}
     execution = _broker_tf(tf.get("execution", "H1"))
     regime = _broker_tf(tf.get("regime", "H4"))
-    checks = _broker_tf(tf.get("position_checks", execution))
+    if (base.get("backtest_data") or {}).get("use_broker_csv", False):
+        from quant.broker_data import resolve_position_checks
+        checks = _broker_tf(resolve_position_checks(base, execution))
+    else:
+        checks = _broker_tf(tf.get("position_checks", execution))
     if batch == bool(symbol):
         raise ValueError("choose exactly one of --symbol or --batch")
     if batch:
@@ -286,8 +290,12 @@ def broker_plan(config_dir: str | Path, symbol: str | None, batch: bool,
             if feed is None:
                 raise ValueError(f"{s}: no supported USD conversion feed")
             jobs.add((feed, "H1"))
+    clock = (base.get("backtest_data") or {}).get("broker_api_clock", "auto")
+    if clock not in ("auto", "utc", "new_york_plus_7"):
+        raise ValueError("broker_api_clock must be auto, utc or new_york_plus_7")
     return {"symbols": symbols, "jobs": sorted(jobs), "execution": execution,
-            "regime": regime, "position_checks": checks, "warmup_bars": warmup_bars}
+            "regime": regime, "position_checks": checks, "warmup_bars": warmup_bars,
+            "api_clock": clock}
 
 
 def _utc_date(value: str) -> datetime:
@@ -297,7 +305,18 @@ def _utc_date(value: str) -> datetime:
     return (ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")).to_pydatetime()
 
 
-def validate_broker_rates(rates, label: str) -> pd.DataFrame:
+def broker_query_date(value: datetime, clock: str = "utc") -> datetime:
+    """Translate actual UTC into the epoch labels used by this broker API."""
+    stamp = pd.Timestamp(value)
+    if stamp.tzinfo is None or clock not in ("utc", "new_york_plus_7"):
+        raise ValueError("need an aware date and an explicit supported broker clock")
+    if clock == "new_york_plus_7":
+        stamp = (stamp.tz_convert("America/New_York").tz_localize(None)
+                 + pd.Timedelta(hours=7)).tz_localize("UTC")
+    return stamp.tz_convert("UTC").to_pydatetime()
+
+
+def validate_broker_rates(rates, label: str, clock: str = "utc") -> pd.DataFrame:
     """Reject bad candles/order instead of sorting, deduplicating or filling gaps."""
     if rates is None:
         raise ValueError(f"{label}: broker returned no data (check terminal history limits)")
@@ -308,6 +327,11 @@ def validate_broker_rates(rates, label: str) -> pd.DataFrame:
         raise ValueError(f"{label}: missing OHLC/time/volume columns")
     df = df[M1_COLUMNS].copy()
     df["time"] = pd.to_datetime(df["time"], unit="s", utc=True, errors="raise")
+    if clock == "new_york_plus_7":
+        from quant.broker_data import pepperstone_utc
+        df["time"] = pepperstone_utc(df["time"].dt.tz_localize(None))
+    elif clock != "utc":
+        raise ValueError("unsupported broker API clock")
     if df["time"].isna().any() or df["time"].duplicated().any() \
             or not df["time"].is_monotonic_increasing:
         raise ValueError(f"{label}: invalid, duplicate or descending timestamps")
@@ -330,7 +354,8 @@ def _expected_next(ts: pd.Timestamp, tf: str) -> pd.Timestamp:
 
 
 def _stream_broker_csv(mt5, symbol: str, tf: str, start: datetime, end: datetime,
-                       last_closed: pd.Timestamp, path: Path, chunk_days: int) -> dict:
+                       last_closed: pd.Timestamp, path: Path, chunk_days: int,
+                       clock: str = "utc") -> dict:
     """Stream bounded chunks to staging; weekend/session gaps are reported, never filled."""
     cursor, count, gap_count, first, previous = start, 0, 0, None, None
     gaps = []
@@ -338,8 +363,9 @@ def _stream_broker_csv(mt5, symbol: str, tf: str, start: datetime, end: datetime
     while cursor < end:
         stop = min(cursor + timedelta(days=chunk_days), end)
         raw = mt5.copy_rates_range(symbol, getattr(mt5, f"TIMEFRAME_{tf}"),
-                                   cursor, stop - timedelta(microseconds=1))
-        df = validate_broker_rates(raw, f"{symbol}/{tf} {cursor.isoformat()}")
+                                   broker_query_date(cursor, clock),
+                                   broker_query_date(stop - timedelta(microseconds=1), clock))
+        df = validate_broker_rates(raw, f"{symbol}/{tf} {cursor.isoformat()}", clock)
         if len(df):
             if (df["time"] < pd.Timestamp(cursor)).any() or (df["time"] >= pd.Timestamp(stop)).any():
                 raise ValueError(f"{symbol}/{tf}: broker returned bars outside requested chunk")
@@ -403,6 +429,12 @@ def export_broker(mt5, plan: dict, start: datetime, end: datetime, out_dir: str 
         account = mt5.account_info()
         if account is None:
             raise ValueError("MT5 account info unavailable")
+        clock = plan.get("api_clock", "auto")
+        if clock == "auto":
+            # Verified Pepperstone responses encode server wall clock, not UTC.
+            clock = "new_york_plus_7" if "pepperstone" in str(account.server).lower() else "utc"
+        if clock not in ("utc", "new_york_plus_7"):
+            raise ValueError("unsupported broker API clock")
         resolved, closed = {}, {}
         for symbol, tf in plan["jobs"]:
             _safe_symbol(symbol)
@@ -415,7 +447,7 @@ def export_broker(mt5, plan: dict, start: datetime, end: datetime, out_dir: str 
                     raise ValueError(f"{symbol}: broker symbol unavailable")
                 resolved[symbol] = broker_symbol
             last = validate_broker_rates(mt5.copy_rates_from_pos(
-                resolved[symbol], getattr(mt5, f"TIMEFRAME_{tf}"), 1, 1), f"{symbol}/{tf} closed")
+                resolved[symbol], getattr(mt5, f"TIMEFRAME_{tf}"), 1, 1), f"{symbol}/{tf} closed", clock)
             if len(last) != 1:
                 raise ValueError(f"{symbol}/{tf}: cannot establish last closed candle")
             closed[symbol, tf] = last["time"].iloc[0]
@@ -425,7 +457,8 @@ def export_broker(mt5, plan: dict, start: datetime, end: datetime, out_dir: str 
                 for tf in sorted({plan["execution"], plan["regime"]}):
                     prefix = validate_broker_rates(mt5.copy_rates_from(
                         resolved[symbol], getattr(mt5, f"TIMEFRAME_{tf}"),
-                        start - timedelta(seconds=1), plan["warmup_bars"] + 1), f"{symbol}/{tf} warmup")
+                        broker_query_date(start - timedelta(seconds=1), clock),
+                        plan["warmup_bars"] + 1), f"{symbol}/{tf} warmup", clock)
                     # The next broker open proves closure: the last row may be
                     # a candle still forming at the requested historical start.
                     prefix = prefix.iloc[:-1]
@@ -436,8 +469,8 @@ def export_broker(mt5, plan: dict, start: datetime, end: datetime, out_dir: str 
                     padded_start = min(padded_start, prefix["time"].iloc[0].to_pydatetime())
         for symbol, tf in plan["jobs"]:
             anchor = validate_broker_rates(mt5.copy_rates_from(
-                resolved[symbol], getattr(mt5, f"TIMEFRAME_{tf}"), padded_start, 1),
-                f"{symbol}/{tf} coverage anchor")
+                resolved[symbol], getattr(mt5, f"TIMEFRAME_{tf}"), broker_query_date(padded_start, clock), 1),
+                f"{symbol}/{tf} coverage anchor", clock)
             if anchor.empty or anchor["time"].iloc[-1] > pd.Timestamp(padded_start):
                 raise ValueError(f"{symbol}/{tf}: history does not cover the warmup start; "
                                  "load more broker history or choose a later start")
@@ -449,12 +482,15 @@ def export_broker(mt5, plan: dict, start: datetime, end: datetime, out_dir: str 
                 filename = f"{symbol}_{tf}.csv"
                 coverage_info = _stream_broker_csv(
                     mt5, resolved[symbol], tf, padded_start, end, closed[symbol, tf],
-                    stage / filename, chunk_days)
+                    stage / filename, chunk_days, clock)
                 metadata = {
                     "source": "MetaTrader5 broker candles (no resampling)",
                     "broker_server": str(getattr(account, "server", "")),
                     "exported_at_utc": exported_at.isoformat(),
-                    "timestamp_timezone": "UTC (MT5 epoch seconds; broker candle boundaries preserved)",
+                    "timestamp_timezone": "UTC (broker API clock normalized; candle boundaries preserved)",
+                    "broker_api_clock": clock,
+                    "api_query_start_label": broker_query_date(padded_start, clock).isoformat(),
+                    "api_query_end_exclusive_label": broker_query_date(end, clock).isoformat(),
                     "symbol": symbol, "broker_symbol": resolved[symbol], "timeframe": tf,
                     "requested_start_utc": start.isoformat(), "requested_end_exclusive_utc": end.isoformat(),
                     "export_start_with_warmup_utc": padded_start.isoformat(),
@@ -562,6 +598,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--m1-csv", action="store_true",
                      help="also write data/<SYM>_M1.csv (minute feed for position checks)")
     ap.add_argument("--broker", action="store_true", help="export actual candles from the logged-in MT5 terminal")
+    ap.add_argument("--broker-clock", choices=("auto", "utc", "new_york_plus_7"), default=None,
+                    help="API timestamp clock; auto normalizes verified Pepperstone server labels")
+    ap.add_argument("--bundle-broker", nargs="+", metavar="SOURCE_DIR",
+                    help="offline: combine verified broker sources, refusing conflicting overlaps")
     ap.add_argument("--batch", action="store_true", help="export selected config pairs")
     ap.add_argument("--config-dir", default="configs")
     ap.add_argument("--start", help="UTC start, with indicator warmup exported before it")
@@ -576,20 +616,40 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--research-timeframes", nargs="+", default=["H4", "D1"])
     ap.add_argument("--chunk-rows", type=int, default=100000)
     ap.add_argument("--import-pepperstone", action="store_true",
-                    help="archive tagged MT5 chart exports and normalize their server clock to UTC")
+                     help="archive tagged MT5 chart exports and normalize their server clock to UTC")
+    ap.add_argument("--add-h1", action="store_true",
+                    help="with --import-pepperstone, add H1 exports to an existing H4/D1 dataset")
     args = ap.parse_args(argv)
+    if args.bundle_broker:
+        if any((args.broker, args.research, args.import_pepperstone, args.add_h1,
+                args.batch, args.symbol, args.out, args.m1_csv, args.overwrite,
+                args.plan, args.start, args.end, args.all_existing, args.broker_clock)):
+            ap.error("--bundle-broker uses only source directories and a fresh --out-dir")
+        try:
+            from quant.broker_data import bundle_sources
+            manifest = bundle_sources(args.bundle_broker, args.out_dir)
+            print(f"Bundled {len(manifest['symbols'])} broker symbols; no strategy simulation", flush=True)
+            return 0
+        except (ValueError, OSError, KeyError) as exc:
+            print(f"BROKER BUNDLE ERROR - {exc}", flush=True)
+            return 2
+    if args.broker_clock and not args.broker:
+        ap.error("--broker-clock requires --broker")
+    if args.add_h1 and not args.import_pepperstone:
+        ap.error("--add-h1 requires --import-pepperstone")
     if args.import_pepperstone:
         if args.broker or args.research or args.all_existing or args.out or args.m1_csv or args.overwrite or args.plan:
-            ap.error("MT5 CSV import uses --batch/--symbol, --src and a new --out-dir")
+            ap.error("MT5 CSV import uses --batch/--symbol, --src and --out-dir (existing only with --add-h1)")
         if args.batch == bool(args.symbol):
             ap.error("choose --batch or --symbol for MT5 CSV import")
         try:
-            from quant.broker_data import import_exports
+            from quant.broker_data import import_exports, import_h1_exports
             from quant.monitor import load_pairs, read_selection
             selection = read_selection(args.config_dir)
             symbols = [args.symbol] if args.symbol else [p["symbol"] for p in load_pairs(args.config_dir)
                 if not p.get("load_error") and (selection is None or selection.get(p["symbol"], True))]
-            manifest = import_exports(args.src, args.out_dir, symbols)
+            importer = import_h1_exports if args.add_h1 else import_exports
+            manifest = importer(args.src, args.out_dir, symbols)
             print(f"Imported {len(manifest['symbols'])} pairs; originals archived under {args.out_dir}/raw", flush=True)
             for warning in manifest["warnings"]:
                 print(f"COVERAGE WARNING: {warning}", flush=True)
@@ -621,6 +681,8 @@ def main(argv: list[str] | None = None) -> int:
             if start >= end or args.chunk_days <= 0:
                 raise ValueError("need start < end and --chunk-days > 0")
             plan = broker_plan(args.config_dir, args.symbol, args.batch, args.warmup_bars)
+            if args.broker_clock:
+                plan["api_clock"] = args.broker_clock
             print(json.dumps({**plan, "start_utc": start.isoformat(),
                               "end_exclusive_utc": end.isoformat(), "out_dir": args.out_dir}, indent=2))
             if args.plan:

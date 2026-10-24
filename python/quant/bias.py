@@ -75,6 +75,13 @@ def h4_bias(h4: pd.DataFrame, sep_min: float = SEP_MIN_DEFAULT, hr1: str = "a",
     hi, lo = float(high.iloc[-1]), float(low.iloc[-1])
     if pd.isna(e_fast) or pd.isna(e_slow) or pd.isna(atr) or atr <= 0:
         return Bias("NEUTRAL", None, None, None, None, False, False, "warmup:nan-atr")
+    return bias_from_values(o, hi, lo, c, e_fast, e_slow, atr, sep_min, variant, use_atr_sep)
+
+
+def bias_from_values(o: float, hi: float, lo: float, c: float,
+                     e_fast: float, e_slow: float, atr: float,
+                     sep_min: float, variant: str, use_atr_sep: bool) -> Bias:
+    """Same bias rules for batch indicators and restart-safe incremental indicators."""
     if variant == "b":
         hr1_long, hr1_short = min(o, c) > e_slow, max(o, c) < e_slow
     elif variant == "c":

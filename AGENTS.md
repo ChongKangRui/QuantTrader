@@ -13,6 +13,9 @@ Always flag real risks, even when I did not ask. If you are unsure, say so.
 - `configs/` — per-pair YAML: symbol, indicator params, spread/swaps/slippage, risk. Live and backtest read the same file.
 - `data/` — local-only CSV history, never committed. Document source + export date in filename or sidecar.
 - `docs/` — `STRATEGY.md` (system rules), `DEVLOG.md` (history + next steps).
+- `docs/DEVLOG.md` must always start with the full TODO section immediately after the title. All dated records go below the entire TODO section, newest first. Never insert a record above TODO.
+- Whenever a completed task is listed in `docs/DEVLOG.md` TODO, remove it from TODO and record its completion in the dated log below the full TODO section in the same change. For partially completed tasks, update the TODO to retain only unfinished work; never remove pending work or claim completion without verification.
+- `resources/` — research library for PDFs, EPUBs, and other reference material. Consult relevant sources when researching improvements to backtesting, system logic, trading strategies, and the wider trading system. Reference material informs proposals; it does not override project rules or authorize code changes or backtest runs. Cite the source and page/chapter when using it, and distinguish research ideas from validated results.
 
 ## Commands (run from repo root, PowerShell)
 - `uv sync` — setup env (pins Python 3.12; MT5 wheel has no 3.14 build).
@@ -27,12 +30,16 @@ Always flag real risks, even when I did not ask. If you are unsure, say so.
 - No lint/typecheck yet. If added, run lint -> typecheck -> test.
 
 ## Config / cost model (required in every backtest)
+- Config files are user-tunable and may change at any time. Never freeze or reset their values just to satisfy tests.
+- Tests must use controlled fixtures for exact settings. Repository-config checks should validate loading, schema and propagation, not pin active values or require equality with presets.
 - Costs are explicit inputs, never hardcoded: `spread_pips` (or points), `swap_long/short` per lot per night + triple-Wednesday flag, `commission_per_lot`, `slippage_pips`.
 - Config must state pip size, contract size, account currency, and units for spread/swaps.
 - CLI must allow cost overrides for sensitivity sweeps.
 
 ## Strategy + data contract
-- Trend-only on 1H/4H. No scalping or timeframes below 1H. 4H defines regime/bias, 1H triggers entries. Document the regime rule per config.
+- Trend-only. No scalping or strategy timeframes below 1H. Use the configured execution/regime timeframes; do not assume fixed H1/H4 roles. Document the regime rule per config.
+- The regime/bias timeframe is only for trend bias. Any strategy mechanic the user mentions (including crossover, recovery, entry and exit rules) belongs to the execution timeframe unless the user explicitly requests the bias timeframe. This is the intended design, not a claim that all existing code already follows it.
+- Every strategy must work with both same-timeframe and different-timeframe execution/bias combinations supported by the system. Do not couple strategy selection to matching timeframes or indicator periods; keep timeframe roles independently configurable.
 - CSV minimum columns: `time,open,high,low,close,tick_volume?`. UTC, ascending, no gaps silently filled.
 - 4H bars come from the broker, not from resampling. Backtest loads `data/<SYMBOL>_H4.csv` exported from the same broker as H1. Live fetches H4 directly (see MT5 bridge rules).
 - No lookahead: a signal on bar `t` executes at open/close of `t+1` plus spread/slippage.

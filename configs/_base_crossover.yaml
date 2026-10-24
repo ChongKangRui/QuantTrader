@@ -1,0 +1,133 @@
+# OPT-IN ONLY: --base-config configs/_base_crossover.yaml
+# Does not inherit from or overwrite configs/_base.yaml. Pair costs still apply.
+# A closed execution-chart EMA crossover grants two actual entries, not two signals.
+# Both entries need a fresh recovery. One open position per pair remains enforced.
+timeframes:
+  # Choices (execution/regime): H1/H4, H4/D1, H1/D1, H1/H1, H4/H4, D1/D1.
+  # Execution controls crossover/recovery/entries/exits; regime controls trend bias only.
+  # With broker CSVs, also match backtest_data.position_checks to execution.
+  execution: H4
+  regime: H4
+  position_checks: H4
+
+backtest_data:
+  use_broker_csv: true
+  broker_csv_dir: data/pepperstone
+  broker_server_clock: new_york_plus_7
+  position_checks: H4  # coarse OHLC checks; not intrabar/tick trailing
+
+execution:
+  signal_bar: t
+  fill_bar: t+1
+  fill: next_open_plus_costs
+
+strategy:
+  bias:
+    bias_ema_fast_period: 20
+    bias_ema_slow_period: 100
+    use_atr_sep: true  # retain the existing price/separation bias guards
+    bias_atr_period: 14
+    hr1: a
+    sep_atr: 0.3
+    warmup_bars: 100
+  entry:
+    entry_atr_period: 7
+    entry_ema_fast_period: 20
+    entry_ema_slow_period: 100
+    use_crossover_memory: true  # false restores the ordinary recovery strategy
+    crossover_max_entries: 2  # actual fills per cross; change to 3 to allow three
+    crossover_history_bars: 6000  # startup search/overlap; increase after a long outage
+    use_recovery_entry: true
+    recovery_use_zone_memory: true
+    recovery_use_wick: false
+    recovery_expiry_bars: 5
+    recovery_cancel_beyond_slow: false
+    use_e1_setup: false
+    lookback: 5
+    touch_atr: 0.5
+    breakdown_atr: 1.0
+    use_e1_trigger: false
+    use_hr2: false
+    min_body_ratio: 0.5
+    use_ext: false
+    ext_atr: 1.5
+    use_hr3: false
+    max_body_atr: 1.5
+    use_hr4: false
+    edge_atr: 1.5
+    pivot_n: 3
+    hl_guard: false
+    use_w1: false
+    w1_touch_from_trend_side: true
+    w1_cross_from_other_side: false
+    w1_cross_into_gap: true
+    w1_pen_atr: 0.0
+  open_trade:
+    use_crossover_exit: true  # close on a confirmed opposite EMA crossover; next available fill
+    stop_atr: 1.5  # initial stop = 1.5 x closed H4 ATR7
+    tp_mult: 10  # target = 10 x initial stop distance, before costs
+    use_trail: true
+    trail_r: 1.5  # arms at +1.5R; follows best price at a 1.5R distance
+    use_be: false
+    be_trigger_r: 1.0
+    be_buffer: 0
+  experimental:
+    bias_flip_exit: false  # legacy filtered-bias exit; independent of use_crossover_exit
+    weekend_flat: false
+
+risk:
+  default_lot: 0.01
+  max_total_positions: 0  # portfolio position cap off; same-pair overlap still blocked
+  max_ccy_net: 0
+  scale_lot_with_balance: false
+  balance_risk_pct: 3.0
+  stop_sizing:
+    widen_stop_to_scope: false
+    increase_lots_if_widening_fails: false
+    max_stop_atr: 3.0
+  sizing_scope_usd:
+    low: 4
+    high: 5.5
+
+costs:
+  spread_points: 20
+  swap_long_per_0_01: -0.08
+  swap_short_per_0_01: -0.08
+  commission_per_lot: 0.0
+  slippage_pips: 0.0
+
+account:
+  currency: USD
+
+limits:
+  max_trades_per_week: 0
+  max_trades_per_pair_per_week: 0
+  max_trades_per_day: 0
+  entry_hours:
+    enabled: true
+    utc_offset_hours: 8
+    start: "09:15"
+    end: "23:30"
+  disable_pair_after_daily_loss: true
+  weekly_loss_r: 3.0
+  weekly_loss_pct: 15.0
+  max_cost_ratio: 0.10
+  no_trade_ranges:
+    - { start: "12-15", end: "01-01" }
+
+live:
+  magic: 100002  # separate trade history from the existing strategy
+  dry_run_default: true
+
+benchmarks:
+  account_usd: 200
+  max_dd_pct: { good: 30.0, ok: 50.0 }
+  profit_factor: { good: 1.50, ok: 1.00 }
+  expect_r: { good: 0.10, ok: 0.00 }
+  per_month: { good: 2.0, ok: 0.2 }
+  worst_year_r: { ok: -20.0 }
+
+# OFFLINE REPORTING ONLY · does not change signals, costs, sizing or live trading.
+backtest_comparison:
+  enabled: true
+  max_drawdown_pct: null  # null = benchmarks.max_dd_pct.ok; override as needed

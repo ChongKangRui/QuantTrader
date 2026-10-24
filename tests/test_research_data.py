@@ -233,6 +233,26 @@ def test_reference_settings_match_and_changed_costs_are_rejected(tmp_path):
         dp.validate_reference_setup(setup, tmp_path)
 
 
+@pytest.mark.parametrize("old_timing", [None, "closed_rows_v1"])
+def test_reference_must_use_corrected_simulation_timing(tmp_path, old_timing):
+    from quant.backtest import SIMULATION_TIMING
+
+    setup = _setup(default_lot=0.01, stop_sizing={}, execution="H4", regime="D1",
+                   research_data=None, jobs=[("EURUSD", "unused.csv", _zero_costs())],
+                   coarse_exit_timing="bar_close", simulation_timing=SIMULATION_TIMING)
+    params = {"timeframes": {"execution": "H4", "regime": "D1"},
+              "strategy": setup["strategy"], "jobs": [["EURUSD", "unused.csv"]],
+              "costs": _zero_costs(), "position_checks": setup["position_checks"],
+              "max_cost_ratio": setup["max_cost_ratio"], "default_lot": 0.01,
+              "coarse_exit_timing": "bar_close", "simulation_timing": old_timing}
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    with pytest.raises(ValueError, match="simulation timing"):
+        dp.validate_reference_setup(setup, tmp_path)
+    params["simulation_timing"] = SIMULATION_TIMING
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    dp.validate_reference_setup(setup, tmp_path)
+
+
 def test_full_trade_parity_rejects_equal_totals_with_different_entries(tmp_path):
     trades = pd.DataFrame([{"entry_time": "2020-01-01 00:00+00:00",
         "exit_time": "2020-01-01 04:00+00:00", "pnl_usd": 1.0, "pnl_R": 1.0}])

@@ -9,6 +9,267 @@ Full numbers live in each `backtest_results/<run-id>/` (params.json is the truth
 - Probe verdict (pre-decided 2026-10-17): CONFIRMED iff pooled onset mean edge ≥ 0 AND mean − 2×SE > 0 at **both** 48 and 72 bars. 24-bar horizon = info only, never used to pick a horizon afterwards. Per-pair rows = information only, never verdict material.
 - One rule change per run. The variant count is the row count below.
 
+## Four-pair evaluation preparation — frozen design (2026-10-24; no run)
+
+- User authorized finishing the isolated setup, 2019 preparation wiring and
+  exporter clock repair. This authorizes code/tests and offline dataset assembly,
+  NOT an actual-history backtest, dice experiment or orders.
+- Evaluation universe fixed before strategy results: EURAUD, GBPCAD, AUDCAD and
+  CADJPY, pooled under one portfolio. No keep/drop decision from per-pair results.
+  EURNZD/GBPCHF remain untouched reserve strategy results; AUDJPY remains parked.
+- Preparation prices: actual UTC 2019. Trading start: 2020-01-01 inclusive;
+  end: 2026-01-01 exclusive. Indicators may read preparation candles; trades,
+  sizing, quotas, loss state, exposure and scored equity may not inherit 2019
+  trading. No pre-start open positions. Keep configured warmup guards, including
+  validation of closed preparation candles on both configured chart roles.
+- Preserve the current active strategy/risk/limits/benchmarks in a separate
+  frozen base snapshot; do not retune them or modify active configs/selection.
+  Freeze exact snapshot hashes and the calibrated cost proposal into the isolated
+  setup under `data/four_pair_evaluation_20261024/`. H4 execution / D1 bias / H1
+  checks are this frozen choice, not a new restriction on other supported combos.
+- Costs fixed to the previously pre-declared recent-quote proposal: EURAUD 15,
+  GBPCAD 18, AUDCAD 7 and CADJPY 14 broker points, exact proposed USD swaps.
+  Commission 0 USD/lot/side and slippage 0 pips remain explicit Standard-account
+  assumptions, not measured fills. Triple-Wednesday is the existing approximate
+  observed-UTC-date model (booked on Thursday); exact rollover is not claimed.
+  Current financing/recent demo quotes do not reconstruct historical costs.
+- Primary first-evaluation rule: at least 100 pooled accepted trades and at
+  least one trade in each of the four pairs; otherwise INSUFFICIENT, not PASS.
+  Require positive net USD and TOTAL PASS against ALL frozen benchmark bands
+  (currently expectancy >= +0.10R, PF >= 1.50, MTM DD <= 30% of USD 200,
+  >= 2 trades/month and worst-year R >= -20). WARN is not PASS. Use the exact
+  isolated snapshot, not future edits to active settings. These are pre-decided
+  reporting criteria, not an invented result or a claim of statistical certainty.
+- A primary PASS is not full strategy validation: STRATEGY section 12 still
+  requires separately authorized cost stress, neighboring-parameter robustness,
+  contribution concentration review and a matching-reference random comparison.
+  No automatic second experiment or claim of independently unseen date regimes.
+- Assemble real UTC broker sources offline into a NEW checksummed bundle:
+  original chart imports + corrected new-pair API collection + full-2019 API
+  collection. Identical overlaps deduplicate once; conflicting OHLC/volume fails.
+  Never fill or average missing prices or replace original inputs. Missing
+  evaluation history for a parked pair must stay visible, not silently borrowed
+  from vendor data. Preserve known final-day and NZDUSD preparation-hour warnings.
+
+### Preparation outcome — 2026-10-24 (setup complete; no strategy result)
+
+- Frozen profile: `data/four_pair_evaluation_20261024/configs/`. Exactly the four
+  declared pairs load/are selected. Effective calibrated costs propagate without
+  changing active strategy/risk/limits/costs/benchmarks or any live settings.
+  `evaluation_plan.json` pins six profile files, source base, cost proposal,
+  broker identity and 22 engine-file hashes. `input_verification.json` records
+  independent input-only checks; its scan/simulation functions were blocked.
+- Built `data/pepperstone_prepared_2019_2025_20261024/`: 51 H1/H4/D1 charts.
+  Verified all original source hashes, all 104 source price files unchanged,
+  exact timestamp/price/volume union, zero CSV price roundtrip difference and
+  deterministic identical-overlap deduplication. Source gaps remain warnings.
+  Sixteen symbols have evaluation history. Parked AUDJPY has preparation only;
+  no missing 2020-2025 broker prices were invented or borrowed from vendor files.
+- Optional window now gates fills before any simulated trading state, while
+  retaining indicator prefix. Metrics/equity exclude preparation; saved windows
+  distinguish reference/parity/comparison groups. Checks retain all supported
+  execution/bias combinations. CLI/config may disable or change dates, but doing
+  so changes this frozen experiment and requires a new declaration before results.
+  Final boundary-fill-day regression confirms daily admission uses the fill's
+  trading day, not the preparation signal day. Engine hashes were refreshed
+  before any actual-history experiment; strategy/costs/verdict rules unchanged.
+- Exporter root cause fixed: price validation formerly labelled server epochs
+  UTC and queries used the wrong clock. Date requests, returned candles, warmup,
+  anchors and last-closed checks now use a consistent explicit broker API clock,
+  with Pepperstone auto detection, US DST and documented override controls.
+- Initial focused synthetic tests: 363 passed. Final full suite, including the
+  added DST/bundle-report and boundary-fill-day cases: 877 passed and two pre-existing editable
+  weekly-cap assertions failed (expect 5, active value 0); settings unchanged.
+  Command: `$env:PYTHONPATH="python"; uv run pytest -q`. No actual-history backtest/parity,
+  dice, strategy-result inspection, MT5 connection, orders or existing report
+  rebuild. This completes setup, not an evaluation verdict or live-parity claim.
+
+## Four-pair broker cost calibration — sampling plan (2026-10-24)
+
+- User chose broker calibration rather than substituting shared default costs.
+  Scope: EURAUD, GBPCAD, AUDCAD and CADJPY only. Conversion quotes: AUDUSD,
+  USDCAD and USDJPY. No reserve-pair results, signals or returns inspected.
+- Read-only current Pepperstone-Demo/USD account: symbol selection, symbol
+  specifications and quotes only. No credentials, account changes, trading-flag
+  changes, orders, backtests or historical-performance inspection.
+- Start with three diagnostic snapshots, five seconds apart. Record broker
+  swap mode/raw swaps, contract/point units, triple-rollover day, spreads from
+  both symbol info and bid/ask, quote timestamps, and conversion references.
+  Tick clock is not assumed identical to the verified candle clock: store
+  both clock interpretations and mark uncertainty explicitly.
+- Weekend/stale quotes are NOT valid spread calibration samples, including
+  nonzero spreads. Freshness diagnostic threshold: 60 seconds, not a strategy
+  change. Today is Saturday; a successful read does not establish an open market.
+- Keep diagnostics separately under
+  `data/pepperstone_cost_calibration_20261024/`. Do not create/freeze/promote
+  pair-cost overrides from these weekend snapshots. Later collect fresh samples
+  across different open-market sessions before agreeing the fixed assumptions.
+  Broker swap specifications describe current terms, not historical 2020-2025
+  financing. Quote-only reads do not measure commission or execution slippage.
+
+### Historical-quote fallback — declared before tick requests
+
+- Weekend symbol-info snapshots cannot calibrate spreads. Read recent broker
+  bid/ask tick history instead, without any strategy simulation or orders.
+- Fixed windows for each of the same four pairs: 2026-10-21, 22 and 23, at
+  02:00, 08:00 and 14:00 UTC, five minutes each (nine windows per pair).
+  These are inside the current entry-hours envelope and sample different
+  sessions; they are not chosen from strategy returns or observed spreads.
+- Request broker-clock labels using the previously verified candle conversion.
+  Verify each window's first bid against the corresponding broker H1 open,
+  and all sampled bids against that H1 range, before treating tick labels as
+  the same clock. Archive original ticks and the H1 clock-check evidence.
+- Required quality: at least 30 positive, non-crossed bid/ask observations per
+  window, finite values and ascending timestamps within its requested bounds.
+  Missing/invalid windows block a completed calibration; bounded retries only.
+- Proposed fixed spread = the maximum per-window 95th-percentile spread across
+  all nine windows, rounded UP to an integer broker point. Define percentile
+  using the higher observed value; no post-result method changes. Keep per-pair
+  snapshots/statistics so this recent-sample assumption is auditable, not a
+  claim about full historical spreads or the worst spread possible.
+- Current POINTS swaps are recorded separately in profit currency. If all quote
+  checks pass, use converters from the same last declared sample window for a
+  labelled USD reference, not today's stale quote. Commission/slippage remain
+  explicit existing assumptions, not measurements from ticks. No active cost
+  promotion or backtest is authorized by sampling alone.
+
+### Cost sampling outcome — 2026-10-24 (no strategy experiment)
+
+- Saturday live diagnostic: 12 stale pair snapshots, zero accepted calibration
+  samples. Nonzero stale spread readings were not promoted into pair settings.
+- Historical fallback completed all 36 planned pair windows plus three matching
+  converter windows. 24179 pair quotes / 26712 including converters; every window
+  had at least 30 quotes and passed first-bid/H1-open and full bid-range checks.
+  This verifies the requested sample clock against broker candles, not unrelated
+  live API consumers or exact execution parity. No history request retry needed.
+- Pre-declared spread method produced:
+
+  | Pair | Spread points | Spread pips | Current swap long | Current swap short |
+  |---|---:|---:|---:|---:|
+  | EURAUD | 15 | 1.5 | -0.090788284 | +0.035443296 |
+  | GBPCAD | 18 | 1.8 | +0.026260429 | -0.092161942 |
+  | AUDCAD | 7 | 0.7 | +0.029051047 | -0.064899752 |
+  | CADJPY | 14 | 1.4 | -0.020989639 | -0.037449599 |
+
+  Swaps above are USD per 0.01 lot per ordinary night. Raw POINTS-mode terms,
+  contract/point units, triple-day code 3 and conversion references are preserved
+  in the proposal. USD conversion uses Oct 23 14:00 UTC sample-window bid quotes.
+  These current swap terms do not reconstruct historical 2020-2025 financing.
+- Commission 0 USD/lot/side and slippage 0 pips are carried existing explicit
+  assumptions, not calibrated from tick quotes. No real fills/commissions were
+  requested. The sampled P95 model is not a worst-case spread guarantee or proof
+  of full-history costs. No return-based method/parameter/pair selection occurred.
+- Evidence: `data/pepperstone_cost_calibration_20261024/recent_ticks/` contains
+  raw quotes, matching H1 checks, `proposed_pair_costs.yaml`,
+  `calibration_report.json`, `calibration_base_snapshot.yaml` and
+  `independent_validation.json`. All 80 listed evidence-file hashes verified;
+  statistics, clock/range consistency and swap calculations independently pass.
+- `uv run pytest -q tests/test_spreadcheck.py` with `PYTHONPATH=python`: 8 passed.
+  No active cost/config/pair-selection changes, backtest/dice/orders, credentials
+  or reserve strategy-result inspection. Sampling/proposal is complete; isolated
+  evaluation approval/freeze and remaining wiring/exporter work are still pending.
+
+## Full 2019 preparation history — pre-declaration (2026-10-24)
+
+- User confirmed the scope: all 17 known pairs, not every broker FX symbol:
+  AUDJPY, AUDUSD, EURGBP, EURJPY, EURUSD, GBPJPY, GBPUSD, NZDUSD, USDCAD,
+  USDCHF, USDJPY, EURAUD, GBPCAD, AUDCAD, CADJPY, EURNZD and GBPCHF.
+  AUDJPY remains parked in active selection; collecting it does not enable it.
+- Collect direct broker H1/H4/D1 for 2019-01-01 inclusive through 2020-01-01
+  exclusive in actual UTC. All required USD converters are already among these
+  17 pairs, so the request is 51 feeds. No extra pre-2019 warmup is requested.
+  This zero-extra-prefix collection setting does not disable strategy warmup.
+- Purpose: prepare indicators using 2019 before a future 2020-2025 evaluation.
+  No 2019 trades/results may enter that intended evaluation. Downloading files
+  alone does not enforce this; explicit intake and test-start boundaries remain
+  separate work. Do not merge/overwrite existing histories or modify settings.
+- Source: current Pepperstone-Demo terminal; no credentials/account switches,
+  trading-flag changes or orders. Allow bounded retries for history loading.
+  Preserve original API bytes, normalize the verified broker server clock to
+  UTC with US DST, and verify overlaps against the prior corrected collection.
+- Destination: `data/pepperstone_all17_2019_export_20261024/` (local-only).
+  Record query labels, actual UTC coverage, export date, checksums and quality
+  warnings. No resampling, filling gaps, backtests or strategy-result inspection.
+  Reserved EURNZD/GBPCHF strategy results remain untouched.
+
+### 2019 collection outcome — 2026-10-24 (preparation data only)
+
+- Completed 05:51:41 UTC: 17 pairs / 51 feeds / 136492 candles. Every pair has
+  259 D1 and 1554 H4 candles; H1 has 6216 except NZDUSD 6215. All required USD
+  converter pairs are included. No automatic retry was needed on initial reads.
+- Verified actual UTC opens are within 2019. First open: Jan 1 22:00 UTC;
+  last opens H1 Dec 31 21:00, H4 Dec 31 18:00 and D1 Dec 30 22:00 UTC.
+  Query bounds were translated to this account's observed broker-clock labels
+  before collection, then timestamps normalized with the existing US DST rule.
+- Preserved 102 raw CSV/metadata files and verified all 204 raw/normalized feed
+  checksums. All 51 feeds retain identical original price/volume strings. All
+  30906 overlapping candles match OHLC/volume in the prior corrected dataset.
+  Source/export time, query bounds, clock reference and audit are in the manifest.
+- Cross-chart checks: no OHLC mismatch or uncovered higher candle. One NZDUSD
+  H1 candle (2019-01-28 18:00 UTC) is absent, leaving one short H4/D1 group.
+  Three fresh targeted broker requests still returned only the neighboring
+  hours. Evidence: `missing_hour_recheck.json`. No bar was filled or invented.
+- Existing exporter/intake tests: 61 passed. Full 2019 is intended preparation
+  for 2020-2025 only; zero extra pre-2019 padding does not disable indicator
+  warmup. Explicit test-start/intake wiring remains pending. No backtest, dice,
+  orders, strategy-result inspection, active config changes or dataset merges.
+  AUDJPY remains parked; EURNZD/GBPCHF strategy results remain untouched.
+
+## Additional FX broker collection — pre-declaration (2026-10-24)
+
+- User authorized collection only: EURAUD, GBPCAD, AUDCAD and CADJPY as the
+  first evaluation group; EURNZD and GBPCHF reserved for a later untouched
+  strategy check. None appears in the available saved backtest/dice params
+  inspected before export; this cannot establish absence of external testing.
+- Request: 2020-01-01 inclusive to 2026-01-01 exclusive, UTC, plus the active
+  config-derived warmup (100 closed bars on each execution/bias chart).
+  Direct Pepperstone H1/H4/D1 candles only; required H1 USD converters are
+  AUDUSD, USDCAD, USDJPY, NZDUSD and USDCHF. No resampling or gap filling.
+- Source: current logged-in Pepperstone-Demo terminal, without loading
+  credentials, switching accounts, changing trading flags or sending orders.
+  Retry temporary history-read failures with bounded attempts; persistent
+  failures or insufficient history must be reported, not fabricated.
+- New local-only destination:
+  `data/pepperstone_unseen_fx_2020_2025_export_20261024/`.
+  Preserve UTC coverage, warmup, source/export timestamps and file checksums.
+  Do not replace/promote the existing active broker dataset or pair selection.
+- Collection is NOT an approved backtest or a completed validation. Quality
+  checks may inspect candle consistency/coverage, not signals or returns.
+  Before any strategy evaluation, agree and freeze pair-specific costs,
+  strategy/config snapshot, evaluation dates and pass/fail criteria separately.
+  Current broker spreads/swaps are not historical financing evidence. Existing
+  2023-2025 results are already inspected; these new crosses share currencies
+  and market events with tested pairs and are not independent market evidence.
+
+### Collection outcome — 2026-10-24 (not strategy results)
+
+- Completed 05:26:47 UTC from Pepperstone-Demo: 23 feeds / 507109 candles.
+  First-group and reserved-group assignments are unchanged. No history retries
+  were needed; the wrapper allowed up to 12 attempts with a 5-second delay.
+- Common prefix starts 2019-08-11 21:00 UTC, giving each pair 101 Daily and
+  606 H4 pre-2020 candles. Each pair has 1658 D1 candles; H4 counts are 9948
+  except EURNZD 9947. H1 counts: 39772 for the first four, EURNZD 39759,
+  GBPCHF 39769. All include warmup; every requested calendar year is present.
+- Clock finding: the API response encoded broker wall-clock values despite the
+  exporter labelling epochs UTC. All 186728 overlapping converter H1 candles
+  exactly match the verified existing imports after the existing US-DST-aware
+  Pepperstone conversion; zero match without it. Archived all 46 original
+  CSV/metadata files unchanged under `raw/`, then normalized timestamps only.
+  Original query labels and actual UTC coverage are recorded separately.
+- Final cross-timeframe audit: no OHLC mismatches or higher candles without
+  constituent coverage. Short groups remain: H1/H4 14 each first-group pair,
+  EURNZD 19 and GBPCHF 16; H4/D1 one EURNZD short group. Gaps/short sessions
+  may include missing hours; nothing was fabricated or filled. Last H1 opens
+  2025-12-31 19:00 UTC, H4 18:00 UTC, D1 2025-12-30 22:00 UTC (Dec 31 server).
+- Reproducibility files: `collection_spec.json`, `collection_base_snapshot.yaml`,
+  `timestamp_verification.json`, `quality_audit.json`, and per-feed metadata.
+  Price/volume strings match originals for all 23 feeds; all normalized/raw
+  checksums were verified. Existing exporter/intake tests: 61 passed.
+- No strategy returns inspected, backtests/dice/orders run, active config/pair
+  selection changed, credentials read or existing datasets replaced. Costs and
+  pass/fail rules are not finalized; API intake/pair wiring and shared exporter
+  clock repair remain separate work before evaluation. Collection TODO complete.
+
 ## Pepperstone H4/D1-only baseline — user-run reference, dice pending (2026-10-21)
 
 Superseding update: Malaysia new-entry window 09:15 inclusive–23:00 exclusive

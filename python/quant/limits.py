@@ -55,14 +55,17 @@ def entry_time_allowed(at: datetime, hours: dict) -> bool:
 
 
 def read_pair_limits(limits: dict) -> dict:
-    """Validate optional pair-entry limits; old configs leave both disabled."""
+    """Validate optional entry limits; old configs leave them disabled."""
     cap = limits.get("max_trades_per_pair_per_week", 0)
+    total = limits.get("max_trades_per_week", 0)
     stop = limits.get("disable_pair_after_daily_loss", False)
+    if isinstance(total, bool) or not isinstance(total, int) or total < 0:
+        raise ValueError("max_trades_per_week must be an integer >= 0")
     if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
         raise ValueError("max_trades_per_pair_per_week must be an integer >= 0")
     if not isinstance(stop, bool):
         raise ValueError("disable_pair_after_daily_loss must be true or false")
-    return {"max_trades_per_pair_per_week": cap,
+    return {"max_trades_per_week": total, "max_trades_per_pair_per_week": cap,
             "disable_pair_after_daily_loss": stop}
 
 

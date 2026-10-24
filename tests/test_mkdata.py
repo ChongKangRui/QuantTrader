@@ -156,6 +156,22 @@ def test_broker_plan_selection_timeframes_and_conversion(tmp_path):
     assert not any(s == "GBPUSD" for s, _ in plan["jobs"])
 
 
+@pytest.mark.parametrize("enabled", [True, False])
+def test_broker_plan_respects_effective_position_checks(tmp_path, enabled):
+    import yaml
+
+    root = _configs(tmp_path)
+    path = root / "_base.yaml"
+    base = yaml.safe_load(path.read_text(encoding="utf-8"))
+    base["backtest_data"] = {"use_broker_csv": enabled, "position_checks": "H1"}
+    path.write_text(yaml.safe_dump(base), encoding="utf-8")
+    plan = broker_plan(root, None, True)
+    assert plan["position_checks"] == ("H1" if enabled else "M1")
+    assert (("EURUSD", "M1") in plan["jobs"]) is not enabled
+    assert {("EURUSD", tf) for tf in ("H1", "H4", "D1")} <= set(plan["jobs"])
+    assert ("USDJPY", "H1") in plan["jobs"]
+
+
 def test_exporter_accepts_chart_combos_beyond_engine_without_resampling(tmp_path):
     plan = broker_plan(_configs(tmp_path, execution="H2", regime="W1", checks="H2"),
                        "EURUSD", False, 0)
@@ -330,3 +346,74 @@ def test_unknown_timeframe_and_bad_selection_fail_loudly(tmp_path):
     (root / "scan-selection.yml").write_text("pairs: {EURUSD: {enabled: 'false'}}\n", encoding="utf-8")
     with pytest.raises(ValueError, match="enabled values"):
         broker_plan(root, None, True)
+
+
+@pytest.mark.parametrize("server,utc", [
+    ("2020-01-02 00:00Z", "2020-01-01 22:00Z"),
+    ("2020-03-09 00:00Z", "2020-03-08 21:00Z"),
+    ("2020-10-26 00:00Z", "2020-10-25 21:00Z"),
+    ("2020-11-02 00:00Z", "2020-11-01 22:00Z")])
+def test_api_clock_roundtrip_preserves_ohlc_and_uses_us_dst(server, utc):
+    from quant.mkdata import broker_query_date
+
+    row = _rate(server)
+    converted = validate_broker_rates([row], "fake", "new_york_plus_7")
+    assert converted.time.iloc[0] == pd.Timestamp(utc)
+    assert int(broker_query_date(pd.Timestamp(utc), "new_york_plus_7").timestamp()) == row["time"]
+    for column in ("open", "high", "low", "close", "tick_volume"):
+        assert converted[column].iloc[0] == row[column]
+
+
+def test_pepperstone_export_normalizes_queries_warmup_closure_and_metadata(tmp_path):
+    plan = broker_plan(_configs(tmp_path, checks="H4"), "EURUSD", False)
+    broker = _Broker()
+    broker.account_info = lambda: SimpleNamespace(server="Pepperstone-Demo")
+    out = tmp_path / "export"
+    export_broker(broker, plan, *_dates(), out, chunk_days=1)
+    frame = pd.read_csv(out / "EURUSD_D1.csv")
+    stamps = pd.to_datetime(frame.time, utc=True)
+    assert stamps.iloc[0] == pd.Timestamp("2020-01-01 22:00Z")
+    assert stamps.iloc[-1] == pd.Timestamp("2020-01-05 22:00Z")
+    meta = json.loads((out / "EURUSD_D1.meta.json").read_text())
+    assert meta["broker_api_clock"] == "new_york_plus_7"
+    assert meta["requested_start_utc"] == _dates()[0].isoformat()
+    assert meta["api_query_start_label"].startswith("2020-01-02T00:00")
+    assert meta["api_query_end_exclusive_label"].startswith("2020-01-06T02:00")
+    assert meta["last_closed_open_utc"].startswith("2020-01-08T22:00")
+    assert broker.shutdowns == 1
+
+
+def test_explicit_utc_override_does_not_double_convert_pepperstone(tmp_path):
+    plan = broker_plan(_configs(tmp_path, checks="H4"), "EURUSD", False, 0)
+    plan["api_clock"] = "utc"
+    broker = _Broker()
+    broker.account_info = lambda: SimpleNamespace(server="Pepperstone-Demo")
+    out = tmp_path / "export"
+    export_broker(broker, plan, *_dates(), out)
+    assert pd.read_csv(out / "EURUSD_D1.csv").time.iloc[0].startswith("2020-01-04 00:00")
+
+
+def test_bad_api_clock_rejected_with_shutdown(tmp_path):
+    plan = broker_plan(_configs(tmp_path), "EURUSD", False)
+    plan["api_clock"] = "fixed_offset_guess"
+    broker = _Broker()
+    with pytest.raises(ValueError, match="clock"):
+        export_broker(broker, plan, *_dates(), tmp_path / "bad")
+    assert broker.shutdowns == 1 and not (tmp_path / "bad").exists()
+
+
+def test_api_stream_keeps_actual_utc_bounds_across_us_dst_weekend(tmp_path):
+    from quant.mkdata import _stream_broker_csv
+    broker = _Broker()
+    broker.rates[broker.TIMEFRAME_H1] = [_rate(stamp) for stamp in (
+        "2020-03-06 23:00Z", "2020-03-09 00:00Z", "2020-03-09 01:00Z")]
+    path = tmp_path / "dst.csv"
+    result = _stream_broker_csv(broker, "EURUSD.pro", "H1",
+        datetime(2020, 3, 6, 20, tzinfo=timezone.utc), datetime(2020, 3, 9, tzinfo=timezone.utc),
+        pd.Timestamp("2020-03-09 23:00Z"), path, 1, "new_york_plus_7")
+    times = pd.to_datetime(pd.read_csv(path).time, utc=True)
+    assert result["bars"] == 3
+    assert list(times.dt.strftime("%Y-%m-%d %H:%M")) == [
+        "2020-03-06 21:00", "2020-03-08 21:00", "2020-03-08 22:00"]
+    assert broker.range_calls[0][2] == datetime(2020, 3, 6, 22, tzinfo=timezone.utc)
+    assert broker.range_calls[-1][3].hour == 2  # Exclusive UTC midnight maps to server 03:00 minus one microsecond.

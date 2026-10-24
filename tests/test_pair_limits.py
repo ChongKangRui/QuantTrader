@@ -70,6 +70,12 @@ def test_dice_rejects_reference_without_enabled_hours(tmp_path):
     params["entry_hours"] = setup["entry_hours"]
     (tmp_path / "params.json").write_text(json.dumps(params))
     validate_reference_setup(setup, tmp_path)
+    setup["max_trades_per_week"] = 5
+    with pytest.raises(ValueError, match="limits differ"):
+        validate_reference_setup(setup, tmp_path)
+    params["max_trades_per_week"] = 5
+    (tmp_path / "params.json").write_text(json.dumps(params))
+    validate_reference_setup(setup, tmp_path)
 
 
 def test_live_outside_hours_stamps_bar_and_never_sends(tmp_path):
@@ -91,11 +97,11 @@ def test_backtest_hours_use_fill_not_signal_and_keep_later_exit():
         "low": [1.0999, 1.0999, 1.0999], "close": [1.1] * 3})
     candidate = {"t": 0, "direction": "LONG", "atr": 0.001}
     settings = {"stop_atr": 1.5, "tp_mult": 2.5, "use_trail": False, "use_be": False}
-    kwargs = dict(p=settings, costs=_zero_costs(), risk_usd=3, max_cost_ratio=0)
+    kwargs = dict(p=settings, costs=_zero_costs(), risk_usd=3, max_cost_ratio=0, bar_hours=4)
     hours = read_entry_hours({"entry_hours": {"enabled": True}})
     trades, _ = simulate(bars, "EURUSD", [candidate], entry_hours=hours, **kwargs)
     assert len(trades) == 1  # signal 08:00 local is outside; fill 12:00 is inside
-    assert pd.Timestamp(trades.iloc[0]["exit_time"]).hour == 16  # midnight local exit still runs
+    assert pd.Timestamp(trades.iloc[0]["exit_time"]).hour == 20  # completed H4 exit still runs outside entry hours
     rejected, funnel = simulate(bars, "EURUSD", [{**candidate, "t": 1}], entry_hours=hours, **kwargs)
     assert rejected.empty and funnel["entry_hours"] == 1
     legacy, _ = simulate(bars, "EURUSD", [candidate], **kwargs)
@@ -286,8 +292,9 @@ def test_invalid_pair_controls_rejected(limits):
 def test_active_config_and_legacy_defaults():
     settings = read_trade_cfg("configs")
     assert settings["max_trades_per_pair_per_week"] == 2
+    assert settings["max_trades_per_week"] == 5
     assert settings["disable_pair_after_daily_loss"] is True
-    assert read_pair_limits({}) == {"max_trades_per_pair_per_week": 0,
+    assert read_pair_limits({}) == {"max_trades_per_week": 0, "max_trades_per_pair_per_week": 0,
                                     "disable_pair_after_daily_loss": False}
 
 
@@ -296,3 +303,158 @@ def test_utc_week_boundary_is_not_local_monday():
     local = datetime(2026, 10, 19, 1, tzinfo=timezone(timedelta(hours=8)))
     deals = [_deal(at=datetime(2026, 10, 12, tzinfo=timezone.utc))]
     assert pair_history_reason(None, deals, MAGIC, "EURUSD", local, 1, False) == "pair_week_cap"
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, True, "5", None])
+def test_invalid_portfolio_week_cap(value):
+    with pytest.raises(ValueError, match="max_trades_per_week"):
+        read_pair_limits({"max_trades_per_week": value})
+
+
+def test_portfolio_week_cap_all_pairs_and_utc_monday_reset():
+    symbols = ["AUDUSD", "EURUSD", "GBPUSD", "NZDUSD", "USDCAD", "USDCHF"]
+    trades = {sym: _pt(sym, f"2026-10-12 {i + 1:02}:00", f"2026-10-12 {i + 2:02}:00")
+              for i, sym in enumerate(symbols)}
+    trades["USDJPY"] = _pt("USDJPY", "2026-10-18 23:59", "2026-10-19 01:00")
+    trades["EURJPY"] = _pt("EURJPY", "2026-10-19 00:00", "2026-10-19 02:00")
+    kept, drops = portfolio_filter(trades, 0, 0, 0, max_trades_per_week=5)
+    assert sum(map(len, kept.values())) == 6
+    assert len(kept["EURJPY"]) == 1
+    assert len(kept["USDCHF"]) == len(kept["USDJPY"]) == 0
+    assert [d["reason"] for d in drops] == ["cap_week", "cap_week"]
+    assert sum(map(len, portfolio_filter(trades, 0, 0, 0)[0].values())) == 8
+
+
+def test_portfolio_week_cap_rejects_do_not_consume_quota():
+    trades = {"AUDUSD": _pt("AUDUSD", "2026-10-12 01:00", "2026-10-12 03:00"),
+              "EURUSD": _series(
+                  ("2026-10-12 02:00", "2026-10-12 04:00", "LONG", -1.0),
+                  ("2026-10-12 04:00", "2026-10-12 05:00"),
+                  ("2026-10-13 01:00", "2026-10-13 02:00"))}
+    kept, drops = portfolio_filter(trades, 1, 0, 0, max_trades_per_week=2,
+                                   max_trades_per_day=2, disable_pair_after_daily_loss=True)
+    assert len(kept["EURUSD"]) == 1
+    assert kept["EURUSD"].iloc[0]["entry_time"] == "2026-10-12 04:00"
+    assert [d["reason"] for d in drops] == ["open_max", "cap_week"]
+
+
+def test_dice_week_cap_uses_unified_daily_admission():
+    trades = {"AUDUSD": _pt("AUDUSD", "2026-10-12 01:00", "2026-10-12 03:00"),
+              "EURUSD": _series(
+                  ("2026-10-12 02:00", "2026-10-12 04:00"),
+                  ("2026-10-12 04:00", "2026-10-12 05:00"))}
+    setup = {"max_day": 2, "max_open": 1, "max_ccy_net": 0, "weekly_r": 0,
+             "max_trades_per_week": 2}
+    kept, cap_drops, drops = apply_filters(trades, setup)
+    assert sum(map(len, kept.values())) == 2
+    assert cap_drops == []
+    assert [d["reason"] for d in drops] == ["open_max"]
+
+
+def test_live_portfolio_week_cap_recovers_history_without_memory(tmp_path):
+    deals = [_deal(i, symbol="GBPUSD") for i in range(5)]
+    deals += [_deal(0, symbol="GBPUSD"), _deal(9, entry=1),
+              _deal(10, magic=999), _deal(11, at=NOW - timedelta(days=7))]
+    mt5 = _FakeMT5()
+    settings = cfg(max_trades_per_week=5, max_trades_per_day=0)
+    assert _trade(mt5, {}, tmp_path / "j.csv", deals=deals,
+                  cfg_=settings) == "skip cap-week"
+    assert _trade(mt5, {}, tmp_path / "j.csv", deals=deals,
+                  cfg_=dict(settings, max_trades_per_week=0)).startswith("PLAN")
+    assert not mt5.sent
+
+
+def test_live_fifth_fill_blocks_next_pair_with_stale_history_and_after_restart(tmp_path):
+    from quant.trader import trade_on_bar, save_mem, load_mem
+    mt5, mem = _FakeMT5(), {}
+    deals = [_deal(i, symbol="AUDUSD") for i in range(4)]
+    settings = cfg(max_trades_per_week=5, max_trades_per_day=0)
+    assert _trade(mt5, mem, tmp_path / "j.csv", deals=deals,
+                  cfg_=settings, dry=False).startswith("ORDER pos=")
+    assert mem["weekly_entries"]["count"] == 5
+    path = tmp_path / "memory.json"
+    save_mem(path, mem)
+    for state in (mem, load_mem(path)):
+        msg = trade_on_bar(mt5, "GBPUSD", "GBPUSD", "LONG", 2, NOW,
+            magic=MAGIC, dry=False, params={}, journal_path=tmp_path / "j.csv",
+            mem=state, cfg=settings, deals=deals, ranges=[])
+        assert msg == "skip cap-week"
+    assert len(mt5.sent) == 1
+    # History catching up must not count the fifth fill twice.
+    mt5._positions = []
+    assert _trade(mt5, mem, tmp_path / "j.csv", bar=3,
+        cfg_=dict(settings, max_trades_per_week=6),
+        deals=[*deals, _deal(100)]).startswith("PLAN")
+    assert mem["weekly_entries"]["count"] == 5
+
+
+@pytest.mark.parametrize("dry,fail", [(True, False), (False, True)])
+def test_live_week_cap_plans_and_failed_orders_consume_no_quota(tmp_path, dry, fail):
+    mt5, mem = _FakeMT5(fail_open=fail), {}
+    for bar in (1, 2):
+        msg = _trade(mt5, mem, tmp_path / "j.csv", bar=bar, dry=dry,
+                     cfg_=cfg(max_trades_per_week=1))
+        assert msg.startswith("PLAN" if dry else "ORDER FAILED")
+        assert mem["weekly_entries"]["count"] == 0
+
+
+def test_live_week_cap_missing_history_fails_closed(tmp_path):
+    mt5, mem = _FakeMT5(), {}
+    assert _trade(mt5, mem, tmp_path / "j.csv", deals=None,
+        cfg_=cfg(max_trades_per_week=5)).startswith("DATA ERROR")
+    assert not mt5.sent and not mem.get("bars")
+
+
+def test_live_week_cap_local_week_and_monday_rollover(tmp_path):
+    from quant.trader import trade_on_bar
+    mt5, mem = _FakeMT5(), {}
+    settings = cfg(max_trades_per_week=1, max_trades_per_day=0)
+    deals = [_deal(at=datetime(2026, 10, 12, tzinfo=timezone.utc))]
+    local = datetime(2026, 10, 19, 1, tzinfo=timezone(timedelta(hours=8)))
+    def check(at, bar):
+        return trade_on_bar(mt5, "EURUSD", "EURUSD", "LONG", bar, at,
+            magic=MAGIC, dry=True, params={"stop_atr": 1.5, "tp_mult": 3},
+            journal_path=tmp_path / "j.csv", mem=mem, cfg=settings, deals=deals, ranges=[])
+    assert check(local, 1) == "skip cap-week"
+    assert check(datetime(2026, 10, 19, tzinfo=timezone.utc), 2).startswith("PLAN")
+    assert mem["weekly_entries"]["count"] == 0
+
+
+def test_live_week_cap_counts_fill_when_position_discovery_fails(tmp_path, monkeypatch):
+    from quant import trader
+    monkeypatch.setattr(trader, "_find_new_position", lambda *args: None)
+    mt5, mem = _FakeMT5(), {}
+    assert _trade(mt5, mem, tmp_path / "j.csv", dry=False,
+        cfg_=cfg(max_trades_per_week=1)).startswith("ORDER SENT but position not found")
+    assert mem["weekly_entries"]["count"] == 1
+    mt5._positions = []
+    assert _trade(mt5, mem, tmp_path / "j.csv", bar=2,
+        cfg_=cfg(max_trades_per_week=1)) == "skip cap-week"
+
+
+def test_weekly_cap_present_in_active_config_and_both_presets():
+    from pathlib import Path
+    import yaml
+    for name in ("_base.yaml", "_base_h1h4.yaml", "_base_h4d1.yaml"):
+        base = yaml.safe_load((Path("configs") / name).read_text(encoding="utf-8"))
+        assert read_pair_limits(base["limits"])["max_trades_per_week"] == 5
+
+
+def test_trade_pass_keeps_managing_positions_at_weekly_cap(tmp_path, monkeypatch):
+    from quant import trader, monitor
+    managed = []
+    monkeypatch.setattr(trader, "manage_book", lambda *a, **kw: managed.append(a[1]) or [])
+    mt5 = _FakeMT5()
+    settings = cfg(max_trades_per_week=5, max_trades_per_day=0)
+    tcfg = {"expected_account": None, "journal": tmp_path / "j.csv",
+            "mem_path": tmp_path / "memory.json", "magic": MAGIC, "dry": True,
+            "base": settings, "base_costs": {}, "ranges": []}
+    pairs = [{"symbol": "EURUSD", "params": {}, "costs": {}}]
+    rows = [SimpleNamespace(symbol="EURUSD", ok=True, bias="UP", has_position=True)]
+    monitor._trade_pass(mt5, pairs, rows, {"EURUSD": 1}, tcfg, "DEMO", {},
+                        [_deal(i, symbol="GBPUSD") for i in range(5)], NOW)
+    assert managed == ["EURUSD"]
+    saved = trader.load_mem(tcfg["mem_path"])
+    assert saved["weekly_entries"]["count"] == 5
+    assert saved["bars"]["EURUSD"] == "1"
+    assert mt5.sent == []

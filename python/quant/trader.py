@@ -16,6 +16,7 @@ import csv
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import NamedTuple
 
 import pandas as pd
 
@@ -23,7 +24,7 @@ from quant import rules
 from quant.journal import append_row, build_comment
 from quant.limits import md_in_ranges, pair_entry_reason, week_start, read_entry_hours, entry_time_allowed
 from quant.live import _find_new_position, build_request, pick_filling, snap_volume
-from quant.signals import check_entry
+from quant.signals import check_entry, crossover_signals, validate_crossover, opposite_crossover
 
 ENTRY_IN = 0        # mt5.DEAL_ENTRY_IN
 ENTRY_OUT = 1       # mt5.DEAL_ENTRY_OUT
@@ -363,19 +364,50 @@ def plan_entry(direction: str, fill: float, atr: float, symbol: str, info,
             "lot_fallback": lot_fallback}, ""
 
 
+def account_matches(mt5, expected: dict | None) -> bool:
+    """Fail closed if the terminal is not on the selected login, server and type."""
+    if expected is None:
+        return True  # Existing standalone helpers retain their caller-owned selection.
+    try:
+        info = mt5.account_info()
+        # MT5 account trade-mode enum: demo=0, real=2; contest accounts are refused.
+        mode = getattr(mt5, "ACCOUNT_TRADE_MODE_REAL", 2) if expected["live"] else getattr(
+            mt5, "ACCOUNT_TRADE_MODE_DEMO", 0)
+        return (info is not None and int(info.login) == int(expected["login"])
+                and str(info.server).strip() == str(expected["server"]).strip()
+                and int(info.trade_mode) == mode)
+    except Exception:
+        return False
+
+
+class EntryNotSent(NamedTuple):
+    """A local refusal, unlike an unknown reply after order_send was called."""
+
+    reason: str
+
+
 def send_entry(mt5, broker: str, direction: str, plan: dict, magic: int,
-               filling: int) -> tuple[bool, object, float]:
+               filling: int, expected_account: dict | None = None) -> tuple[bool, object, float]:
     """Market entry with attached SL/TP. Returns (ok, result, fill_price)."""
-    digits = int(getattr(mt5.symbol_info(broker), "digits", 5))
-    tick = mt5.symbol_info_tick(broker)
-    if tick is None:
-        return False, None, 0.0
-    long = direction == "LONG"
-    fill = round(float(tick.ask if long else tick.bid), digits)
-    req = build_request(mt5, symbol=broker, side="BUY" if long else "SELL",
-                        volume=plan["lots"], price=fill, magic=magic,
-                        filling=filling, comment=build_comment(direction, "E1"))
-    req["sl"], req["tp"] = plan["sl"], plan["tp"]
+    try:
+        info = mt5.symbol_info(broker)
+        if info is None:
+            return False, EntryNotSent("no symbol info"), 0.0
+        digits = int(getattr(info, "digits", 5))
+        tick = mt5.symbol_info_tick(broker)
+        if tick is None:
+            return False, EntryNotSent("no tick"), 0.0
+        long = direction == "LONG"
+        fill = round(float(tick.ask if long else tick.bid), digits)
+        req = build_request(mt5, symbol=broker, side="BUY" if long else "SELL",
+                             volume=plan["lots"], price=fill, magic=magic,
+                             filling=filling, comment=build_comment(direction, "E1"))
+        req["sl"], req["tp"] = plan["sl"], plan["tp"]
+        if not account_matches(mt5, expected_account):
+            return False, EntryNotSent("account mismatch"), 0.0
+    except Exception as exc:
+        return False, EntryNotSent(f"entry preparation failed: {exc}"), 0.0
+    # Exceptions after this boundary cannot prove that the broker received nothing.
     res = mt5.order_send(req)
     ok = res is not None and int(getattr(res, "retcode", -1)) == RETCODE_DONE
     if ok and getattr(res, "price", None):
@@ -398,6 +430,73 @@ def _gate_check(mt5, broker: str, direction: str, params: dict,
     return bool(res["signal"]), (res["fail"] or "?"), float(res["atr"] or 0.0)
 
 
+def _refresh_crossover(mt5, broker, symbol, params, mem, magic, exec_tf="H4", bar_secs=None):
+    """Shared closed-bar memory for entry and management, independent of entry guards."""
+    name = str(exec_tf).removeprefix("TIMEFRAME_")
+    hours = {"H1": 1, "H4": 4, "D1": 24}[name]
+    tf = getattr(mt5, f"TIMEFRAME_{name}", {"H1": TIMEFRAME_H1, "H4": TIMEFRAME_H4,
+                                              "D1": TIMEFRAME_D1}[name])
+    rows = mt5.copy_rates_from_pos(broker, tf, 1, int(params.get("crossover_history_bars", 6000)))
+    if rows is None or len(rows) == 0:
+        raise ValueError("crossover closed-bar history unavailable")
+    bars = pd.DataFrame(rows)
+    bars["time"] = pd.to_datetime(bars["time"], unit="s", utc=True)
+    if bar_secs is not None and int(bars["time"].iloc[-1].timestamp()) != bar_secs:
+        raise ValueError("crossover signal bar changed during fetch; retry next poll")
+    book = mem.setdefault("crossovers", {})
+    state = book.get(symbol) or {}
+    if state and state.get("magic") != magic:
+        raise ValueError("crossover memory belongs to another magic number")
+    if state.get("exec_tf", name) != name:
+        raise ValueError("crossover execution timeframe changed; use separate matching memory")
+    previous = state.get("indicators")
+    if (previous and not state.get("crossover_time")
+            and bars["time"].iloc[0] < pd.Timestamp(previous["first_time"])):
+        previous = None  # A wider startup search can recover an older, previously unseen cross.
+    records, indicators = crossover_signals(bars, params, previous)
+    latest = indicators["latest"]
+    cycle = latest["crossover_time"]
+    used = int(state.get("used", 0)) if state.get("crossover_time") == cycle else 0
+    state = {**state, "magic": magic, "exec_tf": name, "indicators": indicators,
+             "crossover_time": cycle, "used": used}
+    book[symbol] = state
+    return state, records, hours
+
+
+def _crossover_check(mt5, broker: str, symbol: str, params: dict, cfg: dict,
+                      mem: dict, magic: int, now: datetime, bar_secs: int) -> dict:
+    """Restore the last real cross, then reconcile actual entries from broker history."""
+    state, _, hours = _refresh_crossover(mt5, broker, symbol, params, mem, magic,
+                                        cfg.get("exec_tf") or "H4", bar_secs)
+    latest = state["indicators"]["latest"]
+    cycle = state["crossover_time"]
+    if cycle is None:
+        return {**latest, "blocked": "crossover-memory", "used": 0}
+    confirmed = pd.Timestamp(cycle) + pd.Timedelta(hours=hours)
+    history_from = min(confirmed, pd.Timestamp(state.get("pending_since", confirmed)))
+    deals = mt5.history_deals_get(history_from.to_pydatetime(), now)
+    if deals is None:
+        raise ValueError("crossover deal history unavailable")
+    entries = [d for d in deals if getattr(d, "magic", None) == magic
+               and getattr(d, "symbol", "") == broker and getattr(d, "entry", -1) == ENTRY_IN
+               and float(getattr(d, "time", 0)) <= now.timestamp()]
+    if state.get("pending_bar"):
+        if not any(float(d.time) >= pd.Timestamp(state["pending_since"]).timestamp() for d in entries):
+            raise ValueError("unresolved crossover order; check broker history before retrying")
+        mem.setdefault("bars", {})[symbol] = state.pop("pending_bar")
+        state.pop("pending_since", None)
+    count = len({int(d.position_id) for d in entries if float(d.time) >= confirmed.timestamp()})
+    state["used"] = max(state["used"], count)
+    fill_time = bar_secs + hours * 3600
+    if any(float(d.time) >= fill_time for d in entries):
+        # Covers a crash after the fill, even if that position has already closed.
+        mem.setdefault("bars", {})[symbol] = str(bar_secs)
+        return {**latest, "blocked": "seen", "used": state["used"]}
+    cap = int(params.get("crossover_max_entries", 2))
+    return {**latest, "used": state["used"],
+            "blocked": "crossover-cap" if state["used"] >= cap else None}
+
+
 def trade_on_bar(mt5, broker: str, symbol: str, direction: str, bar_secs: int,
                  now: datetime, *, magic: int, dry: bool, params: dict,
                  journal_path, mem: dict, cfg: dict, deals, ranges: list) -> str:
@@ -410,9 +509,21 @@ def trade_on_bar(mt5, broker: str, symbol: str, direction: str, bar_secs: int,
     guard against double orders. Skipped bars stamp too, so a guard does not
     re-fire every cycle. DATA ERROR leaves the bar unstamped for a retry.
     """
+    if not account_matches(mt5, cfg.get("expected_account")):
+        return "DATA ERROR - account mismatch (nothing sent)"
+    if cfg.get("recording_error"):
+        return "DATA ERROR - durable recording unavailable/unresolved (new entries blocked)"
     if (mem.get("bars") or {}).get(symbol) == str(bar_secs):
         return "seen"
     now = now.astimezone(timezone.utc)
+    cross = None
+    try:
+        if validate_crossover(params):
+            cross = _crossover_check(mt5, broker, symbol, params, cfg, mem, magic, now, bar_secs)
+            if cross["blocked"] == "seen":
+                return "seen"
+    except Exception as exc:
+        return f"DATA ERROR - crossover: {exc}"
     # History failures must not stamp the bar: retry without permitting an order.
     max_week = int(cfg.get("max_trades_per_pair_per_week", 0) or 0)
     stop_after_loss = bool(cfg.get("disable_pair_after_daily_loss", False))
@@ -425,18 +536,43 @@ def trade_on_bar(mt5, broker: str, symbol: str, direction: str, bar_secs: int,
             return f"DATA ERROR - pair limits: {exc}"
     if deals is None:
         return "DATA ERROR - deal history unavailable"
+    total_week = int(cfg.get("max_trades_per_week", 0) or 0)
+    week_count = 0
+    if total_week > 0:
+        key = week_start(now).isoformat()
+        state = mem.get("weekly_entries") or {}
+        history_count = opened_positions_today(
+            [d for d in deals if float(getattr(d, "time", 0)) <= now.timestamp()],
+            magic, week_start(now).timestamp())
+        # Keep confirmed sends ahead of the shared history snapshot, including restarts.
+        week_count = max(history_count, int(state.get("count", 0))
+                         if state.get("week") == key and state.get("magic") == magic else 0)
+        mem["weekly_entries"] = {"week": key, "magic": magic, "count": week_count}
     info = mt5.symbol_info(broker)
     if info is None:
         return "DATA ERROR - no symbol info"
-    reason = ""
+    reason = (cross.get("blocked") or "") if cross else ""
     sig_atr = 0.0
-    open_all = our_positions(mt5, magic)
-    if [p for p in open_all if str(getattr(p, "symbol", "")) == broker]:
+    if cross:
+        try:
+            positions = mt5.positions_get()
+            if positions is None:
+                raise ValueError("position history unavailable")
+            pair_open = any(str(getattr(p, "symbol", "")) == broker for p in positions)
+            open_all = [p for p in positions if getattr(p, "magic", None) == magic]
+        except Exception as exc:
+            return f"DATA ERROR - crossover positions: {exc}"
+    else:
+        open_all = our_positions(mt5, magic)
+        pair_open = any(str(getattr(p, "symbol", "")) == broker for p in open_all)
+    if pair_open:
         reason = "pair-open"
     elif cfg.get("halted"):
         reason = "weekly-halt"
     elif pair_reason:
         reason = pair_reason
+    elif total_week > 0 and week_count >= total_week:
+        reason = "cap-week"
     # sequential guards (NOT an elif chain): a non-triggered cap must still
     # let the next gate run — this bug once skipped the E1 gate entirely.
     fill_day_ts = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
@@ -452,6 +588,8 @@ def trade_on_bar(mt5, broker: str, symbol: str, direction: str, bar_secs: int,
         reason = "window"
     if not reason and not entry_time_allowed(now, read_entry_hours(cfg)):
         reason = "entry-hours"
+    if not reason and direction not in ("LONG", "SHORT"):
+        reason = "bias-neutral"
     if not reason:
         breach = positions_breach(open_all, symbol, direction,
                                   int(cfg.get("max_total_positions", 0) or 0),
@@ -459,9 +597,13 @@ def trade_on_bar(mt5, broker: str, symbol: str, direction: str, bar_secs: int,
         if breach:
             reason = breach
         else:
-            ok, fail, sig_atr = _gate_check(
-                mt5, broker, direction, params,
-                exec_tf=str(cfg.get("exec_tf") or "TIMEFRAME_H1"))
+            if cross:
+                ok = cross["signal"] and direction == cross["direction"]
+                fail, sig_atr = "W1", cross["atr"]
+            else:
+                ok, fail, sig_atr = _gate_check(
+                    mt5, broker, direction, params,
+                    exec_tf=str(cfg.get("exec_tf") or "TIMEFRAME_H1"))
             if not ok:
                 reason = f"gate {fail}"
     if not reason:
@@ -492,15 +634,24 @@ def trade_on_bar(mt5, broker: str, symbol: str, direction: str, bar_secs: int,
         else:
             return _send_or_plan(mt5, broker, symbol, direction, plan, str(bar_secs),
                                  now, magic=magic, dry=dry, journal_path=journal_path,
-                                 mem=mem,
-                                 before={int(p.ticket) for p in open_all})
+                                  mem=mem,
+                                  expected_account=cfg.get("expected_account"),
+                                  before={int(p.ticket) for p in open_all},
+                                   crossover=cross is not None, memory_path=cfg.get("memory_path"),
+                                   account_store=cfg.get("account_store"))
     (mem.setdefault("bars", {}))[symbol] = str(bar_secs)
-    return f"skip {reason}"
+    detail = (f" [cross {cross['direction']} {cross['crossover_time']}; "
+              f"used {cross['used']}/{params.get('crossover_max_entries', 2)}]" if cross else "")
+    return f"skip {reason}{detail}"
 
 
 def _send_or_plan(mt5, broker: str, symbol: str, direction: str, plan: dict,
                   stamp: str, now: datetime, *, magic: int, dry: bool,
-                  journal_path, mem: dict, before: set = ()) -> str:
+                   journal_path, mem: dict, before: set = (),
+                   expected_account: dict | None = None, crossover: bool = False,
+                    memory_path: str | Path | None = None, account_store=None) -> str:
+    if not account_matches(mt5, expected_account):
+        return "DATA ERROR - account mismatch (nothing sent)"
     long = direction == "LONG"
     dir_lbl = "LONG" if long else "SHORT"
     if dry:
@@ -511,15 +662,60 @@ def _send_or_plan(mt5, broker: str, symbol: str, direction: str, plan: dict,
              reason=f"dry-run plan: stop {plan['stop_dist']:.5f} tp {plan['tp_dist']:.5f} "
                     f"1R {plan['risk_usd']}$ lots {plan['lots']} (nothing sent)")
         return f"PLAN lots={plan['lots']} 1R={plan['risk_usd']}$ (dry-run)"
+    if expected_account is not None and account_store is None:
+        return "DATA ERROR - durable account recording required (nothing sent)"
     info = mt5.symbol_info(broker)
     filling = pick_filling(mt5, int(getattr(info, "filling_mode", 0) or 0))
     if filling is None:
         # deterministic per-symbol problem: stamp so the bar isn't retried forever
         (mem.setdefault("bars", {}))[symbol] = stamp
         return "DATA ERROR - unsupported filling mode (bar skipped)"
-    ok, res, fill = send_entry(mt5, broker, direction, plan, magic, filling)
+    if crossover and memory_path is None:
+        return "DATA ERROR - crossover order requires durable memory_path"
+    intent = f"{magic}:{symbol}:{stamp}"
+    if account_store is not None:
+        try:
+            if account_store.unresolved():
+                return "ORDER UNCONFIRMED - broker reconciliation required (nothing sent)"
+            account_store.begin(intent, {"symbol": broker, "direction": direction,
+                                        "magic": magic, "time": now.isoformat(), "plan": plan})
+        except Exception as exc:
+            return f"DATA ERROR - durable order recording: {exc} (nothing sent)"
+    if crossover:
+        state = mem["crossovers"][symbol]
+        state.update(pending_bar=stamp, pending_since=now.replace(microsecond=0).isoformat())
+        save_mem(memory_path, mem)  # Write ahead: an interrupted send must never be guessed safe.
+    ok, res, fill = send_entry(mt5, broker, direction, plan, magic, filling,
+                                expected_account=expected_account)
+    not_sent = isinstance(res, EntryNotSent)
+    if account_store is not None:
+        try:
+            account_store.result(intent, res, sent=not not_sent)
+        except Exception as exc:
+            (mem.setdefault("bars", {}))[symbol] = stamp
+            return f"ORDER UNCONFIRMED - recording failed: {exc}; CHECK TERMINAL"
     if not ok:
+        # MT5 request refusals prove no fill; partial/placed/timeout/unknown replies do not.
+        from quant.account_store import REJECTED_CODES
+        definite_no_fill = not_sent or getattr(res, "retcode", None) in REJECTED_CODES
+        if crossover and definite_no_fill:
+            state.pop("pending_bar", None)
+            state.pop("pending_since", None)
+            save_mem(memory_path, mem)
+        elif not definite_no_fill and (crossover or account_store is not None):
+            return f"ORDER UNCONFIRMED rc={getattr(res, 'retcode', 'None')} - CHECK TERMINAL"
+        if not_sent:
+            return f"DATA ERROR - {res.reason} (nothing sent)"
         return f"ORDER FAILED rc={getattr(res, 'retcode', 'None')}"  # bar unstamped: retry
+    if crossover:
+        state["used"] += 1  # A confirmed fill counts even when position discovery fails.
+        state.pop("pending_bar", None)
+        state.pop("pending_since", None)
+        mem.setdefault("bars", {})[symbol] = stamp
+        save_mem(memory_path, mem)
+    state = mem.get("weekly_entries") or {}
+    if state.get("week") == week_start(now).isoformat() and state.get("magic") == magic:
+        state["count"] += 1  # Count a confirmed fill even if position discovery fails.
     pos = _find_new_position(mt5, broker, set(before or ()), magic)
     if pos is None:
         # order may still have filled; stamp to prevent a second send
@@ -540,12 +736,16 @@ def _send_or_plan(mt5, broker: str, symbol: str, direction: str, plan: dict,
 
 
 def manage_book(mt5, broker: str, symbol: str, params: dict, magic: int, dry: bool,
-                journal_path, mem: dict, journal_rows: dict) -> list[str]:
+                 journal_path, mem: dict, journal_rows: dict,
+                 expected_account: dict | None = None, exec_tf: str = "H4",
+                 memory_path: str | Path | None = None) -> list[str]:
     """One management pass: refresh the book, then trail/BE armed stops.
 
     Stop math is the shared rules math; a move is sent only when it improves
     the broker's current SL by more than a sub-tick nudge.
     """
+    if not account_matches(mt5, expected_account):
+        return ["DATA ERROR - account mismatch (management refused)"]
     msgs: list[str] = []
     info = mt5.symbol_info(broker)
     if info is None:
@@ -554,6 +754,15 @@ def manage_book(mt5, broker: str, symbol: str, params: dict, magic: int, dry: bo
     if tick is None:
         return ["DATA ERROR - no tick (manage)"]
     mem = sync_book(mt5, magic, symbol, info, params, journal_rows, mem, journal_path)
+    crosses, cross_error, cross_hours = [], None, None
+    if params.get("use_crossover_exit", False):
+        try:
+            validate_crossover(params)
+            state, crosses, cross_hours = _refresh_crossover(mt5, broker, symbol, params, mem, magic, exec_tf)
+            crosses = crosses + [state["indicators"]["latest"]]
+        except Exception as exc:
+            cross_error = f"DATA ERROR - crossover exit: {exc}"
+            msgs.append(cross_error)
     digits = int(getattr(info, "digits", 5))
     for ticket_str, ctx in (mem.get("open") or {}).items():
         if ctx.get("symbol") != symbol:
@@ -562,6 +771,17 @@ def manage_book(mt5, broker: str, symbol: str, params: dict, magic: int, dry: bo
                     if int(p.ticket) == int(ticket_str)), None)
         if pos is None:  # closed mid-pass; the next sync journals it
             continue
+        if params.get("use_crossover_exit", False):
+            opened = pd.Timestamp(float(pos.time), unit="s", tz="UTC")
+            side = "LONG" if int(pos.type) == POSITION_BUY else "SHORT"
+            for record in crosses:
+                if opposite_crossover(record, side, opened, cross_hours):
+                    ctx["crossover_exit_at"] = record["crossover_time"]
+                    break
+            if ctx.get("crossover_exit_at") and cross_error is None:
+                msgs.append(close_on_crossover(mt5, pos, ctx, info, magic, dry,
+                                               journal_path, expected_account, mem, memory_path))
+                continue
         cur_sl = float(getattr(pos, "sl", 0) or 0)
         new_sl, best, _act = trail_decision(ctx, float(tick.bid), params, cur_sl)
         ctx["best"] = best
@@ -572,7 +792,7 @@ def manage_book(mt5, broker: str, symbol: str, params: dict, magic: int, dry: bo
         if dry:
             msgs.append(f"TRAIL(plan) pos={ticket_str}: SL {cur_sl:.5f} -> {new_sl:.5f}")
             continue
-        ok, res = modify_sl(mt5, pos, new_sl)
+        ok, res = modify_sl(mt5, pos, new_sl, expected_account=expected_account)
         if ok:
             note(journal_path, symbol=symbol, ticket=int(ticket_str),
                  volume=ctx.get("lots", 0.01), direction=ctx["direction"],
@@ -583,6 +803,51 @@ def manage_book(mt5, broker: str, symbol: str, params: dict, magic: int, dry: bo
         else:
             msgs.append(f"TRAIL FAILED pos={ticket_str} (rc={getattr(res, 'retcode', 'None')})")
     return msgs
+
+
+def close_on_crossover(mt5, pos, ctx, info, magic, dry, journal_path, expected_account=None,
+                        mem=None, memory_path=None):
+    """Close this hedging ticket only; refresh remaining volume on every retry."""
+    if dry:
+        return f"EXIT(plan) crossover pos={pos.ticket} (nothing sent)"
+    if ctx.get("crossover_close_pending"):
+        return f"EXIT UNCONFIRMED crossover pos={pos.ticket}; broker reconciliation required"
+    if memory_path is None or mem is None:
+        return "DATA ERROR - crossover close requires durable memory_path"
+    if not account_matches(mt5, expected_account):
+        return "DATA ERROR - account mismatch (crossover close refused)"
+    fresh = mt5.positions_get(symbol=pos.symbol)
+    if fresh is None:
+        return "DATA ERROR - positions unavailable (crossover close)"
+    pos = next((p for p in fresh if p.ticket == pos.ticket and p.magic == magic), None)
+    if pos is None:
+        return "EXIT crossover already closed"
+    if not mt5.symbol_select(pos.symbol, True):
+        return "DATA ERROR - symbol selection failed (crossover close)"
+    tick = mt5.symbol_info_tick(pos.symbol)
+    filling = pick_filling(mt5, int(getattr(info, "filling_mode", 0) or 0))
+    if tick is None or filling is None:
+        return "DATA ERROR - no tick/filling mode (crossover close)"
+    buy = int(pos.type) != POSITION_BUY
+    req = build_request(mt5, symbol=pos.symbol, side="BUY" if buy else "SELL",
+                         volume=float(pos.volume), price=float(tick.ask if buy else tick.bid),
+                         magic=magic, filling=filling, comment="crossover-exit")
+    # MT5 hedging closes require the 'position' ticket, not a new opposite position.
+    req["position"] = int(pos.ticket)
+    if not account_matches(mt5, expected_account):
+        return "DATA ERROR - account mismatch (crossover close refused)"
+    ctx["crossover_close_pending"] = True
+    save_mem(memory_path, mem)  # Unknown sends must survive a crash without a duplicate close.
+    res = mt5.order_send(req)
+    # MT5 DONE_PARTIAL confirms a fill; the next pass closes only the refreshed remainder.
+    if res is None or int(getattr(res, "retcode", -1)) not in (RETCODE_DONE, 10010):
+        return f"EXIT UNCONFIRMED crossover pos={pos.ticket}; verify broker before retry"
+    ctx.pop("crossover_close_pending", None)
+    save_mem(memory_path, mem)
+    note(journal_path, symbol=pos.symbol, ticket=int(pos.ticket), volume=float(pos.volume),
+         direction="LONG" if not buy else "SHORT", trigger="crossover-exit",
+         dry=False, magic=magic, reason=f"opposite crossover {ctx['crossover_exit_at']}")
+    return f"EXIT crossover pos={pos.ticket}"
 
 
 def trail_decision(ctx: dict, bid: float, params: dict, cur_sl: float
@@ -608,7 +873,7 @@ def trail_decision(ctx: dict, bid: float, params: dict, cur_sl: float
     eff = rules.combine_stop(float(ctx["init_sl"] or (entry - stop if long
                                                       else entry + stop)),
                              entry, stop, best, long, use_be,
-                             float(params.get("be_buffer", 0)), use_trail,
+                             float(params.get("be_buffer", 0)) * pip_point(ctx["symbol"]), use_trail,
                              float(params.get("trail_r", 1.0)))
     nudge = stop / 100000.0 if stop else 0.0
     improved = (eff > cur_sl + nudge) if long else (eff < cur_sl - nudge)
@@ -617,11 +882,13 @@ def trail_decision(ctx: dict, bid: float, params: dict, cur_sl: float
     return (eff, best, act) if improved else (None, best, act)
 
 
-def modify_sl(mt5, pos, new_sl: float) -> tuple[bool, object]:
+def modify_sl(mt5, pos, new_sl: float, expected_account: dict | None = None) -> tuple[bool, object]:
     """Broker-side SL move (tp kept as-is). Returns (ok, result)."""
     req = {"action": ACTION_SLTP, "position": int(pos.ticket),
            "symbol": str(pos.symbol), "sl": round(float(new_sl), 8),
-           "tp": float(getattr(pos, "tp", 0.0) or 0.0)}
+            "tp": float(getattr(pos, "tp", 0.0) or 0.0)}
+    if not account_matches(mt5, expected_account):
+        return False, None
     res = mt5.order_send(req)
     ok = res is not None and int(getattr(res, "retcode", -1)) == RETCODE_DONE
     return ok, res

@@ -8,6 +8,16 @@ from quant.backtest import (bias_frames, build_h4, build_htf, grade_benchmarks,
 from quant.bias import h4_bias
 
 
+@pytest.mark.parametrize("execution,regime,suffix", [
+    ("H1", "H4", "H4_H1"), ("H4", "D1", "D_H4"), ("H1", "D1", "D_H1")])
+def test_backtest_folder_name_uses_bias_then_execution(monkeypatch, execution, regime, suffix):
+    from quant import backtest
+
+    monkeypatch.setattr(backtest, "local_stamp", lambda: "20261022_213000")
+    assert backtest.backtest_run_name(execution, regime) == f"20261022_213000_{suffix}"
+    assert backtest.local_stamp() == "20261022_213000"  # Other timestamp callers stay unchanged.
+
+
 def test_yaml_notes_decls_inline_comments(tmp_path):
     yml = tmp_path / "_base.yaml"
     yml.write_text(
@@ -33,6 +43,79 @@ def test_yaml_notes_decls_inline_comments(tmp_path):
     assert yaml_notes(tmp_path / "none.yaml") == {}
 
 
+@pytest.mark.parametrize("batch", [False, True])
+@pytest.mark.parametrize("use_preset", [False, True])
+@pytest.mark.parametrize("snapshot_fails", [False, True])
+def test_main_config_snapshot_is_exact_source_before_overrides(
+        tmp_path, monkeypatch, capsys, batch, use_preset, snapshot_fails):
+    import json
+    from pathlib import Path
+    from quant import backtest
+
+    config_dir = tmp_path / "configs"
+    config_dir.mkdir()
+    active = config_dir / "_base.yaml"
+    active.write_text("strategy: {sep_atr: 9.0}\n", encoding="utf-8")
+    source = config_dir / "_base_preset.yaml" if use_preset else active
+    raw = ("\ufeff# Exact snapshot — keep comments and blank lines\r\n"
+           "\r\nstrategy:\r\n  bias:\r\n"
+           "    sep_atr: 0.30  # retain spacing and numeric spelling\r\n"
+           "costs:\r\n  spread_points: 20 # original cost\r\n"
+           "timeframes: {execution: H1, regime: H4}\r\n").encode("utf-8")
+    source.write_bytes(raw)
+    pair = config_dir / "EURUSD.yaml"
+    pair.write_text("symbol: EURUSD\ncosts: {spread_points: 7}\n", encoding="utf-8")
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    tape = data_dir / "EURUSD_H1.csv"
+    tape.write_text("time,open,high,low,close\n", encoding="utf-8")
+    output = tmp_path / "results"
+    monkeypatch.setattr(backtest, "backtest_run_name", lambda *args: "snapshot_test")
+
+    class SnapshotChecked(Exception):
+        pass
+
+    def fake_run_all(jobs, strategy, args, converters, workers):
+        run = output / "snapshot_test"
+        assert (run / "config.yaml").read_bytes() == raw
+        assert strategy["sep_atr"] == 0.8
+        params = json.loads((run / "params.json").read_text(encoding="utf-8"))
+        assert params["strategy"]["sep_atr"] == 0.8
+        assert params["costs"]["spread_points"] == 35
+        assert params["base_config"] == str(source)
+        assert source.read_bytes() == raw
+        if use_preset:
+            assert active.read_text(encoding="utf-8") == "strategy: {sep_atr: 9.0}\n"
+        # Later source edits cannot change the archived bytes.
+        source.write_text("# changed after startup\n", encoding="utf-8")
+        assert (run / "config.yaml").read_bytes() == raw
+        raise SnapshotChecked
+
+    monkeypatch.setattr(backtest, "run_all", fake_run_all)
+    monkeypatch.setattr(backtest, "simulate", lambda *a, **kw: pytest.fail("must not simulate"))
+    argv = ["--config-dir", str(config_dir), "--data-dir", str(data_dir),
+            "--results-dir", str(output), "--sep-atr", "0.8", "--spread-points", "35"]
+    argv += ["--batch"] if batch else ["--config", str(pair), "--data", str(tape)]
+    if use_preset:
+        argv += ["--base-config", str(source)]
+    if snapshot_fails:
+        write_bytes = Path.write_bytes
+
+        def fail_snapshot(path, content):
+            if path == output / "snapshot_test" / "config.yaml":
+                raise PermissionError("snapshot not writable")
+            return write_bytes(path, content)
+
+        monkeypatch.setattr(Path, "write_bytes", fail_snapshot)
+        assert backtest.main(argv) == 2
+        assert "config snapshot error: snapshot not writable" in capsys.readouterr().out
+        assert not (output / "snapshot_test" / "params.json").exists()
+        assert source.read_bytes() == raw
+        return
+    with pytest.raises(SnapshotChecked):
+        backtest.main(argv)
+
+
 def _h1(closes, t0="2020-01-06 00:00", body=0.0004):
     idx = pd.date_range(t0, periods=len(closes), freq="h", tz="UTC")
     rows = []
@@ -48,6 +131,229 @@ def _costs(**kw):
             "swap_short_per_0_01": 0.0, "commission_per_lot": 0.0}
     base.update(kw)
     return base
+
+
+def _evaluation(start="2020-01-01", end="2020-01-01 03:00Z", **extra):
+    from quant.backtest import read_evaluation_window
+    return read_evaluation_window({"backtest_evaluation": {
+        "enabled": True, "start": start, "end": end, "require_preparation": False, **extra}})
+
+
+@pytest.mark.parametrize("overrides", [
+    {"enabled": "false"}, {"require_preparation": "false"}, {"start": "NaT"},
+    {"end": "bad-date"}, {"start": "2021-01-01"}, {"end": None}])
+def test_evaluation_window_rejects_invalid_settings(overrides):
+    from quant.backtest import read_evaluation_window
+    cfg = {"enabled": True, "start": "2020-01-01", "end": "2021-01-01", **overrides}
+    with pytest.raises((ValueError, TypeError)):
+        read_evaluation_window({"backtest_evaluation": cfg})
+
+
+def test_evaluation_cli_overrides_dates_and_can_disable_without_changing_config():
+    from quant.backtest import read_evaluation_window
+    cfg = {"backtest_evaluation": {"enabled": False, "start": "2020-01-01", "end": "2021-01-01"}}
+    assert read_evaluation_window(cfg) == {"enabled": False}
+    active = read_evaluation_window(cfg, start="2020-02-01T08:00:00+08:00")
+    assert active["start"] == "2020-02-01T00:00:00+00:00"
+    assert active["enabled"] and cfg["backtest_evaluation"]["enabled"] is False
+    assert read_evaluation_window(cfg, enabled=False, start="2020-02-01") == {"enabled": False}
+
+
+def test_preparation_cannot_trade_consume_slots_or_score_before_start():
+    frame = _h1([1.1] * 9, t0="2019-12-31 21:00")
+    candidates = [{"t": t, "direction": "LONG", "atr": .01} for t in (0, 2, 3, 5, 7)]
+    p = {"stop_atr": 1., "tp_mult": 100., "use_trail": False, "use_be": False}
+    window = _evaluation()
+    trades, counts = simulate(frame, "EURUSD", candidates, p, _costs(commission_per_lot=1.),
+        3., 0., default_lot=.01, independent_candidates=True, evaluation_window=window)
+    assert len(trades) == 2 and counts["sized"] == 2
+    assert pd.to_datetime(trades.entry_time, utc=True).min() == pd.Timestamp("2020-01-01T00:00Z")
+    assert (pd.to_datetime(trades.entry_time, utc=True) < pd.Timestamp(window["end"])).all()
+    assert (pd.to_datetime(trades.exit_time, utc=True) <= pd.Timestamp(window["end"])).all()
+    assert set(trades.exit_type) == {"end-of-data"}
+    kept, dropped = portfolio_filter({"EURUSD": trades}, 1, 0, 0,
+                                     max_trades_per_day=1, one_entry_per_pair_per_day=True)
+    assert len(kept["EURUSD"]) == 1 and len(dropped) == 1
+    assert kept["EURUSD"].iloc[0].entry_time.startswith("2020-01-01")
+    # Disabling the window is the exact legacy simulation, not a different strategy.
+    legacy, _ = simulate(frame, "EURUSD", candidates, p, _costs(), 3., 0., default_lot=.01,
+                         independent_candidates=True)
+    disabled, _ = simulate(frame, "EURUSD", candidates, p, _costs(), 3., 0., default_lot=.01,
+                           independent_candidates=True, evaluation_window={"enabled": False})
+    pd.testing.assert_frame_equal(legacy, disabled)
+
+
+def test_window_boundary_fill_uses_trading_day_not_preparation_signal_day():
+    frame = _h1([1.1] * 9, t0="2019-12-31 21:00")
+    candidates = [{"t": t, "direction": "LONG", "atr": .0001} for t in (2, 4)]
+    trades, counts = simulate(frame, "EURUSD", candidates,
+        {"stop_atr": 1., "tp_mult": 1., "use_trail": False, "use_be": False},
+        _costs(), 3., 0., default_lot=.01,
+        evaluation_window=_evaluation(end="2020-01-01 04:00Z"))
+    assert len(trades) == 1 and counts["day"] == 1
+    assert trades.entry_time.iloc[0].startswith("2020-01-01 00:00")
+
+
+def test_end_boundary_refuses_partial_candles_and_future_prices_cannot_change_trades():
+    frame = _h1([1.1] * 9, t0="2019-12-31 21:00")
+    cands = [{"t": 2, "direction": "LONG", "atr": .01}]
+    args = ("EURUSD", cands, {"use_trail": False, "tp_mult": 100.}, _costs(), 3., 0.)
+    with pytest.raises(ValueError, match="cuts an execution candle"):
+        simulate(frame, *args, default_lot=.01, evaluation_window=_evaluation(end="2020-01-01 02:30Z"))
+    original, _ = simulate(frame, *args, default_lot=.01, independent_candidates=True, evaluation_window=_evaluation())
+    frame.loc[frame.time >= pd.Timestamp("2020-01-01 03:00Z"), ["high", "low", "close"]] = [50., .001, 40.]
+    changed, _ = simulate(frame, *args, default_lot=.01, independent_candidates=True, evaluation_window=_evaluation())
+    pd.testing.assert_frame_equal(original, changed)
+
+
+def test_preparation_requires_closed_prefix_on_both_independent_charts():
+    from quant.backtest import validate_preparation
+    frame = _h1([1.1] * 8, t0="2019-12-31 21:00")
+    window = _evaluation(require_preparation=True)
+    validate_preparation(frame, frame, {"warmup_bars": 3}, window)
+    with pytest.raises(ValueError, match="regime preparation"):
+        validate_preparation(frame, frame.iloc[2:], {"warmup_bars": 3}, window)
+    with pytest.raises(ValueError, match="execution preparation"):
+        validate_preparation(frame.iloc[2:], frame, {"warmup_bars": 3}, window)
+
+
+@pytest.mark.parametrize("execution_hours,regime_hours", [(1, 1), (1, 4), (1, 24), (4, 4), (4, 24), (24, 24)])
+def test_evaluation_metrics_use_only_scored_tape_but_indicators_keep_prefix(
+        monkeypatch, execution_hours, regime_hours):
+    from types import SimpleNamespace
+    from quant import backtest
+    execution = _h1([1.1] * 900, t0="2019-01-01")
+    execution["time"] = pd.date_range("2019-01-01", periods=900, freq=f"{execution_hours}h", tz="UTC")
+    regime = execution.copy()
+    if regime_hours != execution_hours:
+        regime = backtest.build_htf(execution, regime_hours)  # Synthetic test fixture only.
+    window = _evaluation(str(execution.time.iloc[600]), str(execution.time.iloc[620]), require_preparation=True)
+    monkeypatch.setattr(backtest, "load_chart_frames", lambda *a, **k: (execution, execution, regime, True))
+    monkeypatch.setattr(backtest, "load_position_bars", lambda *a, **k: None)
+    def scan(frame, bias, symbol, p, **kwargs):
+        assert len(frame) == 620 and frame.time.iloc[0] == execution.time.iloc[0]
+        assert kwargs["evaluation_window"] == window
+        return pd.DataFrame([{}]), [{"t": t, "direction": "LONG", "atr": .01} for t in (400, 600)]
+    monkeypatch.setattr(backtest, "scan_pair", scan)
+    args = SimpleNamespace(exec_hours=execution_hours, reg_hours=regime_hours,
+        broker_data_dir="synthetic", position_checks="H1", risk_usd=3., max_cost_ratio=0.,
+        lot=None, default_lot=.01, evaluation_window=window)
+    result = backtest.run_pair("EURUSD", "not_read.csv", {"warmup_bars": 2,
+        "use_trail": False, "tp_mult": 100.}, _costs(), args)
+    assert len(result["trades"]) == 1 and result["n_bars"] == 20
+    assert result["available_seconds"] == 20 * execution_hours * 3600
+    assert result["span"] == (window["start"], window["end"])
+    assert result["trades"].exposure_seconds.sum() <= result["available_seconds"]
+
+
+def test_equity_and_yearly_metrics_exclude_preparation_and_boundary_year():
+    from quant.backtest import evaluation_equity, yearly_table
+    window = _evaluation(end="2021-01-01")
+    curve = pd.DataFrame({"time": pd.to_datetime(["2019-12-31", "2020-02-01", "2021-01-02"], utc=True),
+                          "usd": [10000., 199., 5000.]})
+    measured = evaluation_equity(curve, window, 200.)
+    assert list(measured.usd) == [200., 199.]
+    assert measured.time.iloc[0] == pd.Timestamp(window["start"])
+    trades = pd.DataFrame({"symbol": ["EURUSD"], "entry_time": ["2020-12-31"],
+        "exit_time": ["2021-01-01"], "pnl_usd": [1.], "pnl_R": [.2]})
+    assert yearly_table(trades, window).year.tolist() == [2020]
+    assert trades.exit_time.iloc[0] == "2021-01-01"  # Recorded timestamps are not rewritten.
+
+
+def _overnight_fixture(side="LONG", hit_hour=2):
+    execution = pd.DataFrame({
+        "time": pd.to_datetime(["2026-10-21 18:00Z", "2026-10-21 22:00Z", "2026-10-22 02:00Z"]),
+        "open": [1.1] * 3, "high": [1.1, 1.102, 1.1],
+        "low": [1.1] * 3, "close": [1.1] * 3})
+    hourly = pd.DataFrame({"time": pd.date_range("2026-10-21 22:00", periods=8, freq="h", tz="UTC"),
+        "open": [1.1] * 8, "high": [1.1] * 8, "low": [1.1] * 8, "close": [1.1] * 8})
+    hourly.loc[hit_hour, "high"] = 1.102
+    if side == "SHORT":
+        for frame in (execution, hourly):
+            frame["open"], frame["close"] = 2.2 - frame.open, 2.2 - frame.close
+            frame["high"], frame["low"] = 2.2 - frame.low, 2.2 - frame.high
+    return execution, hourly
+
+
+@pytest.mark.parametrize("side,rate", [("LONG", -1.), ("SHORT", .5)])
+@pytest.mark.parametrize("feed", ["H1", "M1"])
+@pytest.mark.parametrize("hit_hour,charged", [(0, False), (1, True), (2, True), (4, True)])
+def test_swap_follows_check_rows_and_exit_boundary_once(side, rate, feed, hit_hour, charged):
+    import json
+
+    execution, hourly = _overnight_fixture(side, hit_hour)
+    if feed == "H1":
+        kwargs = {"position_bars": hourly}
+    else:
+        # Sparse minute observations exercise the existing M1 path, not broker H1 substitution.
+        kwargs = {"m1": hourly}
+    trades, _ = simulate(execution, "EURUSD", [{"t": 0, "direction": side, "atr": .001}],
+        {"stop_atr": 1., "tp_mult": 1., "use_trail": False, "use_be": False},
+        _costs(swap_long_per_0_01=rate, swap_short_per_0_01=rate), 3., 0.,
+        bar_hours=4, default_lot=.01, **kwargs)
+    trade = trades.iloc[0]
+    # The 23:00 H1 range books at midnight; its M1 equivalent books at 23:01.
+    expected = charged and not (feed == "M1" and hit_hour == 1)
+    assert trade.swap == (3 * rate if expected else 0.)
+    assert trade.pnl_usd == pytest.approx(1. + trade.swap)
+    events = json.loads(trade.swap_events)
+    assert len(events) == int(expected)
+    if events:
+        assert pd.Timestamp(trade.entry_time) < pd.Timestamp(events[0][0]) <= pd.Timestamp(trade.exit_time)
+        assert events[0][1] == 3 * rate
+
+
+def test_midnight_entry_is_not_charged_for_previous_night():
+    execution, hourly = _overnight_fixture(hit_hour=0)
+    execution["time"] += pd.Timedelta(hours=2)
+    hourly["time"] += pd.Timedelta(hours=2)
+    trades, _ = simulate(execution, "EURUSD", [{"t": 0, "direction": "LONG", "atr": .001}],
+        {"stop_atr": 1., "tp_mult": 1., "use_trail": False},
+        _costs(swap_long_per_0_01=-1.), 3., 0., bar_hours=4, default_lot=.01, position_bars=hourly)
+    assert trades.iloc[0].swap == 0.
+
+
+def test_corrected_overnight_loss_blocks_later_entry():
+    execution, hourly = _overnight_fixture()
+    trades, _ = simulate(execution, "EURUSD", [{"t": 0, "direction": "LONG", "atr": .001}],
+        {"stop_atr": 1., "tp_mult": 1., "use_trail": False},
+        _costs(swap_long_per_0_01=-1.), 3., 0., bar_hours=4, default_lot=.01, position_bars=hourly)
+    later = trades.copy()
+    later["entry_time"], later["exit_time"] = "2026-10-22 03:00Z", "2026-10-22 04:00Z"
+    kept, dropped = portfolio_filter({"EURUSD": pd.concat([trades, later], ignore_index=True)},
+        0, 0, 0., disable_pair_after_daily_loss=True)
+    assert len(kept["EURUSD"]) == 1 and len(dropped) == 1
+
+
+@pytest.mark.parametrize("feed,seconds", [("H1", 3600.), ("M1", 60.)])
+def test_exposure_uses_partial_execution_interval(feed, seconds):
+    execution, hourly = _overnight_fixture(hit_hour=0)
+    kwargs = {"position_bars": hourly} if feed == "H1" else {"m1": hourly}
+    trades, _ = simulate(execution, "EURUSD", [{"t": 0, "direction": "LONG", "atr": .001}],
+        {"stop_atr": 1., "tp_mult": 1., "use_trail": False}, _costs(), 3., 0.,
+        bar_hours=4, default_lot=.01, **kwargs)
+    assert trades.iloc[0].exposure_seconds == seconds
+    assert trades.iloc[0].bars_held == 1  # Retain the chart-context count.
+    result = metrics(trades, 1., 3, available_seconds=12 * 3600.)
+    assert result["exposure_pct"] == round(100 * seconds / (12 * 3600), 2)
+    assert metrics(trades.iloc[:0], 1., 3, available_seconds=12 * 3600.)["exposure_pct"] == 0.
+
+
+def test_exposure_intervals_exclude_weekend_gaps_and_clip_short_sessions():
+    import numpy as np
+    from quant.backtest import _bar_durations, _epoch_s
+
+    times = pd.Series(pd.to_datetime(["2026-10-23 20:00Z", "2026-10-25 22:00Z",
+                                     "2026-10-26 00:00Z"]))
+    assert np.array_equal(_bar_durations(_epoch_s(times), 4), [14400, 7200, 14400])
+    execution, hourly = _overnight_fixture(hit_hour=4)
+    # Carry across the gap, but exposure measures only intervals present in the execution tape.
+    execution.loc[2, "time"] += pd.Timedelta(days=2)
+    hourly.loc[4:, "time"] += pd.Timedelta(days=2)
+    trades, _ = simulate(execution, "EURUSD", [{"t": 0, "direction": "LONG", "atr": .001}],
+        {"stop_atr": 1., "tp_mult": 1., "use_trail": False}, _costs(), 3., 0.,
+        bar_hours=4, default_lot=.01, position_bars=hourly)
+    assert trades.iloc[0].exposure_seconds == 5 * 3600
 
 
 def _pt(sym: str, entry: str, exit_: str, direction: str = "LONG",
@@ -175,6 +481,48 @@ def test_map_bias_d1_completed_bar_only():
     assert m["direction"].iloc[12] == bf["direction"].iloc[1]  # day-3 sees D1 #2
 
 
+@pytest.mark.parametrize("hours", [1, 4, 24])
+@pytest.mark.parametrize("broker_bars", [False, True])
+def test_same_timeframe_bias_uses_same_closed_candle(hours, broker_bars):
+    # A short broker bar and a weekend gap must not shift bias to a future row.
+    times = pd.to_datetime(["2026-01-04 23:00Z", "2026-01-05 00:00Z",
+                            "2026-01-09 20:00Z", "2026-01-12 00:00Z"])
+    bars = pd.DataFrame({"time": times})
+    bf = pd.DataFrame({"direction": ["LONG", "SHORT", "NEUTRAL", "LONG"],
+                       "stacksep": [True, True, False, True],
+                       "hr1": [True, False, False, True]})
+    mapped = map_bias(bars, bars, bf, reg_hours=hours, exec_hours=hours,
+                      broker_bars=broker_bars)
+    pd.testing.assert_frame_equal(mapped, bf)
+    changed = bf.copy()
+    changed.loc[3, "direction"] = "SHORT"
+    actual = map_bias(bars, bars, changed, reg_hours=hours, exec_hours=hours,
+                      broker_bars=broker_bars)
+    pd.testing.assert_frame_equal(actual.iloc[:3], mapped.iloc[:3])
+
+
+@pytest.mark.parametrize("tf,hours", [("H1", 1), ("H4", 4), ("D1", 24)])
+@pytest.mark.parametrize("broker", [False, True])
+def test_same_timeframe_loader_uses_matching_export(tmp_path, monkeypatch, tf, hours, broker):
+    from quant import backtest
+
+    hourly = _h1([1.1] * 48)
+    hourly.to_csv(tmp_path / "EURUSD_H1.csv", index=False)
+    chart = hourly if tf == "H1" else hourly.iloc[::hours].reset_index(drop=True)
+    chart.to_csv(tmp_path / f"EURUSD_{tf}.csv", index=False)
+    def forbidden(*args, **kwargs):
+        pytest.fail("same-timeframe mode must not resample broker charts")
+    monkeypatch.setattr(backtest, "build_htf", forbidden)
+    monkeypatch.setattr("quant.broker_data.chart_path",
+                        lambda root, symbol, frame: tmp_path / f"{symbol}_{frame}.csv")
+    tape = tmp_path / f"EURUSD_{tf if broker else 'H1'}.csv"
+    _, execution, regime, closed = backtest.load_chart_frames(
+        "EURUSD", tape, hours, hours, broker_data_dir=tmp_path if broker else None)
+    pd.testing.assert_frame_equal(execution, chart)
+    pd.testing.assert_frame_equal(regime, chart)
+    assert closed
+
+
 def test_map_bias_broker_daily_uses_signal_close_not_future_day():
     h4 = pd.DataFrame({"time": pd.to_datetime([
         "2026-01-06 00:00Z", "2026-01-06 04:00Z",
@@ -203,10 +551,11 @@ def test_map_bias_broker_short_sunday_day_closes_at_next_open():
     assert list(mapped["direction"]) == ["LONG", "LONG"]
 
 
-def test_scan_pair_h4_d1_never_sees_current_unclosed_daily_bar(monkeypatch):
-    # 110 days supply enough Daily EMA warmup and >400 H4 execution bars.
+@pytest.mark.parametrize("exec_hours", [1, 4])
+def test_scan_pair_daily_never_sees_current_unclosed_daily_bar(monkeypatch, exec_hours):
+    # 110 days supply enough Daily EMA warmup for either execution chart.
     h1 = _h1([1.1 + i * 0.000001 for i in range(24 * 110)])
-    exec_bars = build_htf(h1, 4)
+    exec_bars = h1 if exec_hours == 1 else build_htf(h1, exec_hours)
     daily = build_htf(h1, 24)
     monkeypatch.setattr("quant.backtest.check_entry", lambda *_: {
         "checks": {code: True for code in (
@@ -214,10 +563,58 @@ def test_scan_pair_h4_d1_never_sees_current_unclosed_daily_bar(monkeypatch):
         "signal": True, "atr": 0.001})
     _, candidates = scan_pair(exec_bars, daily, "EURUSD", {
         "warmup_bars": 100, "use_atr_sep": False},
-        reg_hours=24, exec_hours=4, broker_bars=True)
+        reg_hours=24, exec_hours=exec_hours, broker_bars=True)
     assert candidates
     # First tradable Daily bias (index 100) only exists from day 102 onwards.
-    assert candidates[0]["time"] >= daily["time"].iloc[101] - pd.Timedelta(hours=4)
+    assert candidates[0]["time"] == daily["time"].iloc[101] - pd.Timedelta(hours=exec_hours)
+
+
+def test_h1_daily_bias_changes_only_at_daily_completion():
+    execution = pd.DataFrame({"time": pd.to_datetime([
+        "2026-01-06 20:00Z", "2026-01-06 21:00Z", "2026-01-06 22:00Z",
+        "2026-01-07 20:00Z", "2026-01-07 21:00Z", "2026-01-07 22:00Z"])})
+    daily = pd.DataFrame({"time": pd.to_datetime([
+        "2026-01-05 22:00Z", "2026-01-06 22:00Z", "2026-01-07 22:00Z"])})
+    bf = pd.DataFrame({"direction": ["LONG", "SHORT", "LONG"],
+                       "stacksep": [True] * 3, "hr1": [True] * 3})
+    mapped = map_bias(execution, daily, bf, reg_hours=24, exec_hours=1, broker_bars=True)
+    assert mapped.direction.tolist() == ["NEUTRAL", "LONG", "LONG", "LONG", "SHORT", "SHORT"]
+    bf.loc[2, "direction"] = "NEUTRAL"  # Changing the unclosed Daily candle cannot change signals.
+    pd.testing.assert_frame_equal(mapped, map_bias(execution, daily, bf,
+        reg_hours=24, exec_hours=1, broker_bars=True))
+
+
+@pytest.mark.parametrize("daily_opens,signal_opens", [
+    (["2026-01-04 21:00Z", "2026-01-05 00:00Z"],
+     ["2026-01-04 22:00Z", "2026-01-04 23:00Z"]),
+    (["2026-03-07 22:00Z", "2026-03-08 21:00Z"],
+     ["2026-03-08 19:00Z", "2026-03-08 20:00Z"]),
+])
+def test_h1_daily_mapping_uses_next_open_for_short_or_dst_days(daily_opens, signal_opens):
+    daily = pd.DataFrame({"time": pd.to_datetime(daily_opens)})
+    execution = pd.DataFrame({"time": pd.to_datetime(signal_opens)})
+    bf = pd.DataFrame({"direction": ["LONG", "SHORT"],
+                       "stacksep": [True, True], "hr1": [True, True]})
+    assert map_bias(execution, daily, bf, reg_hours=24, exec_hours=1,
+                    broker_bars=True).direction.tolist() == ["NEUTRAL", "LONG"]
+
+
+def test_h1_daily_legacy_loader_requires_exported_daily_without_resampling(tmp_path, monkeypatch):
+    from quant import backtest
+
+    hourly = _h1([1.1] * 48)
+    tape = tmp_path / "EURUSD_H1.csv"
+    hourly.to_csv(tape, index=False)
+    monkeypatch.setattr(backtest, "build_htf", lambda *args: pytest.fail("must load broker Daily"))
+    with pytest.raises(FileNotFoundError):
+        backtest.load_chart_frames("EURUSD", tape, 1, 24)
+    daily = hourly.iloc[[0, 24]].copy()
+    daily["time"] -= pd.Timedelta(hours=2)  # Deliberately not the UTC resampling boundary.
+    daily.to_csv(tmp_path / "EURUSD_D1.csv", index=False)
+    raw, execution, regime, closed = backtest.load_chart_frames("EURUSD", tape, 1, 24)
+    pd.testing.assert_frame_equal(raw, execution)
+    pd.testing.assert_frame_equal(regime, daily.reset_index(drop=True))
+    assert closed
 
 
 def test_h4_d1_loads_broker_csvs_instead_of_resampling_h1(tmp_path):
@@ -308,7 +705,7 @@ def test_stop_before_target_inside_one_bar():
 def test_m1_checks_span_whole_h4_bar():
     # H4 execution grid (bar_hours=4): the stop is hit at 10:30, in the THIRD
     # hour of the 08:00 H4 bar -> the M1 slice must cover all 4 hours, and the
-    # exit books the M1 row's timestamp (deal-time semantics kept)
+    # exit books the M1 row's completion, never its opening timestamp
     idx = pd.date_range("2020-01-06", periods=6, freq="4h", tz="UTC")
     h4 = pd.DataFrame([{"time": t, "open": 1.1000, "high": 1.1005, "low": 1.0995,
                         "close": 1.1000, "tick_volume": 5} for t in idx])
@@ -323,7 +720,7 @@ def test_m1_checks_span_whole_h4_bar():
                                                "trail_r": 100.0, "atr_n": 7},
                          _costs(), 3.0, 0.10, m1=m1, bar_hours=4)
     assert len(trades) == 1 and trades["exit_type"].iloc[0] == "stop"
-    assert trades["exit_time"].iloc[0].startswith("2020-01-06 10:30")
+    assert trades["exit_time"].iloc[0].startswith("2020-01-06 10:31")
 
 
 def test_breakeven_caps_a_reversal():
@@ -528,7 +925,7 @@ def test_scale_lots_to_balance_fence_refuses_high():
                         "reason": "scale-high"}]
 
 
-def test_scale_lots_to_balance_inherits_scratch_rows():
+def test_scale_lots_to_balance_uses_initial_risk_for_scratch_rows():
     import pytest
 
     from quant.backtest import scale_lots_to_balance
@@ -543,7 +940,7 @@ def test_scale_lots_to_balance_inherits_scratch_rows():
     kept, dropped = scale_lots_to_balance(dict(trades), 3.0, 2.5, 3.6, 80.0)
     k = kept["EURUSD"]
     assert dropped == []
-    # balance 80 -> aim 2.4 -> snap 2 x 1.5 = 3.0 in band; scratch inherits the step
+    # Scratch sizing uses its own initial risk, just like every other trade.
     assert k["pnl_usd"].iloc[1] == pytest.approx(0.0)
     assert k["lot"].iloc[1] == pytest.approx(0.02)
 
@@ -736,7 +1133,7 @@ def test_short_pays_spread_on_exit():
     trades, _ = simulate(h1, "EURUSD", cands, {**_RM, "trail_r": 100.0, "use_be": True},
                          _costs(spread_points=20), 3.0, 0.10)
     assert trades["exit_type"].iloc[0] == "target"
-    assert abs(trades["exit"].iloc[0] - (1.0911 + 0.0002)) < 1e-9  # bought back on the ask
+    assert trades["exit"].iloc[0] == trades["tp"].iloc[0]  # Ask reaches TP; spread is not added twice.
 
 
 def test_apply_daily_cap_keeps_earliest():
@@ -787,7 +1184,7 @@ def test_position_checks_walk_m1_and_fall_back_per_hour():
     assert trades_m1["exit_type"].iloc[0] == "stop"
     level = float(m1["high"].max()) - 0.003  # trail gap = trail_r x initial risk
     assert abs(trades_m1["exit"].iloc[0] - level) < 1e-6
-    assert str(trades_m1["exit_time"].iloc[0]).endswith("13:35:00+00:00")  # minute-precision exit
+    assert str(trades_m1["exit_time"].iloc[0]).endswith("13:36:00+00:00")  # completed minute
     assert trades_h1["exit_type"].iloc[0] == "target"  # hour checks miss the intra-bar dip
 
 
@@ -895,10 +1292,23 @@ def test_scope_filters_fixed_lot():
     assert len(tr) == 0 and ex["scope"] == 1  # fixed 0.01 lot risks $2.40, below low
 
 
-def test_mtm_equity_marks_open_positions():
+@pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+def test_epoch_s_converts_explicit_units_without_compressing_time(unit):
+    from quant.backtest import _epoch_s
+
+    times = pd.Series(pd.to_datetime(
+        ["2024-01-02T08:00:00+08:00", "2024-01-02T12:00:00+08:00"], utc=True)
+    ).dt.as_unit(unit)
+    assert _epoch_s(times).tolist() == [1704153600, 1704168000]
+    assert _epoch_s(times.astype(str)).tolist() == [1704153600, 1704168000]
+
+
+@pytest.mark.parametrize("unit", ["s", "ms", "us", "ns"])
+@pytest.mark.parametrize("frequency", ["h", "4h"])
+def test_mtm_equity_marks_open_positions(tmp_path, unit, frequency):
     from quant.backtest import mtm_equity
 
-    times = pd.date_range("2024-01-02 00:00", periods=6, freq="h", tz="UTC")
+    times = pd.date_range("2024-01-02 00:00", periods=6, freq=frequency, tz="UTC").as_unit(unit)
     h1 = pd.DataFrame({"time": times,
                        "close": [1.1000, 1.1010, 1.1020, 1.1030, 1.0990, 1.1015]})
     tr = pd.DataFrame([
@@ -910,6 +1320,13 @@ def test_mtm_equity_marks_open_positions():
          "entry": 1.1010, "sl": 1.1000, "pnl_usd": 5.0, "risk_usd": 2.5},
     ])
     curve = mtm_equity({"EURUSD": tr}, {"EURUSD": h1}, 100.0)
+    assert curve["time"].tolist() == times.tolist()
+    assert curve["time"].diff().dropna().tolist() == [times[1] - times[0]] * 5
+    path = tmp_path / "equity_curve.csv"
+    curve.to_csv(path, index=False)
+    saved = pd.read_csv(path)
+    assert pd.to_datetime(saved["time"], utc=True).tolist() == times.tolist()
+    assert saved["usd"].tolist() == pytest.approx(curve["usd"].tolist())
     got = [round(float(v), 2) for v in curve["usd"]]
     # long trade's mark rides its close: +1R, +2R, then -2R before realizing +5
     assert got == [100.0, 97.0, 99.5, 102.0, 92.0, 102.0]
@@ -962,4 +1379,273 @@ def test_m1_slice_anchors_at_true_hour_edge():
     assert trades["exit_type"].iloc[0] == "stop"
     assert abs(trades["exit"].iloc[0] - 1.0971) < 1e-9  # initial stop level, untouched by trail
     assert trades["bars_held"].iloc[0] == 2  # 13:00 shown to the NEXT hour bar, not the 12:0x bar
-    assert str(trades["exit_time"].iloc[0]).endswith("13:00:00+00:00")
+    assert str(trades["exit_time"].iloc[0]).endswith("13:01:00+00:00")
+
+
+@pytest.mark.parametrize("side", ["LONG", "SHORT"])
+@pytest.mark.parametrize("hours", [1, 4, 24])
+@pytest.mark.parametrize("minute_checks", [False, True])
+@pytest.mark.parametrize("legacy_close_flag", [False, True])
+def test_active_trail_uses_only_previously_completed_check_rows(
+        side, hours, minute_checks, legacy_close_flag):
+    times = pd.date_range("2026-02-02", periods=4, freq=f"{hours}h", tz="UTC")
+    bars = pd.DataFrame({"time": times, "open": [1.1, 1.1, 1.12, 1.145],
+                         "high": [1.101, 1.12, 1.15, 1.149],
+                         "low": [1.099, 1.095, 1.115, 1.13], "close": [1.1, 1.115, 1.145, 1.135]})
+    checks = None
+    if minute_checks:
+        checks = bars.iloc[1:].copy()
+        checks["time"] = pd.date_range(times[1], periods=3, freq="min")
+    if side == "SHORT":
+        for frame in (bars, checks):
+            if frame is not None:
+                hi, lo = frame["high"].copy(), frame["low"].copy()
+                frame["high"], frame["low"] = 2.2 - lo, 2.2 - hi
+                frame["open"], frame["close"] = 2.2 - frame["open"], 2.2 - frame["close"]
+    # Row 2's new peak must not tighten the stop checked against row 2's earlier dip.
+    params = {"stop_atr": 1, "tp_mult": 10, "use_trail": True, "trail_r": 1, "use_be": False}
+    trades, _ = simulate(bars, "EURUSD", [{"t": 0, "direction": side, "atr": 0.01}],
+                         params, _costs(), 10, 0, lot=0.01, bar_hours=hours,
+                         m1=checks, coarse_exit_at_close=legacy_close_flag)
+    row = trades.iloc[0]
+    assert row.exit_type == "stop"
+    assert row.exit == pytest.approx(1.14 if side == "LONG" else 1.06)
+    expected = checks.time.iloc[2] + pd.Timedelta(minutes=1) if minute_checks else times[3] + pd.Timedelta(hours=hours)
+    assert pd.Timestamp(row.exit_time) == expected
+
+
+@pytest.mark.parametrize("pnl_r", [-1.0, -0.049, 0.0, 0.049, 1.0])
+def test_entry_lot_does_not_depend_on_its_future_result(pnl_r):
+    from quant.backtest import scale_lots_to_balance
+
+    row = {**_scale_rows()[0], "lot": 0.01, "risk_usd": 4,
+           "pnl_R": pnl_r, "pnl_usd": round(pnl_r * 4, 2)}
+    kept, dropped = scale_lots_to_balance({"EURUSD": pd.DataFrame([row])}, 10, 0, 0, 100)
+    assert not dropped
+    assert kept["EURUSD"].iloc[0].lot == pytest.approx(0.03)
+    assert kept["EURUSD"].iloc[0].risk_usd == pytest.approx(12)
+
+
+@pytest.mark.parametrize("risk", [None, 0, float("nan"), float("inf")])
+def test_scaling_never_infers_missing_initial_risk_from_future_profit(risk):
+    from quant.backtest import scale_lots_to_balance
+
+    row = _scale_rows()[0]
+    if risk is None:
+        row.pop("risk_usd")
+    else:
+        row["risk_usd"] = risk
+    kept, dropped = scale_lots_to_balance({"EURUSD": pd.DataFrame([row])}, 10, 0, 0, 100)
+    assert not dropped
+    assert kept["EURUSD"].iloc[0].lot == row["lot"]
+
+
+@pytest.mark.parametrize("minute_checks", [False, True])
+def test_portfolio_cannot_free_slot_or_book_loss_before_check_row_closes(minute_checks):
+    times = pd.date_range("2026-02-02", periods=3, freq="h", tz="UTC")
+    bars = pd.DataFrame({"time": times, "open": [1.1] * 3,
+                         "high": [1.101] * 3, "low": [1.099, 1.099, 1.08], "close": [1.1] * 3})
+    checks = bars.iloc[2:].copy() if minute_checks else None
+    trades, _ = simulate(bars, "EURUSD", [{"t": 0, "direction": "LONG", "atr": 0.01}],
+                         {"stop_atr": 1, "tp_mult": 10, "use_trail": False, "use_be": False},
+                         _costs(), 10, 0, lot=0.01, m1=checks)
+    other_entry = times[2] + pd.Timedelta(seconds=30 if minute_checks else 1800)
+    other = _pt("GBPUSD", str(other_entry), str(times[2] + pd.Timedelta(hours=2)))
+    candidates = {"EURUSD": trades, "GBPUSD": other}
+    kept, dropped = portfolio_filter(candidates, 1, 0, 0)
+    assert kept["GBPUSD"].empty and dropped[0]["reason"] == "open_max"
+    kept, dropped = portfolio_filter(candidates, 0, 0, 0.5)
+    assert len(kept["GBPUSD"]) == 1 and not dropped
+
+
+@pytest.mark.parametrize("side", ["LONG", "SHORT"])
+@pytest.mark.parametrize("hours", [1, 4, 24])
+@pytest.mark.parametrize("minute_checks", [False, True])
+def test_gapped_stop_fills_at_available_open_with_costs(side, hours, minute_checks):
+    times = pd.date_range("2026-02-02", periods=3, freq=f"{hours}h", tz="UTC")
+    bars = pd.DataFrame({"time": times, "open": [1.1, 1.1, 1.08],
+                         "high": [1.101, 1.101, 1.081], "low": [1.099, 1.099, 1.079],
+                         "close": [1.1, 1.1, 1.08]})
+    if side == "SHORT":
+        hi = bars["high"].copy()
+        bars["high"], bars["low"] = 2.2 - bars["low"], 2.2 - hi
+        bars["open"], bars["close"] = 2.2 - bars["open"], 2.2 - bars["close"]
+    m1 = bars.iloc[2:].copy() if minute_checks else None
+    if m1 is not None:
+        m1["time"] += pd.Timedelta(minutes=5)
+        bars.loc[2, "open"] = 1.1
+        bars.loc[2, "high"] = max(1.1, bars.loc[2, "high"])
+        bars.loc[2, "low"] = min(1.1, bars.loc[2, "low"])
+    trades, _ = simulate(bars, "EURUSD", [{"t": 0, "direction": side, "atr": .01}],
+                         {"stop_atr": 1, "tp_mult": 10, "use_trail": False},
+                         _costs(spread_points=20, slippage_pips=1), 10, 0,
+                         lot=.01, bar_hours=hours, m1=m1)
+    row = trades.iloc[0]
+    assert row.exit_type == "stop"
+    assert row.exit == pytest.approx(1.0799 if side == "LONG" else 1.1203)
+    assert pd.Timestamp(row.exit_time) == (m1.time.iloc[0] if minute_checks else times[2])
+    assert row.pnl_R < -1
+
+
+def test_short_stop_checks_ask_and_does_not_charge_spread_twice():
+    bars = pd.DataFrame({"time": pd.date_range("2026-02-02", periods=2, freq="h", tz="UTC"),
+                         "open": [1.1, 1.1], "high": [1.1001, 1.1009],
+                         "low": [1.0999, 1.0999], "close": [1.1, 1.1005]})
+    trades, _ = simulate(bars, "EURUSD", [{"t": 0, "direction": "SHORT", "atr": .001}],
+                         {"stop_atr": 1, "tp_mult": 1, "use_trail": False},
+                         _costs(spread_points=20), 10, 0, lot=.01)
+    row = trades.iloc[0]
+    assert row.exit_type == "stop" and row.exit == row.sl
+    assert row.pnl_R == -1
+
+
+def test_short_target_waits_until_ask_reaches_target():
+    bars = pd.DataFrame({"time": pd.date_range("2026-02-02", periods=3, freq="h", tz="UTC"),
+                         "open": [1.1, 1.1, 1.0995], "high": [1.1001, 1.1001, 1.0996],
+                         "low": [1.0999, 1.0989, 1.0987], "close": [1.1, 1.0995, 1.099]})
+    args = ("EURUSD", [{"t": 0, "direction": "SHORT", "atr": .001}],
+            {"stop_atr": 1, "tp_mult": 1, "use_trail": False}, _costs(spread_points=20), 10, 0)
+    assert simulate(bars.iloc[:2], *args, lot=.01)[0].empty
+    row = simulate(bars, *args, lot=.01)[0].iloc[0]
+    assert row.exit_type == "target" and row.exit == row.tp and row.pnl_R == 1
+
+
+@pytest.mark.parametrize("symbol,entry_price,expected", [("USDJPY", 100., 90.91), ("EURJPY", 150., 50.)])
+def test_usd_profit_uses_exit_conversion_not_entry_conversion(symbol, entry_price, expected):
+    times = pd.date_range("2026-02-02", periods=5, freq="h", tz="UTC")
+    bars = pd.DataFrame({"time": times[:3], "open": [entry_price] * 3,
+                         "high": [entry_price + .1, entry_price + .1, entry_price + 10],
+                         "low": [entry_price - .1] * 3, "close": [entry_price] * 3})
+    converters = {"USDJPY": pd.Series([100., 100., 200., 999.], index=times[[0, 1, 3, 4]])}
+    args = (symbol, [{"t": 0, "direction": "LONG", "atr": 1}],
+            {"stop_atr": 1, "tp_mult": 10, "use_trail": False}, _costs(), 10, 0)
+    row = simulate(bars, *args, lot=.01, converters=converters)[0].iloc[0]
+    assert row.pnl_usd == expected
+    assert row.risk_usd == 10
+    converters["USDJPY"].iloc[-1] = 1
+    assert simulate(bars, *args, lot=.01, converters=converters)[0].iloc[0].pnl_usd == expected
+
+
+@pytest.mark.parametrize("symbol,price,risk,pip", [("EURUSD", 1.1, .01, .0001), ("USDJPY", 150., 1., .01)])
+@pytest.mark.parametrize("side", ["LONG", "SHORT"])
+def test_backtest_breakeven_buffer_is_in_pips(symbol, price, risk, pip, side):
+    times = pd.date_range("2026-02-02", periods=3, freq="h", tz="UTC")
+    bars = pd.DataFrame({"time": times, "open": [price, price, price + 1.5 * risk],
+                         "high": [price + .1 * risk, price + 2 * risk, price + 1.6 * risk],
+                         "low": [price - .1 * risk] * 3, "close": [price, price + 1.5 * risk, price]})
+    if side == "SHORT":
+        hi = bars["high"].copy()
+        bars["high"], bars["low"] = 2 * price - bars["low"], 2 * price - hi
+        bars["open"], bars["close"] = 2 * price - bars["open"], 2 * price - bars["close"]
+    row = simulate(bars, symbol, [{"t": 0, "direction": side, "atr": risk}],
+                   {"stop_atr": 1, "tp_mult": 10, "use_trail": False, "use_be": True,
+                    "be_trigger_r": 1, "be_buffer": 1}, _costs(), 10, 0, lot=.01)[0].iloc[0]
+    assert row.exit == pytest.approx(price + (pip if side == "LONG" else -pip))
+
+
+def test_rejected_candidate_cannot_suppress_later_same_pair_entry():
+    times = pd.date_range("2026-02-02", periods=7, freq="h", tz="UTC")
+    bars = pd.DataFrame({"time": times, "open": [1.1] * 7,
+                         "high": [1.1001] * 3 + [1.111] + [1.1001] * 3,
+                         "low": [1.0995] * 6 + [1.08], "close": [1.1] * 7})
+    cands = [{"t": t, "direction": "LONG", "atr": atr} for t, atr in [(0, .01), (1, .001)]]
+    raw, _ = simulate(bars, "EURUSD", cands,
+                      {"stop_atr": 1, "tp_mult": 10, "use_trail": False},
+                      _costs(), 10, 0, lot=.01, independent_candidates=True)
+    assert len(raw) == 2
+    other = _pt("GBPUSD", str(times[0]), str(times[2]))
+    kept, dropped = portfolio_filter({"EURUSD": raw, "GBPUSD": other}, 1, 0, 0,
+                                     max_trades_per_day=2, one_entry_per_pair_per_day=True)
+    assert len(kept["EURUSD"]) == 1
+    assert kept["EURUSD"].iloc[0].signal_bar_time == str(times[1])
+    assert [d["reason"] for d in dropped] == ["open_max"]
+
+
+def test_gap_entry_equity_uses_known_entry_not_previous_close():
+    from quant.backtest import mtm_equity
+
+    prices = pd.DataFrame({"time": pd.to_datetime(["2026-01-02 22:00Z", "2026-01-05 04:00Z", "2026-01-05 08:00Z"]),
+                           "close": [1.10, 1.20, 1.20]})
+    trade = {"entry_time": "2026-01-05 00:00Z", "exit_time": "2026-01-05 08:00Z", "entry": 1.2,
+             "sl": 1.19, "direction": "LONG", "risk_usd": 10., "pnl_usd": 0.}
+    curve = mtm_equity({"EURUSD": pd.DataFrame([trade])}, {"EURUSD": prices}, 100, accrue_costs=True)
+    assert curve.usd.tolist() == pytest.approx([100] * len(curve))
+
+
+@pytest.mark.parametrize("side", ["LONG", "SHORT"])
+def test_gap_entry_marks_only_real_spread_and_entry_fee(side):
+    from quant.backtest import mtm_equity
+
+    prices = pd.DataFrame({"time": pd.to_datetime(["2026-01-02 22:00Z", "2026-01-05 04:00Z", "2026-01-05 08:00Z"]),
+                           "close": [1.1, 1.2, 1.2]})
+    entry = 1.2002 if side == "LONG" else 1.2
+    trade = {"entry_time": "2026-01-05 00:00Z", "exit_time": "2026-01-05 08:00Z",
+             "entry": entry, "entry_bid": 1.2, "spread_price": .0002, "quote_notional": 1000.,
+             "sl": entry - .01 if side == "LONG" else entry + .01,
+             "direction": side, "risk_usd": 10., "pnl_usd": -.30,
+             "entry_commission": .05, "short_spread_usd": .2 if side == "SHORT" else 0.}
+    curve = mtm_equity({"EURUSD": pd.DataFrame([trade])}, {"EURUSD": prices}, 100, accrue_costs=True)
+    at_entry = curve.loc[curve.time == pd.Timestamp(trade["entry_time"]), "usd"].iloc[0]
+    assert at_entry == pytest.approx(99.75)
+    assert curve.usd.iloc[-1] == pytest.approx(99.70)
+
+
+def test_known_open_supersedes_previous_close_at_same_time():
+    from quant.backtest import mtm_equity
+
+    times = pd.date_range("2026-02-02", periods=3, freq="h", tz="UTC")
+    prices = pd.DataFrame({"time": times[1:], "open_time": times[:-1],
+                           "open": [1.1, 1.08], "close": [1.1, 1.08]})
+    trade = {"entry_time": str(times[0]), "exit_time": str(times[2]), "entry": 1.1,
+             "entry_bid": 1.1, "spread_price": 0., "quote_notional": 1000.,
+             "sl": 1.09, "direction": "LONG", "risk_usd": 10., "pnl_usd": -20.}
+    curve = mtm_equity({"EURUSD": pd.DataFrame([trade])}, {"EURUSD": prices}, 100, accrue_costs=True)
+    assert curve.loc[curve.time == times[1], "usd"].iloc[0] == pytest.approx(80)
+
+
+def test_open_cross_position_marks_use_current_known_conversion():
+    from quant.backtest import mtm_equity
+
+    times = pd.date_range("2026-02-02", periods=4, freq="h", tz="UTC")
+    prices = pd.DataFrame({"time": times[[0, 1, 3]], "close": [150., 151., 151.]})
+    trade = {"entry_time": str(times[0]), "exit_time": str(times[3]), "entry": 150.,
+             "entry_bid": 150., "spread_price": 0., "quote_notional": 1000.,
+             "sl": 149., "direction": "LONG", "risk_usd": 10., "pnl_usd": 5.}
+    converters = {"USDJPY": pd.Series([100., 200.], index=times[[0, 2]])}
+    curve = mtm_equity({"EURJPY": pd.DataFrame([trade])}, {"EURJPY": prices}, 100,
+                       accrue_costs=True, converters=converters)
+    assert curve.loc[curve.time == times[1], "usd"].iloc[0] == pytest.approx(110)
+    assert curve.loc[curve.time == times[2], "usd"].iloc[0] == pytest.approx(105)
+    assert curve.usd.iloc[-1] == 105
+    with pytest.raises(ValueError, match="USD conversion"):
+        mtm_equity({"EURJPY": pd.DataFrame([trade])}, {"EURJPY": prices}, 100, accrue_costs=True)
+
+
+def test_sizing_rejection_consumes_no_pair_slot_or_day_quota():
+    times = pd.date_range("2026-02-02", periods=5, freq="h", tz="UTC")
+    base = {"symbol": "EURUSD", "direction": "LONG", "lot": .01,
+            "pnl_usd": 0., "pnl_R": 0., "swap": 0., "tp_usd": 10., "quote_notional": 1000.}
+    trades = pd.DataFrame([
+        {**base, "entry_time": str(times[0]), "exit_time": str(times[4]), "risk_usd": 3.},
+        {**base, "entry_time": str(times[1]), "exit_time": str(times[2]), "risk_usd": 2., "pnl_usd": 2., "pnl_R": 1.}])
+    kept, dropped = portfolio_filter({"EURUSD": trades}, 1, 0, 0, max_trades_per_day=1,
+                                     one_entry_per_pair_per_day=True,
+                                     balance_sizing={"start_balance": 100., "pct": 4.,
+                                                     "scope_low": 0., "scope_high": 5., "default_lot": .01})
+    row = kept["EURUSD"].iloc[0]
+    assert len(kept["EURUSD"]) == 1 and row.entry_time == str(times[1])
+    assert row.lot == .02 and row.quote_notional == 2000.
+    assert row.pnl_usd == 4. and row.risk_usd == 4.
+    assert dropped[0]["reason"] == "scale-high"
+
+
+def test_admission_balance_changes_only_after_accepted_exit():
+    rows = _scale_rows()
+    rows[0].update(lot=.01, risk_usd=1., pnl_usd=-3., pnl_R=-3.)
+    rows[1].update(lot=.01, risk_usd=1., pnl_usd=1., pnl_R=1.)
+    kept, dropped = portfolio_filter({"EURUSD": pd.DataFrame(rows)}, 0, 0, 0,
+                                     balance_sizing={"start_balance": 100., "pct": 10.,
+                                                     "scope_low": 0., "scope_high": 0., "default_lot": .01})
+    assert not dropped
+    assert kept["EURUSD"].lot.tolist() == pytest.approx([.1, .07])
+    assert kept["EURUSD"].pnl_usd.tolist() == pytest.approx([-30., 7.])

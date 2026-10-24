@@ -62,6 +62,19 @@ def test_report_renders_labels_summary_and_filter_without_changing_original_csv(
     assert saved[saved["symbol"] == "TOTAL"]["trades"].sum() == 2
 
 
+def test_report_recognizes_pullback_cross(tmp_path):
+    run, data, _ = _run_dir(tmp_path)
+    path = run / "trades_S1.csv"
+    trades = pd.read_csv(path)
+    trades["entry_reason"] = "pullback_cross"
+    trades.to_csv(path, index=False)
+    assert report.write_report(run, data)
+    payload = _blob((run / "report.html").read_text(encoding="utf-8"), "trades-json")
+    assert all(row["entryReasonLabel"] == "Pullback cross into EMA gap" for row in payload["meta"])
+    summary = pd.read_csv(run / "entry_summary.csv")
+    assert set(summary["entry_reason"]) == {"pullback_cross"}
+
+
 def test_old_report_without_verified_source_keeps_unknown_and_escapes_bad_labels(tmp_path):
     run, data, _ = _run_dir(tmp_path)
     path = run / "trades_S1.csv"
@@ -111,8 +124,9 @@ def test_old_reference_ignores_only_missing_diagnostic_columns(tmp_path):
     assert not dp.check_parity({"EURUSD": 1}, total, tmp_path, {"EURUSD": current})[0]
 
 
+@pytest.mark.parametrize("reason", ["cross_candle", "pullback_cross"])
 @pytest.mark.parametrize("problem", [None, "atr", "source", "fill_time", "signal_time", "failed_signal"])
-def test_historical_reconstruction_requires_saved_config_source_signal_and_atr(tmp_path, monkeypatch, problem):
+def test_historical_reconstruction_requires_saved_config_source_signal_and_atr(tmp_path, monkeypatch, problem, reason):
     src, dataset, run = tmp_path / "inbox", tmp_path / "broker", tmp_path / "run"
     _exports(src, days=100)
     import_exports(src, dataset, ["EURUSD"])
@@ -120,6 +134,10 @@ def test_historical_reconstruction_requires_saved_config_source_signal_and_atr(t
     frame = backtest.load_h1(dataset / "EURUSD_H4.csv")
     strategy = dict(_W1_ISO, w1_touch_from_trend_side=True, w1_cross_from_other_side=True,
                     entry_ema_fast_period=20, entry_ema_slow_period=100, entry_atr_period=7)
+    if reason == "pullback_cross":
+        strategy.pop("w1_touch_from_trend_side")
+        strategy.pop("w1_cross_from_other_side")
+        strategy["w1_cross_into_gap"] = True
     params = {"broker_data": dataset_info(dataset), "strategy": strategy,
               "timeframes": {"execution": "H4", "regime": "D1"}}
     (run / "params.json").write_text(json.dumps(params))
@@ -129,7 +147,7 @@ def test_historical_reconstruction_requires_saved_config_source_signal_and_atr(t
         checked.append(window["time"].iloc[-1])
         assert saved_params == strategy
         assert len(window) == backtest.WIN_BARS
-        return {"signal": problem != "failed_signal", "atr": 0.001, "entry_reason": "cross_candle"}
+        return {"signal": problem != "failed_signal", "atr": 0.001, "entry_reason": reason}
     monkeypatch.setattr("quant.signals.check_entry", fake_check)
     if problem == "atr":
         row.loc[0, "atr"] = 0.1
@@ -145,7 +163,7 @@ def test_historical_reconstruction_requires_saved_config_source_signal_and_atr(t
     annotated = report.annotate_entry_reasons(run, [("EURUSD", row)])[0][1]
     pd.testing.assert_frame_equal(row, original)
     if problem is None:
-        assert annotated.iloc[0]["entry_reason"] == "cross_candle"
+        assert annotated.iloc[0]["entry_reason"] == reason
         assert annotated.iloc[0]["_entry_reason_source"] == "reconstructed"
         assert checked == [frame["time"].iloc[500]]  # Never uses the entry/future candle.
     else:

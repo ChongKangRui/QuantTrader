@@ -36,8 +36,18 @@ def _load(prefix: str, live: bool) -> Account:
     return Account(login=int(login), password=password, server=server, live=live)
 
 
-def get_accounts() -> list[Account]:
-    """All enabled accounts. Raises if none enabled."""
+def get_accounts(selection: str | None = None) -> list[Account]:
+    """Enabled accounts, optionally narrowed without overriding either enable flag."""
+    if selection not in (None, "demo", "real"):
+        raise ValueError("account selection must be demo or real")
+    if selection == "demo":
+        if not USE_DEMO:
+            raise RuntimeError("Demo account is disabled (USE_DEMO).")
+        return [_load("MT5_DEMO_", live=False)]
+    if selection == "real":
+        if not USE_REAL:
+            raise RuntimeError("Real account is disabled (USE_REAL).")
+        return [_load("MT5_REAL_", live=True)]
     accounts: list[Account] = []
     if USE_DEMO:
         accounts.append(_load("MT5_DEMO_", live=False))

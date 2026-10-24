@@ -1,5 +1,6 @@
 """Signals tests. Synthetic closed-bar frames only, no terminal, no data/."""
 import pandas as pd
+import pytest
 
 from quant.signals import _ema, check_entry, pivot_lows
 
@@ -292,3 +293,73 @@ def test_w1_h4_rejects_wrong_close_and_open_on_ema():
         at_ema = list(bars)
         at_ema[-1] = [fast, hi, lo, bars[-1][3]]
         assert check_entry(_frame(at_ema), side, params)["fail"] == "W1"
+
+
+def _pullback_bars(side):
+    bars, _ = _w1_bars(side)
+    # Place the final close inside the real, causally calculated EMA gap.
+    closes = pd.Series([bar[3] for bar in bars])
+    fast = float(_ema(closes, 20).iloc[-2])
+    slow = float(_ema(closes, 100).iloc[-2])
+    c = (fast + slow) / 2
+    o = fast + 0.5 if side == "LONG" else fast - 0.5
+    bars[-1] = [o, max(o, c) + 0.1, min(o, c) - 0.1, c]
+    return bars
+
+
+@pytest.mark.parametrize("side", ["LONG", "SHORT"])
+def test_pullback_cross_is_optional_and_independent(side):
+    frame = _frame(_pullback_bars(side))
+    settings = dict(_W1_ISO, entry_ema_slow_period=100,
+                    w1_touch_from_trend_side=False, w1_cross_from_other_side=False)
+    assert check_entry(frame, side, settings)["fail"] == "W1"
+    enabled = dict(settings, w1_cross_into_gap=True)
+    result = check_entry(frame, side, enabled)
+    assert result["signal"] is True
+    assert result["entry_reason"] == "pullback_cross"
+    combined = dict(enabled, w1_touch_from_trend_side=True, w1_cross_from_other_side=True)
+    assert check_entry(frame, side, combined) == result
+    assert check_entry(frame, side, dict(enabled, use_hr2=True))["fail"] == "HR2"
+    assert check_entry(frame, side, dict(enabled, use_w1=False))["entry_reason"] == "other"
+    # The new pattern has no wick-depth requirement.
+    assert check_entry(frame, side, dict(enabled, w1_pen_atr=100))["signal"] is True
+
+
+@pytest.mark.parametrize("side", ["LONG", "SHORT"])
+@pytest.mark.parametrize("case", ["valid", "open_equal", "open_wrong", "close_fast",
+                                 "close_slow", "past_slow", "wick_only", "misaligned", "flat"])
+def test_pullback_cross_strict_boundaries(monkeypatch, side, case):
+    from quant import signals
+    fast, slow = (110.0, 100.0) if side == "LONG" else (100.0, 110.0)
+    sign = 1 if side == "LONG" else -1
+    o, c = fast + sign, 105.0
+    if case == "open_equal":
+        o = fast
+    elif case == "open_wrong":
+        o = fast - sign
+    elif case == "close_fast":
+        c = fast
+    elif case == "close_slow":
+        c = slow
+    elif case == "past_slow":
+        c = slow - sign
+    elif case == "wick_only":
+        c = fast + sign / 2
+    elif case == "misaligned":
+        slow = fast + sign * 10
+    elif case == "flat":
+        slow = fast
+    monkeypatch.setattr(signals, "_ema", lambda series, period: pd.Series(
+        fast if period == 20 else slow, index=series.index))
+    bars = [[105, 115, 95, 105] for _ in range(30)]
+    bars[-1] = [o, 115, 95, c]
+    result = check_entry(_frame(bars), side, dict(_W1_ISO, entry_ema_slow_period=100,
+                         w1_cross_into_gap=True))
+    assert result["signal"] is (case == "valid")
+
+
+def test_pullback_switch_off_preserves_legacy_w1():
+    for side in ("LONG", "SHORT"):
+        frame = _frame(_w1_bars(side)[0])
+        assert check_entry(frame, side, _W1_ISO) == check_entry(
+            frame, side, dict(_W1_ISO, w1_cross_into_gap=False))

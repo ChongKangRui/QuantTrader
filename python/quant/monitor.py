@@ -10,7 +10,7 @@ account AND only the user launches it.
 Repaint rule: the screen only redraws when a new execution-timeframe bar
 closes. All bars are closed bars fetched via copy_rates_from_pos(...,
 start_pos=1); the bias uses the last fully completed `timeframes.regime` bar
-(allowed pairs: H1->H4, H4->D1). Empty state: NONE DETECTED when no pair
+(allowed pairs: H1->H4, H4->D1, H1->D1, or the same timeframe). Empty state: NONE DETECTED when no pair
 holds UP/DOWN bias. ENTRY column shows GO or the first failing section-5
 rule. Each cycle also syncs closed positions and the weekly loss halt per
 account.
@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -100,23 +101,31 @@ def read_selection(config_dir: str | Path) -> dict[str, bool] | None:
     return out
 
 
-def read_limits(config_dir: str | Path) -> float:
+def base_config_path(config_dir: str | Path, base_config: str | Path | None = None) -> Path:
+    """An explicitly selected preset never replaces the active base file."""
+    return Path(base_config) if base_config is not None else Path(config_dir) / "_base.yaml"
+
+
+def read_limits(config_dir: str | Path, base_config: str | Path | None = None) -> float:
     """Weekly halt threshold from _base.yaml limits. Default 15.0."""
     import yaml
 
     try:
-        cfg = yaml.safe_load(_read_yaml_text(Path(config_dir) / "_base.yaml")) or {}
+        cfg = yaml.safe_load(_read_yaml_text(base_config_path(config_dir, base_config))) or {}
         return float((cfg.get("limits") or {}).get("weekly_loss_pct", 15.0))
     except Exception:
+        if base_config is not None:
+            raise
         return 15.0
 
 
 # timeframes.execution / timeframes.regime -> bar hours; locked combos only
 TF_HOURS = {"H1": 1, "H4": 4, "D1": 24}
-TF_COMBOS = ((1, 4), (4, 24))  # H1->H4 default, H4->D1 upscale
+# Allowed execution -> bias hours; reversed chart roles remain unsupported.
+TF_COMBOS = ((1, 4), (4, 24), (1, 24), (1, 1), (4, 4), (24, 24))
 
 
-def read_timeframes(config_dir: str | Path) -> tuple[str, str]:
+def read_timeframes(config_dir: str | Path, base_config: str | Path | None = None) -> tuple[str, str]:
     """(execution, regime) names from _base.yaml timeframes. Defaults H1/H4.
 
     Raises ValueError on an unknown or un-locked combo so every entry point
@@ -125,8 +134,10 @@ def read_timeframes(config_dir: str | Path) -> tuple[str, str]:
     import yaml
 
     try:
-        cfg = yaml.safe_load(_read_yaml_text(Path(config_dir) / "_base.yaml")) or {}
+        cfg = yaml.safe_load(_read_yaml_text(base_config_path(config_dir, base_config))) or {}
     except Exception:
+        if base_config is not None:
+            raise
         cfg = {}
     tf = dict(cfg.get("timeframes") or {})
     exec_tf = str(tf.get("execution") or "H1").upper()
@@ -137,11 +148,13 @@ def read_timeframes(config_dir: str | Path) -> tuple[str, str]:
                          f"regime={reg_tf} (known: {sorted(TF_HOURS)})")
     if (eh, rh) not in TF_COMBOS:
         raise ValueError(f"timeframes: unsupported combo {exec_tf}->{reg_tf} "
-                         f"(allowed: H1->H4 or H4->D1)")
+                         f"(allowed: H1->H4, H4->D1, H1->D1, H1->H1, H4->H4 or D1->D1)")
+    from quant.signals import validate_crossover
+    validate_crossover(flatten_strategy(cfg))
     return exec_tf, reg_tf
 
 
-def read_trade_cfg(config_dir: str | Path) -> dict:
+def read_trade_cfg(config_dir: str | Path, base_config: str | Path | None = None) -> dict:
     """`--trade` knobs: the SAME _base.yaml keys the backtest engine reads.
 
     paths: live.magic/dry_run_default, risk.max_total_positions/max_ccy_net,
@@ -155,8 +168,10 @@ def read_trade_cfg(config_dir: str | Path) -> dict:
 
     try:
         cfg = yaml.safe_load(
-            _read_yaml_text(Path(config_dir) / "_base.yaml")) or {}
+            _read_yaml_text(base_config_path(config_dir, base_config))) or {}
     except Exception:
+        if base_config is not None:
+            raise
         cfg = {}
     risk = dict(cfg.get("risk") or {})
     lim = dict(cfg.get("limits") or {})
@@ -202,7 +217,7 @@ def flatten_strategy(cfg: dict) -> dict:
     return flat
 
 
-def load_pairs(config_dir: str | Path) -> list[dict]:
+def load_pairs(config_dir: str | Path, base_config: str | Path | None = None) -> list[dict]:
     """Read per-pair yamls. Strategy comes solely from _base.yaml's `strategy`.
 
     A pair-level `strategy` key is ignored by design (single source of truth).
@@ -212,9 +227,11 @@ def load_pairs(config_dir: str | Path) -> list[dict]:
     config_dir = Path(config_dir)
     base_strat: dict = {}
     try:
-        base_cfg = yaml.safe_load(_read_yaml_text(config_dir / "_base.yaml")) or {}
+        base_cfg = yaml.safe_load(_read_yaml_text(base_config_path(config_dir, base_config))) or {}
         base_strat = flatten_strategy(base_cfg)
     except Exception:
+        if base_config is not None:
+            raise
         pass
     pairs: list[dict] = []
     for path in sorted(config_dir.glob("*.yaml")) + sorted(config_dir.glob("*.yml")):
@@ -297,15 +314,17 @@ def poll(mt5, pairs: list[dict], h4_bars: int = H4_BARS,
                 rows.append(PairRow(symbol=symbol, ok=False, note="symbol not found"))
                 continue
             mt5.symbol_select(broker, True)
-            h1 = mt5.copy_rates_from_pos(broker, getattr(mt5, exec_tf), 1, h1_bars)
-            h4 = mt5.copy_rates_from_pos(broker, getattr(mt5, reg_tf), 1, h4_bars)
+            params = p.get("params") or {}
+            crossover = bool(params.get("use_crossover_memory", False))
+            history = int(params.get("crossover_history_bars", 6000)) if crossover else 0
+            h1 = mt5.copy_rates_from_pos(broker, getattr(mt5, exec_tf), 1, max(h1_bars, history))
+            h4 = mt5.copy_rates_from_pos(broker, getattr(mt5, reg_tf), 1, max(h4_bars, history))
             if h1 is None or len(h1) == 0 or h4 is None or len(h4) == 0:
                 rows.append(PairRow(symbol=symbol, ok=False, note="no closed-bar data"))
                 continue
             h1df = pd.DataFrame(h1)
             h4df = pd.DataFrame(h4)
             times[symbol] = int(h1df["time"].iloc[-1])
-            params = p.get("params") or {}
             warmup = int(params.get("warmup_bars", 300))
             # bias periods come from the same flat params the backtest uses;
             # defaults mirror the locked B1 constants, never re-tuned here
@@ -404,6 +423,9 @@ def _trade_pass(mt5, pairs, rows, times, tcfg: dict, atag: str, week: dict,
     """
     from quant import trader as tr
 
+    if not tr.account_matches(mt5, tcfg["expected_account"]):
+        print("DATA ERROR - trading account changed; refusing entries and modifications.", flush=True)
+        return
     journal_path = tcfg["journal"]
     mem_path = tcfg["mem_path"]
     mem = tr.load_mem(mem_path)
@@ -417,21 +439,42 @@ def _trade_pass(mt5, pairs, rows, times, tcfg: dict, atag: str, week: dict,
         row = row_by_sym.get(sym)
         if sym in booked or (row is not None and row.has_position):
             # trailing/ghost sync runs every pass, poll error or not
-            for m in tr.manage_book(mt5, sym, sym, p["params"], tcfg["magic"],
-                                    tcfg["dry"], journal_path, mem, journal_rows):
+            management = tr.manage_book(mt5, sym, sym, p["params"], tcfg["magic"],
+                                     tcfg["dry"], journal_path, mem, journal_rows,
+                                      expected_account=tcfg["expected_account"],
+                                      **({"exec_tf": tcfg["base"].get("exec_tf", "H4"), "memory_path": mem_path}
+                                         if p["params"].get("use_crossover_exit", False) else {}))
+            for m in management:
                 print(f"trade {sym}: {m}", flush=True)
-        if row is None or row.bias not in ("UP", "DOWN"):
+            if any(m.startswith("EXIT") for m in management):
+                tr.save_mem(mem_path, mem)
+                continue  # Never turn a close into an immediate reverse order in the same pass.
+        crossover = bool(p["params"].get("use_crossover_memory", False))
+        if row is None or (row.bias not in ("UP", "DOWN") and not crossover):
             continue
         cfg = dict(tcfg["base"])
+        cfg["account_store"] = tcfg.get("account_store")
+        cfg["recording_error"] = tcfg.get("recording_error")
         cfg["costs"] = {**tcfg["base_costs"], **p["costs"]}
         cfg["halted"] = bool((week or {}).get("halted"))
-        msg = tr.trade_on_bar(mt5, sym, sym, direction=dir_of(row.bias),
+        direction = dir_of(row.bias) if row.bias in ("UP", "DOWN") else "NEUTRAL"
+        msg = tr.trade_on_bar(mt5, sym, sym, direction=direction,
                               bar_secs=int(times.get(sym) or 0), now=now,
                               magic=tcfg["magic"], dry=tcfg["dry"],
                               params=p["params"], journal_path=journal_path,
                               mem=mem, cfg=cfg, deals=deals, ranges=tcfg["ranges"])
         if msg and msg != "seen":
             print(f"trade {sym}: {msg}", flush=True)
+        if crossover:
+            state = (mem.get("crossovers") or {}).get(sym) or {}
+            latest = (state.get("indicators") or {}).get("latest") or {}
+            if latest:
+                cycle = latest.get("crossover_time") or "not found"
+                status = msg if msg and msg != "seen" else "remembered"
+                row.entry = (f"{status} | cross {cycle} | "
+                             f"{state.get('used', 0)}/{p['params'].get('crossover_max_entries', 2)} used")
+        # Persist each decision before another pair can use the remaining weekly quota.
+        tr.save_mem(mem_path, mem)
     tr.save_mem(mem_path, mem)
 
 
@@ -445,7 +488,7 @@ def _cycle(mt5, accounts, pairs, args, conditions: dict[str, str],
     """One pass over every enabled account: bias poll, records sync, weekly halt.
 
     The terminal holds one MT5 session, so accounts log in sequentially.
-    History calls only; this function never sends orders. Returns
+    Read-only unless tcfg enables the trading pass. Returns
     (rows, {symbol: H1 time}, {account_tag: week_info}).
     """
     from quant import limits as lim
@@ -461,6 +504,11 @@ def _cycle(mt5, accounts, pairs, args, conditions: dict[str, str],
                 print(f"DATA ERROR - {atag} initialize failed: {mt5.last_error()}", flush=True)
                 continue
             try:
+                if tcfg:
+                    from quant.trader import account_matches
+                    if not account_matches(mt5, tcfg["expected_account"]):
+                        print(f"DATA ERROR - {atag} login/server/account type mismatch; refusing to trade.", flush=True)
+                        continue
                 rows, times = poll(mt5, pairs, args.bars,
                                    exec_tf=getattr(args, "exec_tf", "TIMEFRAME_H1"),
                                    reg_tf=getattr(args, "reg_tf", "TIMEFRAME_H4"))
@@ -485,13 +533,43 @@ def _cycle(mt5, accounts, pairs, args, conditions: dict[str, str],
                     equity = 0.0
                 try:
                     weeks[atag] = lim.evaluate(
-                        Path(args.memory_dir) / f"weekly_{atag.lower()}.json",
+                        Path(args.memory_dir) / f"weekly_{atag.lower()}{'_' + str(args.magic) if getattr(args, 'base_config', None) else ''}.json",
                         deals or (), args.magic, equity, loss_pct, now)
                 except Exception as exc:
                     print(f"weekly halt check skipped ({atag}): {exc}", flush=True)
+                # Preserve raw broker deals, including fees and partial fills, per account.
+                store = None
+                if getattr(args, "record_performance", False) or (tcfg and not tcfg["dry"]):
+                    try:
+                        from quant.account_store import AccountStore, write_performance
+                        info = mt5.account_info()
+                        if (info is None or int(info.login) != int(acct.login)
+                                or str(info.server) != acct.server
+                                or int(info.trade_mode) != (2 if acct.live else 0)):
+                            raise ValueError("Recording account identity mismatch")
+                        store = AccountStore(Path(args.records_dir) / "accounts", info)
+                        store.sync_from_broker(mt5)
+                        write_performance(store, args.performance_settings, args.magic)
+                        if tcfg:
+                            tcfg["account_store"] = store
+                            tcfg["recording_error"] = bool(store.unresolved())
+                        if store.unresolved():
+                            print(f"RECORDING ALERT - {atag}: unresolved orders; new entries blocked", flush=True)
+                    except Exception as exc:
+                        if tcfg:
+                            tcfg["account_store"] = None
+                            tcfg["recording_error"] = True
+                        print(f"RECORDING ERROR - {atag}: {exc}; new entries blocked", flush=True)
                 if tcfg:
                     _trade_pass(mt5, pairs, rows, times, tcfg, atag,
                                 weeks.get(atag) or {}, deals, now)
+                if store is not None:
+                    # Catch fills/fees created during this pass, not just on the next poll.
+                    try:
+                        store.sync_from_broker(mt5)
+                        write_performance(store, args.performance_settings, args.magic)
+                    except Exception as exc:
+                        print(f"RECORDING ALERT - {atag}: post-pass sync failed: {exc}", flush=True)
                 merged = rows if merged is None else _merge_stars(merged, rows)
             finally:
                 mt5.shutdown()
@@ -500,10 +578,46 @@ def _cycle(mt5, accounts, pairs, args, conditions: dict[str, str],
     return merged or [], times, weeks
 
 
+@contextmanager
+def _terminal_lock(path: Path):
+    """One panel/trader per workspace; OS releases the byte lock after a crash."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a+b") as lock:
+        lock.seek(0, 2)
+        if not lock.tell():
+            lock.write(b"0")
+            lock.flush()
+        lock.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            raise RuntimeError("Another panel/trader is already running in this workspace. Close it first.") from exc
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock.seek(0)
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def main(argv: list[str] | None = None) -> int:
+    with ExitStack() as resources:
+        return _main(argv, resources)
+
+
+def _main(argv, resources: ExitStack) -> int:
     ap = argparse.ArgumentParser(
         description="Regime-bias console panel; add --trade for the trading loop (dry-run default).")
     ap.add_argument("--config-dir", default="configs")
+    ap.add_argument("--base-config", default=None,
+                    help="select a shared preset without changing configs/_base.yaml")
     ap.add_argument("--journal", default=JOURNAL_DEFAULT)
     ap.add_argument("--records-dir", default=RECORDS_DEFAULT)
     ap.add_argument("--memory-dir", default=MEMORY_DEFAULT)
@@ -513,15 +627,35 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--once", action="store_true")
     ap.add_argument("--interval", type=float, default=POLL_INTERVAL)
     ap.add_argument("--trade", action="store_true",
-                    help="enable the trading loop (entries + management). OFF = read-only panel.")
+                     help="enable the trading loop (entries + management). OFF = read-only panel.")
+    ap.add_argument("--account", choices=("demo", "real"),
+                    help="select one enabled account; never overrides USE_DEMO/USE_REAL")
     ap.add_argument("--dry-run", action=argparse.BooleanOptionalAction, default=None,
-                    help="trade planner only, nothing sent (default: live.dry_run_default=true)")
+                     help="trade planner only, nothing sent (default: live.dry_run_default=true)")
+    ap.add_argument("--record-performance", action=argparse.BooleanOptionalAction, default=True,
+                    help="store broker deals/equity locally; order auditing is mandatory for actual sends")
     args = ap.parse_args(argv)
+    from quant.performance import PerformanceSettings
+    import yaml
+
+    try:
+        base = yaml.safe_load(_read_yaml_text(base_config_path(args.config_dir, args.base_config))) or {}
+        args.performance_settings = PerformanceSettings.from_dict(base.get("performance"))
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        print(f"performance config error: {exc}", flush=True)
+        return 2
+    preset = {"base_config": args.base_config} if args.base_config else {}
+
+    try:
+        resources.enter_context(_terminal_lock(Path(__file__).resolve().parents[2] / "memory" / "monitor.lock"))
+    except (OSError, RuntimeError) as exc:
+        print(f"DATA ERROR - {exc}", flush=True)
+        return 2
 
     from quant.config import get_accounts
 
     try:
-        pairs = load_pairs(args.config_dir)
+        pairs = load_pairs(args.config_dir, **preset)
     except Exception as exc:
         print(f"DATA ERROR - no pair configs in {args.config_dir}: {exc}", flush=True)
         return 1
@@ -534,11 +668,13 @@ def main(argv: list[str] | None = None) -> int:
     if not pairs:
         print(f"DATA ERROR - no pair configs found in {args.config_dir}", flush=True)
         return 1
-    loss_pct = read_limits(args.config_dir)
     # timeframes: locked combos only; every fetch/gate below reads these
     try:
-        args.exec_tf, args.reg_tf = read_timeframes(args.config_dir)
-    except ValueError as exc:
+        loss_pct = read_limits(args.config_dir, **preset)
+        args.exec_tf, args.reg_tf = read_timeframes(args.config_dir, **preset)
+        if args.base_config and args.magic is None:
+            args.magic = read_trade_cfg(args.config_dir, **preset)["magic"]
+    except (OSError, TypeError, ValueError) as exc:
         print(f"config error: {exc}", flush=True)
         return 2
 
@@ -558,7 +694,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        accounts = get_accounts()  # every enabled account, each cycle; raises if none
+        accounts = get_accounts(args.account) if args.account else get_accounts()
     except Exception as exc:
         print(f"DATA ERROR - account config: {exc}", flush=True)
         return 2
@@ -575,7 +711,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         atag = "REAL" if accounts[0].live else "DEMO"
         try:
-            tradecfg = read_trade_cfg(args.config_dir)
+            tradecfg = read_trade_cfg(args.config_dir, **preset)
         except (TypeError, ValueError) as exc:
             print(f"DATA ERROR - {exc}. Refusing to trade.", flush=True)
             return 2
@@ -589,13 +725,18 @@ def main(argv: list[str] | None = None) -> int:
             print(f"DATA ERROR - {conflict}. Refusing to trade.", flush=True)
             return 2
         tcfg = {
+            "expected_account": {"login": accounts[0].login, "server": accounts[0].server,
+                                 "live": accounts[0].live},
             "magic": magic, "dry": dry, "journal": args.journal,
-            "mem_path": Path(args.memory_dir) / f"live_{atag.lower()}.json",
+            "mem_path": Path(args.memory_dir) / f"live_{atag.lower()}{'_' + str(magic) if args.base_config else ''}.json",
             "ranges": tradecfg["ranges"], "base_costs": tradecfg["costs"],
             "base": {
+                "expected_account": {"login": accounts[0].login, "server": accounts[0].server,
+                                     "live": accounts[0].live},
                 "max_total_positions": tradecfg["max_total_positions"],
                 "max_ccy_net": tradecfg["max_ccy_net"],
                 "max_trades_per_day": tradecfg["max_trades_per_day"],
+                "max_trades_per_week": tradecfg["max_trades_per_week"],
                 "max_trades_per_pair_per_week": tradecfg["max_trades_per_pair_per_week"],
                 "disable_pair_after_daily_loss": tradecfg["disable_pair_after_daily_loss"],
                 "entry_hours": tradecfg["entry_hours"],
@@ -606,14 +747,16 @@ def main(argv: list[str] | None = None) -> int:
                 "scope_high": tradecfg["scope_high"],
                  "stop_sizing": stop_sizing,
                  "default_lot": tradecfg["default_lot"],
-                "exec_tf": args.exec_tf,  # execution TF name for _gate_check
+                 "exec_tf": args.exec_tf,  # execution TF name for _gate_check
+                 "memory_path": Path(args.memory_dir) / f"live_{atag.lower()}{'_' + str(magic) if args.base_config else ''}.json",
             },
         }
         banner = (f"TRADER: ON ({'DRY-RUN - plans only, nothing sent' if dry
                   else f'REAL ORDERS on {atag}'}) magic={magic} "
                   f"caps: total={tcfg['base']['max_total_positions'] or 'off'} "
                   f"ccy-net={tcfg['base']['max_ccy_net'] or 'off'} "
-                  f"day={tcfg['base']['max_trades_per_day'] or 'off'}")
+                   f"day={tcfg['base']['max_trades_per_day'] or 'off'} "
+                   f"week={tcfg['base']['max_trades_per_week'] or 'off'}")
 
     from quant import records as rec
 
